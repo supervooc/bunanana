@@ -71,7 +71,7 @@ function AddFile([string]$p) {
   $script:files.Add([pscustomobject]@{ abs = $full; rel = $rel; size = (Get-Item $full).Length })
 }
 
-foreach ($f in @('README.md', '.gitignore')) {
+foreach ($f in @('README.md', 'README.zh-CN.md', '.gitignore')) {
   $p = Join-Path $root $f
   if (Test-Path $p) { AddFile $p }
 }
