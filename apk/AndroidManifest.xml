@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  rootdetect - Android root / root-hiding detector.
+
+  Deliberately targetSdk 28: Android 10+ blocks exec() of files under the app's
+  own data directory for apps targeting 29+, and one of the two ways this app
+  runs the bundled scanner is exactly that. The native library directory stays
+  executable either way; the files-dir copy is the fallback.
+
+  There are no resources: the whole UI is built in code, so aapt2 only has to
+  link this manifest.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.rootdetect.app"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="28" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:extractNativeLibs="true"
+        android:allowBackup="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:label="@string/app_name"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

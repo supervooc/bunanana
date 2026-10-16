@@ -1,0 +1,17 @@
+# Fetched toolchains: the vendor/*.mjs scripts rebuild these (SDK ~1.1 GB zip,
+# NDK ~4 GB extracted, system images, JDK). Never commit them.
+vendor/
+
+# Build intermediates
+build/apk-work/
+build/t2-out/
+build/debug.keystore
+
+# Locally built CLI binaries. The APK in out/ already carries the same scanners
+# for arm64-v8a / armeabi-v7a / x86_64, and these are reproducible with
+# build/build.ps1.
+out/rootdetect-arm
+out/rootdetect-arm64
+out/rootdetect-x86
+out/rootdetect-x86_64
+out/*.idsig
