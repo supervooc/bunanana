@@ -149,7 +149,7 @@ Runs on the device and verifies two things:
 
 ```
 $ adb shell /data/local/rx/rx --selftest
-rootdetect 1.0.1 self-test   uid=2000
+rootdetect 1.0.2 self-test   uid=2000
 -- decision logic --
   PASS  keyword: magisk package name
   ...
