@@ -266,6 +266,41 @@ static void test_logic(void) {
   ok(strlen(e) > 0 && strlen(e) < 32 && e[32] == '#' && e[63] == '#',
      "json: long string truncated in bounds, sentinel past the buffer intact", e);
 
+  /* --- text escape: the terminal report must not carry live control bytes ---
+   * Evidence is built from another process's own files, so ESC/CR/DEL and the
+   * 8-bit CSI (0x9B, which a non-UTF-8 locale still honours) have to come out as
+   * printable text - otherwise a process can erase the finding that exposes it. */
+  char te[64];
+  memset(te, '#', sizeof te);
+  size_t tn = rd_text_escape("/x/\x1b[2K\rFORGED", 14, te, sizeof te);
+  ok(strcmp(te, "/x/\\x1b[2K\\x0dFORGED") == 0, "text escape: ESC and CR become \\xNN", te);
+  ok(tn == strlen(te), "text escape: returns the number of bytes written", NULL);
+  ok(strchr(te, '\x1b') == NULL && strchr(te, '\r') == NULL,
+     "text escape: no live control byte survives", NULL);
+  memset(te, '#', sizeof te);
+  rd_text_escape("\x7f\x9b\xff", 3, te, sizeof te);
+  ok(strcmp(te, "\\x7f\\x9b\\xff") == 0,
+     "text escape: DEL, the 8-bit CSI and a lone 0xff are escaped", te);
+  memset(te, '#', sizeof te);
+  rd_text_escape("\xe4\xbd\xa0\xe5\xa5\xbd", 6, te, sizeof te);
+  ok(strcmp(te, "\xe4\xbd\xa0\xe5\xa5\xbd") == 0,
+     "text escape: valid UTF-8 (a Chinese path) passes through", te);
+  memset(te, '#', sizeof te);
+  rd_text_escape("/sbin/su", 8, te, sizeof te);
+  ok(strcmp(te, "/sbin/su") == 0, "text escape: an ordinary path is unchanged", te);
+  /* Worst case is 4 bytes per input byte, plus the terminator: pin the edge. */
+  memset(te, '#', sizeof te);
+  rd_text_escape("\x01\x02\x03", 3, te, 13);
+  ok(strcmp(te, "\\x01\\x02\\x03") == 0 && te[12] == '\0' && te[13] == '#',
+     "text escape: an exact (4*n+1) buffer holds every byte", te);
+  memset(te, '#', sizeof te);
+  rd_text_escape("\x01\x02\x03", 3, te, 12);
+  ok(strcmp(te, "\\x01\\x02") == 0 && te[8] == '\0' && te[12] == '#',
+     "text escape: one byte short drops the last escape whole", te);
+  memset(te, '#', sizeof te);
+  rd_text_escape("abc", 3, te, 0);
+  ok(te[0] == '#', "text escape: outsz 0 touches nothing", NULL);
+
   /* --- appendf / format_row overrun guards ------------------------------ */
   char ab[32];
   memset(ab, '#', sizeof ab);
