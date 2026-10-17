@@ -22,8 +22,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define RD_VERSION "1.0.0"
+#define RD_VERSION "1.0.3"
 #define RD_MAXEVID 3000
+
+/* The LKM this build targets specifically: github.com/inforcqb/susfs4ksu-lkm
+ * (SUSFS ported to the loadable kernel module `susfs_guard_lkm`, loaded via
+ * ksud insmod / susfs_insmod). The kernel uses the .ko file name as the module
+ * name, and releases ship susfs_guard_lkm-<kmi>.ko, so everything that looks
+ * the name up treats it as a prefix. */
+#define RD_SUSFS_LKM_MODULE "susfs_guard_lkm"
 
 /* ------------------------------------------------------------------ severity */
 
@@ -140,6 +147,11 @@ bool rd_parse_kallsyms_line(const char *line, unsigned long long *addr, char *na
                             char *mod, size_t modsz);
 bool rd_parse_proc_modules_line(const char *line, char *name, size_t sz);
 
+/* When `content` - the body of control node `path` - matches the counter/table
+ * format documented for the susfs_guard_lkm LKM, returns a short description of
+ * what matched; NULL otherwise. Exposed for --selftest. */
+const char *rd_susfs_lkm_node_fingerprint(const char *path, const char *content);
+
 /* Probe table used by the consistency engine. */
 typedef struct {
   int stat_r, statx_r, fstatat_r, access_r, open_path_r, open_read_r, opendir_r;
@@ -175,6 +187,9 @@ void rd_check_packages(rd_ctx *c, rd_report *rep);      /* root manager apps */
 void rd_check_mounts(rd_ctx *c, rd_report *rep);        /* mount cross-checks */
 void rd_check_kernel(rd_ctx *c, rd_report *rep);        /* modules, kallsyms, lsm */
 void rd_check_susfs(rd_ctx *c, rd_report *rep);         /* SuSFS-specific probes */
+/* susfs_guard_lkm LKM specifics: the module's self-filter of /proc/modules, its
+ * module parameters, its installer layout on disk and its node fingerprints. */
+void rd_check_susfs_lkm(rd_ctx *c, rd_report *rep);
 void rd_check_processes(rd_ctx *c, rd_report *rep);      /* cmdline/maps scan */
 /* Cheap extra signals: unix control sockets, ptrace, LD_* env, map backing. */
 void rd_check_extra(rd_ctx *c, rd_report *rep);
@@ -206,6 +221,10 @@ extern const char *const RD_ROOT_PATHS[];
 extern const size_t RD_ROOT_PATH_COUNT;
 extern const char *const RD_HIDING_PATHS[];
 extern const size_t RD_HIDING_PATH_COUNT;
+/* Installer/loader layout specific to the susfs_guard_lkm LKM
+ * (github.com/inforcqb/susfs4ksu-lkm); see rd_checks.c for the sources. */
+extern const char *const RD_SUSFS_LKM_PATHS[];
+extern const size_t RD_SUSFS_LKM_PATH_COUNT;
 extern const char *const RD_ROOT_PACKAGES[];
 extern const size_t RD_ROOT_PACKAGE_COUNT;
 

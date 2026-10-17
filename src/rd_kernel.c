@@ -28,6 +28,17 @@ static bool read_first_line_public(const char *p, char *b, size_t s) {
   return rd_read_first_line(p, b, s);
 }
 
+/* Bounded copy that always NUL-terminates. Used in place of
+ * snprintf(dst, n, "%s", src) so that a long source is truncated explicitly
+ * instead of tripping the compiler's -Wformat-truncation analysis. */
+static void rd_copy(char *dst, size_t n, const char *src) {
+  if (n == 0) return;
+  size_t l = strlen(src);
+  if (l >= n) l = n - 1;
+  memcpy(dst, src, l);
+  dst[l] = '\0';
+}
+
 static const char *kptr_str(unsigned long long a, char *buf, size_t sz) {
   if (a == 0) { snprintf(buf, sz, "0 (kptr_restrict)"); return buf; }
   snprintf(buf, sz, "0x%llx", a);
@@ -446,6 +457,424 @@ void rd_check_susfs(rd_ctx *c, rd_report *rep) {
   }
 }
 
+/* ------------------------------------------- susfs_guard_lkm LKM specifics
+ *
+ * Target: github.com/inforcqb/susfs4ksu-lkm - SUSFS ported to a loadable kernel
+ * module (`susfs_guard_lkm`) so it can run on a stock GKI kernel, loaded with
+ * `ksud insmod` or the release's own susfs_insmod loader.
+ *
+ * The checks below lean on statements the project makes about itself, not on
+ * string luck:
+ *  - susfs_main.c's load banner: "This module is filtered out of /proc/modules
+ *    for every caller including root, so `lsmod | grep susfs` stays empty -
+ *    check /sys/module/susfs_guard_lkm instead." The sysfs directory, its
+ *    parameter files and the kallsyms module tag are views that self-filter
+ *    does NOT cover, so any of them answering while /proc/modules omits the
+ *    module is the filter observed in the act.
+ *  - module/load.sh uses `[ -d /sys/module/susfs_guard_lkm ]` as its own
+ *    "already loaded" probe; the parameters expose_proc / fail_layer /
+ *    opath_test / opath_dump are unique to this port.
+ *  - susfs.h: the module name is the .ko file name; releases ship
+ *    susfs_guard_lkm-<kmi>.ko, so name lookups here are prefix matches
+ *    (susfs_guard_lkm, susfs_guard_lkm_android13_5_15, ...).
+ *  - PROC_INTERFACES.md: hide_modules removes the module's own /proc/modules
+ *    line only - another module's "used by" column would still name it.
+ *  - PROC_INTERFACES.md documents the control-node bodies; the counter/table
+ *    shapes are reproduced in rd_susfs_lkm_node_fingerprint().
+ */
+
+/* Module parameters this LKM declares (susfs_main.c, susfs_opath.c). Seeing
+ * any of them under /sys/module/<name>/parameters/ identifies the port. */
+static const char *const lkm_params[] = {"expose_proc", "fail_layer", "opath_test", "opath_dump"};
+
+/* True for the module's sysfs/proc name: equal to the base name, or the name
+ * the kernel derived from the .ko file name (dashes become underscores, so
+ * susfs_guard_lkm-android13-5.15.ko loads as susfs_guard_lkm_android13_5_15). */
+static bool lkm_name(const char *name) {
+  size_t n = strlen(RD_SUSFS_LKM_MODULE);
+  if (!name || strncmp(name, RD_SUSFS_LKM_MODULE, n) != 0) return false;
+  char c = name[n];
+  return c == '\0' || c == '_' || c == '-' || c == '.';
+}
+
+const char *rd_susfs_lkm_node_fingerprint(const char *path, const char *content) {
+  static const struct {
+    const char *path; /* the node whose documented body this describes */
+    const char *a;    /* required substring */
+    const char *b;    /* second required substring, or NULL */
+    const char *what; /* short description for the evidence line */
+  } t[] = {
+      {"/proc/susfs_opath", "opath/", "nr=", "O_PATH wrapper self-test counters"},
+      {"/proc/susfs_kstat", "maps: armed=", "stat nr ", "kstat dispatcher counters"},
+      {"/proc/susfs_hide_modules", "hide_modules:", "names:", "module-list hide table"},
+      {"/proc/susfs_open_redirect", "hooks: forward=", NULL, "open-redirect hook counters"},
+      {"/proc/susfs_avc_spoof", "priv_app_sid=", NULL, "AVC audit spoof state"},
+      {"/proc/susfs_hide_mounts", "prefixes:", NULL, "mount-hide prefix table"},
+      {"/proc/susfs_path", "hide_from_apps=", NULL, "sus_path rule table"},
+  };
+  if (!path || !content) return NULL;
+  for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+    if (strcmp(path, t[i].path) != 0) continue;
+    if (!rd_contains(content, t[i].a)) return NULL;
+    if (t[i].b && !rd_contains(content, t[i].b)) return NULL;
+    return t[i].what;
+  }
+  return NULL;
+}
+
+/* Read the nodes this LKM registers and identify the port from the shape of
+ * their bodies. In practice this needs uid 0: with rules armed the sus_path
+ * layer answers ENOENT on every interface from anyone else. */
+static void lkm_node_fingerprints(rd_report *rep) {
+  static const char *const nodes[] = {
+      "/proc/susfs_path",  "/proc/susfs_kstat",        "/proc/susfs_open_redirect",
+      "/proc/susfs_opath", "/proc/susfs_hide_modules", "/proc/susfs_hide_mounts",
+      "/proc/susfs_avc_spoof",
+  };
+  char ev[RD_MAXEVID];
+  ev[0] = '\0';
+  int hits = 0;
+  for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+    /* O_NONBLOCK, like rd_read_small(): a node whose read handler blocks must
+     * not be able to hang the scan. */
+    int fd = open(nodes[i], O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) continue;
+    char *txt = rd_slurp_fd(fd, NULL);
+    close(fd);
+    if (!txt) continue;
+    const char *what = rd_susfs_lkm_node_fingerprint(nodes[i], txt);
+    if (what) {
+      hits++;
+      char first[160];
+      size_t n = 0;
+      while (txt[n] && txt[n] != '\n' && n + 1 < sizeof(first)) n++;
+      memcpy(first, txt, n);
+      first[n] = '\0';
+      if (strlen(ev) < sizeof(ev) - 300)
+        rd_appendf(ev, sizeof(ev), "%s: %s\n  %s\n", nodes[i], what, first);
+    }
+    free(txt);
+  }
+  if (hits)
+    rd_add_ev(rep, SEV_CRITICAL, "susfs-lkm-node-fingerprint",
+              "control node bodies match the susfs_guard_lkm interface", ev,
+              "%d /proc/susfs_* node(s) answered with the counter/table format this LKM port "
+              "documents (stat dispatcher counters, O_PATH self-test, hide tables). The text "
+              "identifies the port: these read handlers belong to the module itself.", hits);
+}
+
+/* Files this LKM has to keep on disk: the flashable KernelSU module unpacks to
+ * /data/adb/modules/susfs_guard_lkm, and the README's manual route puts the .ko
+ * under /data/adb/loader. /data/adb is 0700 root, so this half only sees
+ * anything as uid 0 - which is what makes it a good after-the-fact check. */
+static void lkm_artefacts(rd_report *rep) {
+  char ev[RD_MAXEVID];
+  ev[0] = '\0';
+  char hev[RD_MAXEVID];
+  hev[0] = '\0';
+  int found = 0, hidden = 0;
+
+  for (size_t i = 0; i < RD_SUSFS_LKM_PATH_COUNT; i++) {
+    const char *p = RD_SUSFS_LKM_PATHS[i];
+    rd_probe_row row;
+    rd_probe_all(p, &row);
+    bool exists = row.stat_r == 0 || row.statx_r == 0 || row.fstatat_r == 0 || row.access_r == 0 ||
+                  row.open_path_r == 0 || row.open_read_r == 0 || row.opendir_r == 0;
+    if (rd_row_inconsistent(&row, NULL, 0) && !rd_is_dangling_symlink(p)) {
+      hidden++;
+      char line[512];
+      rd_format_row(p, &row, line, sizeof(line));
+      if (strlen(hev) < sizeof(hev) - 520) rd_appendf(hev, sizeof(hev), "%s\n", line);
+    }
+    if (exists) {
+      found++;
+      char line[512];
+      rd_format_row(p, &row, line, sizeof(line));
+      if (strlen(ev) < sizeof(ev) - 520) rd_appendf(ev, sizeof(ev), "%s\n", line);
+    }
+  }
+
+  /* KernelSU module directories. The release zip's module id is
+   * susfs_guard_lkm, but match on the id wherever it appears instead of the
+   * folder name alone: a renamed install still carries the id in module.prop,
+   * and the .ko files under lib/ keep the project's file name. */
+  static const char *const bases[] = {"/data/adb/modules", "/data/adb/modules_update"};
+  for (size_t b = 0; b < sizeof(bases) / sizeof(bases[0]); b++) {
+    DIR *d = opendir(bases[b]);
+    if (!d) continue;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+      if (e->d_name[0] == '.') continue;
+      char dir[512], prop[600], lib[600];
+      snprintf(dir, sizeof(dir), "%s/%s", bases[b], e->d_name);
+      snprintf(prop, sizeof(prop), "%s/module.prop", dir);
+      snprintf(lib, sizeof(lib), "%s/lib", dir);
+      char *ptxt = rd_slurp(prop, NULL);
+      bool hit = rd_contains_ci(e->d_name, RD_SUSFS_LKM_MODULE) ||
+                 (ptxt && rd_contains_ci(ptxt, "id=" RD_SUSFS_LKM_MODULE));
+      /* The loader binary and the packaged .ko set name the project directly. */
+      char insmod[700];
+      snprintf(insmod, sizeof(insmod), "%s/bin/susfs_insmod", dir);
+      if (!hit && rd_path_exists(insmod)) hit = true;
+      if (!hit) {
+        DIR *ld = opendir(lib);
+        if (ld) {
+          struct dirent *le;
+          while ((le = readdir(ld))) {
+            if (le->d_name[0] != '.' && rd_contains_ci(le->d_name, RD_SUSFS_LKM_MODULE)) {
+              hit = true;
+              break;
+            }
+          }
+          closedir(ld);
+        }
+      }
+      if (!hit) {
+        free(ptxt);
+        continue;
+      }
+      found++;
+      if (strlen(ev) < sizeof(ev) - 700) {
+        rd_appendf(ev, sizeof(ev), "%s/\n", dir);
+        if (ptxt) rd_appendf(ev, sizeof(ev), "%s", ptxt);
+      }
+      free(ptxt);
+      DIR *ld = opendir(lib);
+      if (ld) {
+        struct dirent *le;
+        while ((le = readdir(ld))) {
+          if (le->d_name[0] == '.' || !rd_contains(le->d_name, ".ko")) continue;
+          if (strlen(ev) < sizeof(ev) - 200) rd_appendf(ev, sizeof(ev), "%s/%s\n", lib, le->d_name);
+        }
+        closedir(ld);
+      }
+    }
+    closedir(d);
+  }
+
+  /* The manual-load directory from the README (`ksud insmod
+   * /data/adb/loader/susfs_guard_lkm.ko`) and the loader next to it. */
+  DIR *ld = opendir("/data/adb/loader");
+  if (ld) {
+    struct dirent *e;
+    while ((e = readdir(ld))) {
+      if (e->d_name[0] == '.') continue;
+      if (!rd_contains_ci(e->d_name, RD_SUSFS_LKM_MODULE) &&
+          !rd_contains_ci(e->d_name, "susfs_insmod"))
+        continue;
+      found++;
+      if (strlen(ev) < sizeof(ev) - 200) rd_appendf(ev, sizeof(ev), "/data/adb/loader/%s\n", e->d_name);
+    }
+    closedir(ld);
+  }
+
+  if (hidden)
+    rd_add_ev(rep, SEV_CRITICAL, "susfs-lkm-artefact-hidden",
+              "susfs_guard_lkm files exist for some interfaces only", hev,
+              "%d LKM-specific path(s) answered differently depending on the interface used - "
+              "the path-hiding layer intercepts only a subset of stat/getdents for these files.",
+              hidden);
+  if (found)
+    rd_add_ev(rep, SEV_HIGH, "susfs-lkm-artefact",
+              "susfs_guard_lkm installer artefacts exist on disk", ev,
+              "%d path(s) from this LKM's install/loader layout exist. The .ko must stay on disk "
+              "to be re-inserted at boot, so installer files survive hiding rules aimed at the "
+              "running kernel.", found);
+  else
+    rd_add(rep, SEV_INFO, "susfs-lkm-artefact-absent", "no susfs_guard_lkm installer file found",
+           "probed %zu LKM-specific paths plus the KernelSU module and loader directories; "
+           "nothing matched. /data/adb is unreadable to non-root, so this proves nothing "
+           "without uid 0.",
+           RD_SUSFS_LKM_PATH_COUNT);
+}
+
+void rd_check_susfs_lkm(rd_ctx *c, rd_report *rep) {
+  (void)c; /* uid only changes which views are reachable; absence is documented */
+  char buf[128];
+
+  /* ---- view A: /proc/modules, the view the module filters ---- */
+  bool mods_readable = false, in_modules = false;
+  int mod_count = 0, usedby_hits = 0;
+  char modline[512] = "";
+  char usedby[RD_MAXEVID];
+  usedby[0] = '\0';
+  char *mods = rd_slurp("/proc/modules", NULL);
+  if (mods) {
+    mods_readable = true;
+    char *save = NULL;
+    for (char *line = strtok_r(mods, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+      char name[128] = "";
+      if (!rd_parse_proc_modules_line(line, name, sizeof(name))) continue;
+      mod_count++;
+      if (lkm_name(name)) {
+        in_modules = true;
+        rd_copy(modline, sizeof(modline), line);
+        continue;
+      }
+      /* hide_modules removes the module's own line only: a dependent module's
+       * "used by" column (or any other column) still names it. */
+      if (rd_contains_ci(line, "susfs")) {
+        usedby_hits++;
+        if (strlen(usedby) < sizeof(usedby) - 512) rd_appendf(usedby, sizeof(usedby), "%s\n", line);
+      }
+    }
+  }
+
+  /* ---- view B: /sys/module, the signal the module's own loader uses ---- */
+  bool sysfs = false;
+  char sysname[128] = "";
+  char sysline[512] = "";
+  DIR *sm = opendir("/sys/module");
+  if (sm) {
+    struct dirent *e;
+    while ((e = readdir(sm))) {
+      if (!lkm_name(e->d_name)) continue;
+      sysfs = true;
+      rd_copy(sysname, sizeof(sysname), e->d_name);
+      break;
+    }
+    closedir(sm);
+  }
+  if (!sysfs) {
+    /* The listing may be filtered while a direct probe still answers (or the
+     * other way around); check the canonical name explicitly too. */
+    rd_probe_row row;
+    rd_probe_all("/sys/module/" RD_SUSFS_LKM_MODULE, &row);
+    if (row.stat_r == 0 || row.statx_r == 0 || row.fstatat_r == 0 || row.access_r == 0 ||
+        row.open_path_r == 0 || row.open_read_r == 0 || row.opendir_r == 0) {
+      sysfs = true;
+      rd_copy(sysname, sizeof(sysname), RD_SUSFS_LKM_MODULE);
+    }
+  }
+  if (sysfs) {
+    char dir[256];
+    struct stat st;
+    snprintf(dir, sizeof(dir), "/sys/module/%s", sysname);
+    if (stat(dir, &st) == 0)
+      snprintf(sysline, sizeof(sysline), "%s present (mode %o)", dir, (unsigned)(st.st_mode & 07777));
+    else
+      rd_copy(sysline, sizeof(sysline), dir);
+  }
+
+  /* ---- view C: module parameters, names unique to this port ---- */
+  char pev[1024];
+  pev[0] = '\0';
+  int params = 0;
+  if (sysname[0]) {
+    for (size_t i = 0; i < sizeof(lkm_params) / sizeof(lkm_params[0]); i++) {
+      char p[300], val[128] = "";
+      snprintf(p, sizeof(p), "/sys/module/%s/parameters/%s", sysname, lkm_params[i]);
+      if (!rd_path_exists(p)) continue;
+      params++;
+      bool have = read_first_line_public(p, val, sizeof(val));
+      if (strlen(pev) < sizeof(pev) - 300)
+        rd_appendf(pev, sizeof(pev), "%s = %s\n", p, have && val[0] ? val : "(present)");
+    }
+  }
+
+  /* ---- view D: /proc/kallsyms module tag ---- */
+  bool tag = false;
+  char tagline[256] = "";
+  char *ks = rd_slurp("/proc/kallsyms", NULL);
+  if (ks) {
+    /* "[susfs_guard_lkm" without the closing bracket also matches a
+     * KMI-suffixed name ([susfs_guard_lkm_android13_5_15]). */
+    size_t mlen = strlen(RD_SUSFS_LKM_MODULE);
+    for (char *p = strstr(ks, "[" RD_SUSFS_LKM_MODULE); p;
+         p = strstr(p + 1, "[" RD_SUSFS_LKM_MODULE)) {
+      char cc = p[1 + mlen];
+      if (cc != ']' && cc != '_' && cc != '-' && cc != '.') continue;
+      tag = true;
+      char *ls = p;
+      while (ls > ks && ls[-1] != '\n') ls--;
+      char *le = p;
+      while (*le && *le != '\n') le++;
+      size_t n = (size_t)(le - ls);
+      if (n >= sizeof(tagline)) n = sizeof(tagline) - 1;
+      memcpy(tagline, ls, n);
+      tagline[n] = '\0';
+      break;
+    }
+    free(ks);
+  }
+
+  /* ---- decision ---- */
+  bool kernel_view = sysfs || params > 0 || tag;
+  if (kernel_view && mods_readable && !in_modules) {
+    char ev[RD_MAXEVID];
+    ev[0] = '\0';
+    if (sysline[0]) rd_appendf(ev, sizeof(ev), "%s\n", sysline);
+    if (params) rd_appendf(ev, sizeof(ev), "parameters visible:\n%s", pev);
+    if (tag) rd_appendf(ev, sizeof(ev), "kallsyms tag: %s\n", tagline);
+    rd_add_ev(rep, SEV_CRITICAL, "susfs-lkm-module-filtered",
+              "susfs_guard_lkm is loaded while /proc/modules does not list it", ev,
+              "The kernel still answers for this module (sysfs=%s, module parameters=%d, "
+              "kallsyms tag=%s) while /proc/modules has no matching line among its %d module(s). "
+              "The module removes its own /proc/modules entry for every caller including root - "
+              "it says so in its load banner - so this is that self-filter caught in the act, "
+              "not a name match.",
+              sysfs ? "yes" : "no", params, tag ? "yes" : "no", mod_count);
+  } else if (kernel_view && !mods_readable) {
+    char ev[RD_MAXEVID];
+    ev[0] = '\0';
+    if (sysline[0]) rd_appendf(ev, sizeof(ev), "%s\n", sysline);
+    if (params) rd_appendf(ev, sizeof(ev), "parameters visible:\n%s", pev);
+    if (tag) rd_appendf(ev, sizeof(ev), "kallsyms tag: %s\n", tagline);
+    rd_add_ev(rep, SEV_HIGH, "susfs-lkm-module",
+              "susfs_guard_lkm answers from the kernel; /proc/modules is unreadable", ev,
+              "sysfs=%s, module parameters=%d, kallsyms tag=%s - the module is loaded, but "
+              "/proc/modules could not be read, so whether its self-filter is armed could not "
+              "be verified.",
+              sysfs ? "yes" : "no", params, tag ? "yes" : "no");
+  } else if (in_modules) {
+    char ev[RD_MAXEVID];
+    ev[0] = '\0';
+    if (modline[0]) rd_appendf(ev, sizeof(ev), "%s\n", modline);
+    if (sysline[0]) rd_appendf(ev, sizeof(ev), "%s\n", sysline);
+    if (params) rd_appendf(ev, sizeof(ev), "parameters visible:\n%s", pev);
+    rd_add_ev(rep, SEV_HIGH, "susfs-lkm-module", "the susfs_guard_lkm hiding module is loaded", ev,
+              "/proc/modules names it%s. Its self-filter is currently off (a fresh load, or its "
+              "hide list was cleared), which changes how loudly it hides, not whether a "
+              "hiding-capable LKM is loaded.",
+              sysline[0] ? " and its /sys/module entry is reachable" : "");
+  } else {
+    rd_add(rep, SEV_INFO, "susfs-lkm-module-absent", "no kernel view shows susfs_guard_lkm",
+           "checked %d module name(s), the /sys/module listing, module parameters and "
+           "/proc/kallsyms; no view names the LKM. Under a non-root uid this is also what a "
+           "loaded module looks like - its sysfs directory is hidden from non-root callers and "
+           "the /proc/susfs_* nodes answer ENOENT - so absence alone proves nothing without "
+           "uid 0.",
+           mod_count);
+  }
+
+  if (usedby_hits && !in_modules)
+    rd_add_ev(rep, SEV_HIGH, "susfs-lkm-usedby",
+              "another module's line names the LKM missing from the module list", usedby,
+              "%d /proc/modules line(s) mention susfs in a column other than a module name. The "
+              "self-filter removes only the module's own line, so a dependent's \"used by\" list "
+              "still leaks it.",
+              usedby_hits);
+
+  /* ---- taint/list ghost: OE set while no module is listed at all ---- */
+  if (mods_readable && mod_count == 0 && !in_modules &&
+      read_first_line_public("/proc/sys/kernel/tainted", buf, sizeof(buf))) {
+    long t = strtol(buf, NULL, 10);
+    if (t & 0x1000)
+      rd_add(rep, SEV_MEDIUM, "kernel-module-list-ghost",
+             "taint says an out-of-tree module was loaded but no module is listed",
+             "tainted=%ld has bit 12 (OE) set: the kernel recorded an out-of-tree module load, "
+             "yet /proc/modules lists none at all. The bit is sticky - an rmmod leaves it set - "
+             "so this is corroboration, not proof; but removing its own line is exactly what "
+             "susfs_guard_lkm does, and an emptied list covers that up best.",
+             t);
+  }
+
+  if (mods) free(mods);
+
+  lkm_artefacts(rep);
+  lkm_node_fingerprints(rep);
+}
+
 /* ------------------------------------------------------- consistency engine */
 
 /* Compare uname() with the interfaces SuSFS's uname layer does NOT hook. */
@@ -793,7 +1222,7 @@ void rd_check_deep(rd_ctx *c, rd_report *rep) {
  * process and diffing the answers is a very direct detector.
  */
 
-#define RD_ABI_MAX 96
+#define RD_ABI_MAX 128
 #define RD_ABI_FIELDS 7
 
 typedef struct {
@@ -814,6 +1243,11 @@ static size_t abi_corpus(const char **out) {
   for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]) && n < RD_ABI_MAX; i++) out[n++] = extra[i];
   for (size_t i = 0; i < RD_ROOT_PATH_COUNT && n < RD_ABI_MAX; i++) out[n++] = RD_ROOT_PATHS[i];
   for (size_t i = 0; i < RD_HIDING_PATH_COUNT && n < RD_ABI_MAX; i++) out[n++] = RD_HIDING_PATHS[i];
+  /* The LKM's own installer paths are hiding surfaces too: sus_path rules are
+   * armed per path, and the 32-bit and 64-bit halves of the syscall table are
+   * patched independently. */
+  for (size_t i = 0; i < RD_SUSFS_LKM_PATH_COUNT && n < RD_ABI_MAX; i++)
+    out[n++] = RD_SUSFS_LKM_PATHS[i];
   return n;
 }
 
