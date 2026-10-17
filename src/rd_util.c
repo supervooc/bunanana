@@ -421,9 +421,16 @@ int rd_run(const char *const argv[], char *out, size_t outsz) {
 
 static void props_push(rd_props *p, const char *k, const char *v) {
   if (p->n == p->cap) {
-    p->cap = p->cap ? p->cap * 2 : 128;
-    p->keys = (char **)realloc(p->keys, p->cap * sizeof(char *));
-    p->vals = (char **)realloc(p->vals, p->cap * sizeof(char *));
+    /* Grow both arrays before touching cap: updating cap before a failed realloc
+     * would make the next write index past the (still small) allocation. */
+    size_t ncap = p->cap ? p->cap * 2 : 128;
+    char **nk = (char **)realloc(p->keys, ncap * sizeof(char *));
+    if (!nk) return;
+    char **nv = (char **)realloc(p->vals, ncap * sizeof(char *));
+    if (!nv) { p->keys = nk; return; }
+    p->keys = nk;
+    p->vals = nv;
+    p->cap = ncap;
   }
   p->keys[p->n] = xstrdup(k);
   p->vals[p->n] = xstrdup(v);
@@ -434,6 +441,7 @@ void rd_props_load(rd_props *p) {
   memset(p, 0, sizeof(*p));
   char *out = (char *)malloc(1 << 20);
   if (!out) return;
+  out[0] = '\0'; /* no getprop binary => out is never written, so NUL it here */
   static const char *const cands[] = {"/system/bin/getprop", "/system/bin/getprop2",
                                       "/vendor/bin/getprop", NULL};
   for (int i = 0; cands[i]; i++) {
@@ -593,7 +601,13 @@ int rd_probe_open_o_path(const char *path) {
 }
 
 int rd_probe_open_read(const char *path) {
-  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  /* O_NONBLOCK matters: this probe runs on paths from the artefact corpus, and
+   * /data/local/tmp/* is writable by any `adb shell` user. Opening a FIFO that
+   * lives there for reading blocks until a writer appears, which let an
+   * unprivileged user hang the whole scan (including a root run) indefinitely.
+   * With O_NONBLOCK the open returns immediately; the file still counts as
+   * present, so the vote is unchanged. */
+  int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
   if (fd >= 0) { close(fd); return 0; }
   return errno == ENOENT || errno == ENOTDIR ? 1 : -1;
 }
