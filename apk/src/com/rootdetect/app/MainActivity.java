@@ -30,6 +30,7 @@ import java.util.Date;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -69,6 +70,18 @@ public class MainActivity extends Activity {
     /** Full text of the last scan (header + summary + raw report): what we export. */
     private String lastLog = "";
     private static final String STATE_LOG = "lastLog";
+
+    /** How long a scan may run before the scanner is killed. */
+    private static final long SCAN_TIMEOUT_MS = 120000L;
+
+    /* A scan runs on its own thread and outlives a configuration change, so the
+     * in-flight state and its result live in statics: `sCurrent` is the Activity
+     * the thread should deliver to (the newest one), `sScanning` lets a recreated
+     * Activity keep showing "scanning" instead of "not scanned yet", and
+     * `sPendingReport` holds a result that arrived while no Activity existed. */
+    private static volatile MainActivity sCurrent;
+    private static volatile boolean sScanning;
+    private static volatile String sPendingReport;
 
     /* The scanner's finding header line looks like
      *   [HIGH    ] artefact-present       root artefacts present on the filesystem
@@ -158,20 +171,29 @@ public class MainActivity extends Activity {
         output.setText(header() + "\n点\"开始检测\"开始扫描这台设备。\n\n"
                 + "退出码：0 干净 | 1 可疑 | 2 检测到 root | 3 检测到隐藏\n");
 
-        /* A rotation (or any configuration change) recreates the Activity. Without
-         * this the report and the export button were lost and the user had to
-         * rescan just to export. */
-        if (savedInstanceState != null) {
-            String saved = savedInstanceState.getString(STATE_LOG);
-            if (saved != null && !saved.isEmpty()) {
-                lastLog = saved;
-                String verdict = verdictOf(saved);
-                summary.setText(buildSummary(verdict, parseFindings(saved)));
-                summary.setBackgroundColor(colorFor(verdict));
-                output.setText(saved);
-                runButton.setText("重新检测");
-                exportButton.setEnabled(true);
-            }
+        /* A rotation (or any configuration change) recreates the Activity. The
+         * in-flight scan (sScanning) and a finished one whose result arrived
+         * meanwhile (sPendingReport) survive in statics; otherwise the report and
+         * the export button were lost and the user had to rescan just to export. */
+        sCurrent = this;
+        String saved = savedInstanceState != null ? savedInstanceState.getString(STATE_LOG) : null;
+        if (sScanning) {
+            summary.setText("结论：正在检测……");
+            output.setText("正在扫描……\n");
+            runButton.setEnabled(false);
+            exportButton.setEnabled(false);
+        } else if (sPendingReport != null && !sPendingReport.isEmpty()) {
+            String log = sPendingReport;
+            String verdict = verdictOf(log);
+            applyResult(buildSummary(verdict, parseFindings(log)), verdict, log);
+        } else if (saved != null && !saved.isEmpty()) {
+            lastLog = saved;
+            String verdict = verdictOf(saved);
+            summary.setText(buildSummary(verdict, parseFindings(saved)));
+            summary.setBackgroundColor(colorFor(verdict));
+            output.setText(saved);
+            runButton.setText("重新检测");
+            exportButton.setEnabled(true);
         }
     }
 
@@ -181,6 +203,12 @@ public class MainActivity extends Activity {
         outState.putString(STATE_LOG, lastLog);
     }
 
+    @Override
+    protected void onDestroy() {
+        if (sCurrent == this) sCurrent = null;
+        super.onDestroy();
+    }
+
     private String header() {
         return "uid " + android.os.Process.myUid() + "  |  " + Build.MANUFACTURER + " " + Build.MODEL
                 + "  |  Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")\n"
@@ -188,6 +216,7 @@ public class MainActivity extends Activity {
     }
 
     private void startScan() {
+        sScanning = true;
         runButton.setEnabled(false);
         exportButton.setEnabled(false);
         summary.setBackgroundColor(0xFF455A64);
@@ -197,51 +226,73 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 final String report = scan();
+                final String verdict = verdictOf(report);
+                final String banner = buildSummary(verdict, parseFindings(report));
+                final String log = header() + "\n\n" + banner + "\n\n"
+                        + "----------------------------------------------\n" + report;
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
-                        String verdict = verdictOf(report);
-                        List<Finding> findings = parseFindings(report);
-                        String banner = buildSummary(verdict, findings);
-
-                        lastLog = header() + "\n\n" + banner + "\n\n"
-                                + "----------------------------------------------\n" + report;
-                        summary.setText(banner);
-                        summary.setBackgroundColor(colorFor(verdict));
-                        output.setText(lastLog);
-
-                        runButton.setEnabled(true);
-                        runButton.setText("重新检测");
-                        exportButton.setEnabled(true);
+                        sScanning = false;
+                        sPendingReport = log;
+                        /* Deliver to the current Activity: this one when the scan
+                         * finished before a rotation, the recreated one when it
+                         * did not (see sCurrent/onDestroy). */
+                        MainActivity target = (isFinishing() || isDestroyed())
+                                ? sCurrent : MainActivity.this;
+                        if (target != null && !target.isFinishing() && !target.isDestroyed()) {
+                            target.applyResult(banner, verdict, log);
+                        }
                     }
                 });
             }
         }).start();
     }
 
+    /** Show a finished scan: banner, colour, log and the enabled buttons. */
+    private void applyResult(String banner, String verdict, String log) {
+        lastLog = log;
+        sPendingReport = null;
+        summary.setText(banner);
+        summary.setBackgroundColor(colorFor(verdict));
+        output.setText(log);
+        runButton.setEnabled(true);
+        runButton.setText("重新检测");
+        exportButton.setEnabled(true);
+    }
+
     /** The extracted scanner, or a copy in the app data dir if that fails. */
     private File scannerFile() throws Exception {
         File inLibs = new File(getApplicationInfo().nativeLibraryDir, "librootdetect.so");
-        if (inLibs.isFile() && inLibs.canExecute()) {
+        if (inLibs.isFile()) {
             return inLibs;
         }
+        return stagedScanner(inLibs);
+    }
+
+    /**
+     * Copy the scanner into the app's private files directory and make it
+     * executable. The copy is refreshed on every scan: the old staleness check
+     * only compared the length, so a same-sized but different binary (a rebuilt
+     * APK whose versionCode and library size did not change) could be executed.
+     * 2 MB is copied in milliseconds on a user-initiated scan.
+     */
+    private File stagedScanner(File inLibs) throws Exception {
         File local = new File(getFilesDir(), "rx");
-        if (!local.isFile() || local.length() != inLibs.length()) {
-            InputStream in = new java.io.FileInputStream(inLibs);
+        InputStream in = new java.io.FileInputStream(inLibs);
+        try {
+            OutputStream out = new FileOutputStream(local);
             try {
-                OutputStream out = new FileOutputStream(local);
-                try {
-                    byte[] buf = new byte[65536];
-                    int n;
-                    while ((n = in.read(buf)) > 0) {
-                        out.write(buf, 0, n);
-                    }
-                } finally {
-                    out.close();
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
                 }
             } finally {
-                in.close();
+                out.close();
             }
+        } finally {
+            in.close();
         }
         local.setExecutable(true, false);
         return local;
@@ -259,46 +310,122 @@ public class MainActivity extends Activity {
         if (bin == null) {
             return sb.toString() + fallbackInstructions();
         }
-        sb.append("扫描器：").append(bin).append('\n');
-        sb.append("模式  ：详细输出 (uid ").append(android.os.Process.myUid()).append(")\n");
-        sb.append("----------------------------------------------\n");
 
         List<String> cmd = new ArrayList<String>();
         cmd.add(bin.getAbsolutePath());
         cmd.add("-v");
+
+        StringBuilder out = new StringBuilder();
+        boolean ok = runProcess(cmd, out);
+        if (!ok) {
+            /* execve can refuse the native-library copy even though canExecute()
+             * said yes (noexec mount, SELinux), which is why scannerFile() no
+             * longer trusts canExecute(). Retry once from a fresh copy in the
+             * app's files directory - the fallback the class comment describes. */
+            try {
+                File staged = stagedScanner(new File(getApplicationInfo().nativeLibraryDir,
+                        "librootdetect.so"));
+                if (!staged.getAbsolutePath().equals(bin.getAbsolutePath())) {
+                    cmd.set(0, staged.getAbsolutePath());
+                    out.setLength(0);
+                    ok = runProcess(cmd, out);
+                    if (ok) {
+                        bin = staged;
+                    }
+                }
+            } catch (Exception e) {
+                out.append("无法准备备选扫描器：").append(e).append('\n');
+            }
+        }
+
+        sb.append("扫描器：").append(bin).append('\n');
+        sb.append("模式  ：详细输出 (uid ").append(android.os.Process.myUid()).append(")\n");
+        sb.append("----------------------------------------------\n");
+        sb.append(out);
+        if (!ok) {
+            sb.append(fallbackInstructions());
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Run one command with stderr folded into stdout, appending everything to
+     * `out`. Returns true when the process started and exited before the
+     * timeout; the exit code (and its verdict) is appended in that case.
+     */
+    private boolean runProcess(List<String> cmd, StringBuilder out) {
         Process p = null;
+        final AtomicBoolean finished = new AtomicBoolean(false);
+        final AtomicBoolean timedOut = new AtomicBoolean(false);
         try {
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
             p = pb.start();
+            /* The scanner reads no input; closing stdin keeps a scanner that
+             * probes stdin from waiting on a pipe that never closes. */
+            try {
+                p.getOutputStream().close();
+            } catch (Exception ignored) {
+            }
+
+            /* readLine() blocks until the process closes stdout, so waitFor()
+             * never gets to enforce a timeout: without a watchdog a wedged
+             * scanner would hang the scan thread forever with the buttons
+             * disabled. The watchdog kills it, which closes the pipe and
+             * unblocks the reader below. */
+            final Process proc = p;
+            Thread watchdog = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        Thread.sleep(SCAN_TIMEOUT_MS);
+                    } catch (InterruptedException e) {
+                        return;   // the scan finished in time; expected
+                    }
+                    if (!finished.get()) {
+                        timedOut.set(true);
+                        proc.destroyForcibly();
+                    }
+                }
+            });
+            watchdog.setDaemon(true);
+            watchdog.start();
+
             BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
             try {
                 String line;
                 while ((line = r.readLine()) != null) {
-                    sb.append(line).append('\n');
+                    out.append(line).append('\n');
                 }
             } finally {
                 r.close();
             }
             int rc = p.waitFor();
-            sb.append("\n[退出码 ").append(rc).append("] ");
-            switch (rc) {
-                case 0: sb.append("干净"); break;
-                case 1: sb.append("可疑"); break;
-                case 2: sb.append("检测到 root"); break;
-                case 3: sb.append("检测到隐藏"); break;
-                default: sb.append("扫描器错误"); break;
+            finished.set(true);
+            watchdog.interrupt();
+            if (timedOut.get()) {
+                out.append("\n[超时：扫描器超过 ").append(SCAN_TIMEOUT_MS / 1000)
+                        .append(" 秒未退出，已强制终止]\n");
             }
-            sb.append('\n');
+            out.append("\n[退出码 ").append(rc).append("] ");
+            switch (rc) {
+                case 0: out.append("干净"); break;
+                case 1: out.append("可疑"); break;
+                case 2: out.append("检测到 root"); break;
+                case 3: out.append("检测到隐藏"); break;
+                default: out.append("扫描器错误"); break;
+            }
+            out.append('\n');
+            return true;
         } catch (Exception e) {
-            sb.append("无法执行 ").append(bin).append("：").append(e).append('\n');
-            sb.append(fallbackInstructions());
+            finished.set(true);
+            out.append("无法执行 ").append(cmd.get(0)).append("：").append(e).append('\n');
+            return false;
         } finally {
             if (p != null) {
                 p.destroy();
             }
         }
-        return sb.toString();
     }
 
     /** One finding parsed out of the scanner's text report. */
@@ -425,15 +552,41 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "请先运行一次检测", Toast.LENGTH_SHORT).show();
             return;
         }
-        File file;
-        try {
-            file = writeLog(lastLog);
-        } catch (Exception e) {
-            Toast.makeText(this, "无法保存日志：" + e, Toast.LENGTH_LONG).show();
-            return;
-        }
-        Toast.makeText(this, "日志已保存：" + file.getAbsolutePath(), Toast.LENGTH_LONG).show();
-        share(lastLog + "\n\n[已保存到设备：" + file.getAbsolutePath() + "]\n");
+        /* Writing the report must not run on the UI thread: it blocked the main
+         * thread (and could ANR on a slow /sdcard). */
+        final String text = lastLog;
+        exportButton.setEnabled(false);
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                File written = null;
+                Exception error = null;
+                try {
+                    written = writeLog(text);
+                } catch (Exception e) {
+                    error = e;
+                }
+                final File file = written;
+                final Exception err = error;
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (isFinishing() || isDestroyed()) {
+                            return;
+                        }
+                        exportButton.setEnabled(true);
+                        if (err != null) {
+                            Toast.makeText(MainActivity.this, "无法保存日志：" + err,
+                                    Toast.LENGTH_LONG).show();
+                            return;
+                        }
+                        Toast.makeText(MainActivity.this, "日志已保存：" + file.getAbsolutePath(),
+                                Toast.LENGTH_LONG).show();
+                        share(text + "\n\n[已保存到设备：" + file.getAbsolutePath() + "]\n");
+                    }
+                });
+            }
+        }).start();
     }
 
     /**
@@ -443,11 +596,16 @@ public class MainActivity extends Activity {
      * otherwise into the app's private files directory.
      */
     private File writeLog(String text) throws Exception {
-        String ts = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date());
+        /* Milliseconds plus a uniquifier: with second resolution two exports in
+         * the same second silently overwrote each other. */
+        String ts = new SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(new Date());
         File dir = getExternalFilesDir(null);
         if (dir == null) dir = getFilesDir();
         if (dir != null && !dir.exists()) dir.mkdirs();
         File file = new File(dir, "bunanana-report-" + ts + ".txt");
+        for (int i = 2; i < 100 && file.exists(); i++) {
+            file = new File(dir, "bunanana-report-" + ts + "-" + i + ".txt");
+        }
         Writer w = new OutputStreamWriter(new FileOutputStream(file), "UTF-8");
         try {
             w.write(text);

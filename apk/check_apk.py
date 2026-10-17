@@ -12,6 +12,7 @@ except (OSError, zipfile.BadZipFile) as e:
 # e_machine values we care about; the label was previously computed and dropped.
 MACHINES = {0xB7: "ARM64", 0x3E: "x86-64", 0x28: "ARM", 0x03: "x86"}
 
+bad = False
 with z:
     names = z.namelist()
     print("== entries ==")
@@ -27,12 +28,18 @@ with z:
         # BMP characters as UTF-8, so match the encoded bytes.
         for s in [b"MainActivity", b"com/rootdetect/app/MainActivity", b"librootdetect.so",
                   "开始检测".encode("utf-8"), b"nativeLibraryDir"]:
-            print(("   found   " if s in dex else "   MISSING ") + s.decode())
+            found = s in dex
+            if not found:
+                bad = True
+            print(("   found   " if found else "   MISSING ") + s.decode())
     else:
         print("== classes.dex MISSING ==")
+        bad = True
     print("== native libs ==")
+    n_libs = 0
     for n in names:
         if n.startswith("lib/"):
+            n_libs += 1
             data = z.read(n)
             if len(data) >= 20 and data[:4] == b"\x7fELF":
                 machine = int.from_bytes(data[18:20], "little")
@@ -40,3 +47,12 @@ with z:
             else:
                 machine, kind = -1, "not-ELF"
             print("   %-40s %9d bytes  %-7s elf_machine=%d" % (n, len(data), kind, machine))
+    if n_libs == 0:
+        print("   (no lib/* entry: the scanner was not embedded)")
+        bad = True
+
+# The prints above are the report; the exit status is what makes this a gate. It
+# used to always exit 0, so a missing dex string or a missing scanner passed.
+if bad:
+    raise SystemExit("apk sanity check FAILED")
+print("apk sanity check: OK")

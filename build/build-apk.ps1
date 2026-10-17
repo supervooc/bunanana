@@ -90,6 +90,14 @@ foreach ($a in @("arm64", "arm", "x86_64")) {
   $bin = Join-Path $out "rootdetect-$a"
   if (Test-Path $bin) { $entries += ("lib/{0}/librootdetect.so={1}" -f $abiMap[$a], (ToWsl $bin)) }
 }
+# A build with zero embedded scanners passes every later check vacuously
+# (classes.dex alone is still a valid pair for list_apk.py), so require one.
+$libEntries = @($entries | Where-Object { $_ -like 'lib/*' })
+if ($libEntries.Count -eq 0) {
+  throw "no native scanner embedded: build out/rootdetect-arm64 (build/build.ps1) first"
+}
+Write-Host ("    embedded scanners: {0} -> {1}" -f $libEntries.Count,
+            (($libEntries | ForEach-Object { ($_ -split '=')[0] }) -join ', '))
 $pyArgs = @("python3", (ToWsl "$apkSrc\assemble.py"), (ToWsl "$work\unsigned.apk"),
             (ToWsl "$work\base.apk")) + $entries
 $cmdline = ($pyArgs | ForEach-Object { if ($_ -match ' ') { '"' + $_ + '"' } else { $_ } }) -join ' '
