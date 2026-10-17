@@ -253,8 +253,12 @@ void rd_check_paths(rd_ctx *c, rd_report *rep) {
     if (exists) {
       found++;
       rd_sev s = sev_for_artefact(p);
-      bool build_ships_su = rd_starts_with(p, "/system/") || rd_starts_with(p, "/sbin/") ||
-                            rd_starts_with(p, "/vendor/bin/su");
+      /* Only the stock su locations are legitimately shipped by a userdebug
+       * build; the old "/system/" prefix also downgraded /system/bin/ksud,
+       * /system/etc/init/magisk, ... which never ship on a stock image. */
+      bool build_ships_su = strcmp(p, "/system/bin/su") == 0 || strcmp(p, "/system/xbin/su") == 0 ||
+                            strcmp(p, "/system/sbin/su") == 0 || strcmp(p, "/sbin/su") == 0 ||
+                            strcmp(p, "/vendor/bin/su") == 0;
       if (userdebug && s >= SEV_HIGH && build_ships_su) s = SEV_MEDIUM;
       if (s > worst) worst = s;
       char line[512];
@@ -390,7 +394,9 @@ void rd_check_packages(rd_ctx *c, rd_report *rep) {
 
   char ev[RD_MAXEVID];
   ev[0] = '\0';
-  int hit = 0, hidden = 0;
+  char unk[RD_MAXEVID];
+  unk[0] = '\0';
+  int hit = 0, hidden = 0, unknown = 0, definite = 0;
   for (size_t i = 0; i < RD_ROOT_PACKAGE_COUNT; i++) {
     const char *pkg = RD_ROOT_PACKAGES[i];
     bool listed = false;
@@ -407,6 +413,7 @@ void rd_check_packages(rd_ctx *c, rd_report *rep) {
     int dsp = rd_path_state(dp), dsu = rd_path_state(du);
     bool data_dir = dsp == 1 || dsu == 1;
     bool data_unknown = dsp < 0 || dsu < 0;
+    if (data_dir || !data_unknown) definite++;
     if (listed && (data_dir || data_unknown)) {
       hit++;
       rd_add(rep, SEV_HIGH, "package-roots", "root manager application installed", "%s", pkg);
@@ -421,13 +428,37 @@ void rd_check_packages(rd_ctx *c, rd_report *rep) {
              "%s: %s exists yet `cmd package list packages` does not list it - the definitive "
              "signature of KernelSU's \"hide the app\" / Magisk DenyList-style renaming.",
              pkg, dp);
+    } else if (data_unknown) {
+      unknown++;
+      if (strlen(unk) < sizeof(unk) - 64) rd_appendf(unk, sizeof(unk), "%s (%s)\n", pkg, dp);
     }
     if (listed && strlen(ev) < sizeof(ev) - 64) rd_appendf(ev, sizeof(ev), "%s\n", pkg);
   }
   if (hit && ev[0])
     rd_add_ev(rep, SEV_HIGH, "package-roots-list", "known root managers enumerated", ev,
               "%d of %zu known root manager packages are installed.", hit, RD_ROOT_PACKAGE_COUNT);
-  if (!hit && !hidden)
+  if (unknown) {
+    /* The name is neither listed nor stat-able, so "package-clean" would have
+     * been a false negative waiting to happen (a hidden manager whose data dir
+     * this uid cannot stat looks exactly like an absent one). Report the
+     * inconclusiveness instead. When the data directory is otherwise readable
+     * (definite > 0) an EACCES on these specific names is itself suspicious;
+     * when the whole directory is unsearchable it is informational only - run
+     * as root for a definitive answer. */
+    if (definite)
+      rd_add_ev(rep, SEV_MEDIUM, "package-unverifiable",
+                "known root manager package(s) could not be verified", unk,
+                "%d known root manager name(s) are neither listed nor readable: their data path "
+                "returned EACCES although other paths in the same directory were readable, so a "
+                "hidden install cannot be ruled out.", unknown);
+    else
+      rd_add_ev(rep, SEV_INFO, "package-unverifiable",
+                "known root manager package(s) could not be verified", unk,
+                "%d known root manager name(s) are neither listed nor readable because this uid "
+                "cannot search the app data directory; run as root for a definitive answer.",
+                unknown);
+  }
+  if (!hit && !hidden && !unknown)
     rd_add(rep, SEV_INFO, "package-clean", "no known root manager package",
            "checked %zu package names against the full package list.", RD_ROOT_PACKAGE_COUNT);
   free(out);
@@ -449,7 +480,11 @@ static size_t collect_targets(const char *file, int field, char **out, size_t ma
       while (*p && *p != ' ') p++;
     }
     while (*p == ' ') p++;
-    if (!*p) continue;
+    /* A mount target is always an absolute path. Requiring the leading '/' also
+     * drops the bare-number tokens on filesystems whose show_stats appends
+     * continuation lines (nfs_show_stats/cifs_show_stats), which used to become
+     * phantom mount targets and a CRITICAL mount-view-inconsistency. */
+    if (*p != '/') continue;
     char *end = p;
     while (*end && *end != ' ') end++;
     char saved = *end;
@@ -501,10 +536,22 @@ void rd_check_mounts(rd_ctx *c, rd_report *rep) {
   const int field[4] = {1, 4, 4, 4};
   for (int i = 0; i < 4; i++) ns[i] = collect_targets(files[i], field[i], sets[i], MAXX);
 
-  if (ns[0] == 0)
-    rd_add(rep, SEV_INFO, "mount-view", "mount views unavailable",
-           "could not parse /proc/mounts - a hide module may be filtering it entirely.");
-  else
+  if (ns[0] == 0) {
+    int peers = (ns[1] ? 1 : 0) + (ns[2] ? 1 : 0) + (ns[3] ? 1 : 0);
+    if (peers)
+      /* The primary view parsed to nothing while a peer view still lists mounts:
+       * every cross-check below is then skipped, so the anomaly has to be
+       * reported here instead of staying silent. */
+      rd_add(rep, SEV_MEDIUM, "mount-view-empty",
+             "/proc/mounts is empty while another mount view is not",
+             "/proc/mounts parsed to 0 entries but /proc/self/mountinfo=%zu, /proc/1/mountinfo=%zu "
+             "and /proc/self/mountstats=%zu list mounts: an emptied primary view defeats every "
+             "cross-check.", ns[1], ns[2], ns[3]);
+    else
+      rd_add(rep, SEV_INFO, "mount-view", "mount views unavailable",
+             "could not parse /proc/mounts - a hide module may be filtering it entirely, or the "
+             "file is unreadable.");
+  } else
     rd_add(rep, SEV_INFO, "mount-view", "mount views readable",
            "/proc/mounts=%zu /proc/self/mountinfo=%zu /proc/1/mountinfo=%zu /proc/self/mountstats=%zu entries",
            ns[0], ns[1], ns[2], ns[3]);
