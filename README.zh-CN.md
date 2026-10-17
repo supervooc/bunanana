@@ -477,6 +477,6 @@ wsl -u root -e bash scripts/wsl-android-verify.sh   # 推送 + 全量验证
 wsl -u root -e bash android-rootdetect/scripts/verify-all.sh
 ```
 
-最近一次：**PASS=11 FAIL=0 SKIP=0**（Linux 真内核自检 + 干净基线；模拟器自检 + shell/root 双视角；注入 fixtures 命中 `package-hidden` CRITICAL；跨 ABI 差分；APK 结构与三 ABI 二进制哈希）。原始输出在 `/tmp/verify-all/`。
+最近一次：**PASS=18 FAIL=0 SKIP=0**（Linux 真内核自检 + 干净基线；模拟器自检 + shell/root 双视角；注入 fixtures 命中 `package-hidden` CRITICAL；跨 ABI 差分；APK 结构与三 ABI 二进制哈希）。原始输出在 `/tmp/verify-all/`。
 
 > 本机没有 PowerShell 7（`pwsh`），所有 `.ps1` 请用 `powershell -ExecutionPolicy Bypass -File` 调用——README 里的示例已按此修正（这是 t-abi 发现的文档问题）。

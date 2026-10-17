@@ -477,6 +477,6 @@ Every replacement is forced to match **exactly once** (to avoid silent mis-edits
 wsl -u root -e bash android-rootdetect/scripts/verify-all.sh
 ```
 
-Most recent run: **PASS=11 FAIL=0 SKIP=0** (Linux real-kernel self-test + clean baseline; emulator self-test + shell/root dual view; injected fixtures hitting `package-hidden` CRITICAL; cross-ABI diff; APK structure and three-ABI binary hashes). Raw output is in `/tmp/verify-all/`.
+Most recent run: **PASS=18 FAIL=0 SKIP=0** (Linux real-kernel self-test + clean baseline; emulator self-test + shell/root dual view; injected fixtures hitting `package-hidden` CRITICAL; cross-ABI diff; APK structure and three-ABI binary hashes). Raw output is in `/tmp/verify-all/`.
 
 > This machine has no PowerShell 7 (`pwsh`), so all `.ps1` files must be invoked as `powershell -ExecutionPolicy Bypass -File` — the examples in this README were corrected accordingly (a documentation problem found by t-abi).
