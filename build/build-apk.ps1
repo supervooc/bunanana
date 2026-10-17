@@ -71,7 +71,10 @@ Step "javac (java sources -> classes)" {
   $srcs = @(Get-ChildItem "$apkSrc\src" -Recurse -Filter *.java | ForEach-Object { $_.FullName })
   # Quote every path: an unquoted -bootclasspath argument gets mangled by
   # PowerShell's native-command argument handling ("invalid flag: :").
-  & "$jdk\bin\javac.exe" -source 8 -target 8 -nowarn -bootclasspath "$androidJar" `
+  # -encoding UTF-8: the Activity's UI strings are Chinese (and the sources are
+  # UTF-8); without this javac 17 reads them with the platform ANSI codepage on
+  # Windows and mangles the literals.
+  & "$jdk\bin\javac.exe" -source 8 -target 8 -nowarn -encoding UTF-8 -bootclasspath "$androidJar" `
     -d "$work\classes" @srcs
 }
 

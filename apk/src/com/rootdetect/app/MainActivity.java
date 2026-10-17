@@ -38,7 +38,10 @@ import java.util.regex.Pattern;
  * qualified below. */
 
 /**
- * Minimal front end for the native scanner.
+ * Minimal front end for the native scanner. The UI text is Simplified Chinese;
+ * the report printed by the native engine stays English on purpose, because the
+ * parsing below depends on that stable text contract (severity header line +
+ * 11-space detail/evidence indent, and the "verdict:" line).
  *
  * The scanner is a statically linked ELF executable that ships inside this APK
  * as {@code lib/<abi>/librootdetect.so}, so the package manager extracts it into
@@ -53,7 +56,7 @@ import java.util.regex.Pattern;
  * hard to read at a glance:
  *   1. a result banner - is the device rooted, is anything hidden, and *where*
  *      the problems are (the concrete paths/keys behind each finding);
- *   2. an "Export log" button that writes the whole report to a file and opens
+ *   2. an "export log" button that writes the whole report to a file and opens
  *      the system share sheet, so the log can leave the device.
  */
 public class MainActivity extends Activity {
@@ -96,8 +99,8 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView sub = new TextView(this);
-        sub.setText("root / root-hiding detector\n"
-                + "engine: rootdetect - static native build, no dependencies, no network");
+        sub.setText("root / 隐藏 root 检测工具\n"
+                + "检测引擎：rootdetect - 静态编译，无第三方依赖，不联网");
         sub.setTextSize(12f);
         root.addView(sub);
 
@@ -117,7 +120,7 @@ public class MainActivity extends Activity {
         root.addView(summary, slp);
 
         runButton = new Button(this);
-        runButton.setText("Run detection");
+        runButton.setText("开始检测");
         runButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -127,7 +130,7 @@ public class MainActivity extends Activity {
         root.addView(runButton);
 
         exportButton = new Button(this);
-        exportButton.setText("Export log");
+        exportButton.setText("导出日志");
         exportButton.setEnabled(false);
         exportButton.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -151,9 +154,9 @@ public class MainActivity extends Activity {
         root.addView(scroll, lp);
 
         setContentView(root);
-        summary.setText("Result: not scanned yet\nPress \"Run detection\" to check this device.");
-        output.setText(header() + "\nPress \"Run detection\" to scan this device.\n\n"
-                + "Exit codes: 0 clean | 1 suspicious | 2 root detected | 3 hiding detected\n");
+        summary.setText("结论：尚未检测\n点\"开始检测\"检查这台设备。");
+        output.setText(header() + "\n点\"开始检测\"开始扫描这台设备。\n\n"
+                + "退出码：0 干净 | 1 可疑 | 2 检测到 root | 3 检测到隐藏\n");
 
         /* A rotation (or any configuration change) recreates the Activity. Without
          * this the report and the export button were lost and the user had to
@@ -166,7 +169,7 @@ public class MainActivity extends Activity {
                 summary.setText(buildSummary(verdict, parseFindings(saved)));
                 summary.setBackgroundColor(colorFor(verdict));
                 output.setText(saved);
-                runButton.setText("Run detection again");
+                runButton.setText("重新检测");
                 exportButton.setEnabled(true);
             }
         }
@@ -181,15 +184,15 @@ public class MainActivity extends Activity {
     private String header() {
         return "uid " + android.os.Process.myUid() + "  |  " + Build.MANUFACTURER + " " + Build.MODEL
                 + "  |  Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")\n"
-                + "primary abi: " + (Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "?");
+                + "主 ABI：" + (Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "?");
     }
 
     private void startScan() {
         runButton.setEnabled(false);
         exportButton.setEnabled(false);
         summary.setBackgroundColor(0xFF455A64);
-        summary.setText("Result: scanning...");
-        output.setText("scanning...\n");
+        summary.setText("结论：正在检测……");
+        output.setText("正在扫描……\n");
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -208,7 +211,7 @@ public class MainActivity extends Activity {
                         output.setText(lastLog);
 
                         runButton.setEnabled(true);
-                        runButton.setText("Run detection again");
+                        runButton.setText("重新检测");
                         exportButton.setEnabled(true);
                     }
                 });
@@ -251,13 +254,13 @@ public class MainActivity extends Activity {
         try {
             bin = scannerFile();
         } catch (Exception e) {
-            sb.append("could not stage the scanner: ").append(e).append("\n");
+            sb.append("无法准备扫描器：").append(e).append("\n");
         }
         if (bin == null) {
             return sb.toString() + fallbackInstructions();
         }
-        sb.append("scanner: ").append(bin).append('\n');
-        sb.append("mode   : verbose (uid ").append(android.os.Process.myUid()).append(")\n");
+        sb.append("扫描器：").append(bin).append('\n');
+        sb.append("模式  ：详细输出 (uid ").append(android.os.Process.myUid()).append(")\n");
         sb.append("----------------------------------------------\n");
 
         List<String> cmd = new ArrayList<String>();
@@ -278,17 +281,17 @@ public class MainActivity extends Activity {
                 r.close();
             }
             int rc = p.waitFor();
-            sb.append("\n[exit code ").append(rc).append("] ");
+            sb.append("\n[退出码 ").append(rc).append("] ");
             switch (rc) {
-                case 0: sb.append("CLEAN"); break;
-                case 1: sb.append("SUSPICIOUS"); break;
-                case 2: sb.append("ROOT DETECTED"); break;
-                case 3: sb.append("HIDING DETECTED"); break;
-                default: sb.append("scanner error"); break;
+                case 0: sb.append("干净"); break;
+                case 1: sb.append("可疑"); break;
+                case 2: sb.append("检测到 root"); break;
+                case 3: sb.append("检测到隐藏"); break;
+                default: sb.append("扫描器错误"); break;
             }
             sb.append('\n');
         } catch (Exception e) {
-            sb.append("could not execute ").append(bin).append(": ").append(e).append('\n');
+            sb.append("无法执行 ").append(bin).append("：").append(e).append('\n');
             sb.append(fallbackInstructions());
         } finally {
             if (p != null) {
@@ -353,6 +356,15 @@ public class MainActivity extends Activity {
         return "SCAN_ERROR";
     }
 
+    /** Chinese display name for the engine's verdict codes. */
+    private static String verdictName(String v) {
+        if ("CLEAN".equals(v)) return "干净";
+        if ("SUSPICIOUS".equals(v)) return "可疑";
+        if ("ROOT_DETECTED".equals(v)) return "检测到 root";
+        if ("HIDING_DETECTED".equals(v)) return "检测到隐藏";
+        return "扫描出错";
+    }
+
     /** The banner text: verdict + root/hiding booleans + where the problems are. */
     private static String buildSummary(String verdict, List<Finding> findings) {
         if ("SCAN_ERROR".equals(verdict)) {
@@ -360,21 +372,21 @@ public class MainActivity extends Activity {
              * to run. That is not a clean device, so the clean banner must not
              * be printed - on a security tool it is the worst possible false
              * negative. */
-            return "Result        : SCAN_ERROR\n"
-                    + "Device rooted : unknown\n"
-                    + "Root hiding   : unknown\n"
-                    + "The scanner produced no verdict (it could not be staged or executed).\n"
-                    + "See the log below and the manual instructions.\n";
+            return "结论        ：扫描出错\n"
+                    + "是否 root   ：未知\n"
+                    + "是否存在隐藏：未知\n"
+                    + "扫描器没有给出结论（无法部署或执行）。\n"
+                    + "请查看下方日志以及手动运行说明。\n";
         }
         boolean rooted = "ROOT_DETECTED".equals(verdict) || "HIDING_DETECTED".equals(verdict);
         boolean hiding = "HIDING_DETECTED".equals(verdict);
-        String rootText = rooted ? "YES" : ("SUSPICIOUS".equals(verdict) ? "maybe" : "no");
+        String rootText = rooted ? "是" : ("SUSPICIOUS".equals(verdict) ? "可能" : "否");
 
         StringBuilder sb = new StringBuilder();
-        sb.append("Result        : ").append(verdict).append('\n');
-        sb.append("Device rooted : ").append(rootText).append('\n');
-        sb.append("Root hiding   : ").append(hiding ? "YES" : "no").append('\n');
-        sb.append("Where the problems are:\n");
+        sb.append("结论        ：").append(verdictName(verdict)).append('\n');
+        sb.append("是否 root   ：").append(rootText).append('\n');
+        sb.append("是否存在隐藏：").append(hiding ? "是" : "否").append('\n');
+        sb.append("问题位置：\n");
 
         int shown = 0;
         for (Finding f : findings) {
@@ -394,7 +406,7 @@ public class MainActivity extends Activity {
             sb.append('\n');
         }
         if (shown == 0) {
-            sb.append("  (none above MEDIUM - the device looks clean here)\n");
+            sb.append("  （没有 MEDIUM 及以上的问题，这台设备看起来是干净的）\n");
         }
         return sb.toString();
     }
@@ -410,18 +422,18 @@ public class MainActivity extends Activity {
     /** Save the last report to a file, then open the system share sheet. */
     private void exportLog() {
         if (lastLog == null || lastLog.isEmpty()) {
-            Toast.makeText(this, "run a detection first", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "请先运行一次检测", Toast.LENGTH_SHORT).show();
             return;
         }
         File file;
         try {
             file = writeLog(lastLog);
         } catch (Exception e) {
-            Toast.makeText(this, "could not save the log: " + e, Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "无法保存日志：" + e, Toast.LENGTH_LONG).show();
             return;
         }
-        Toast.makeText(this, "log saved: " + file.getAbsolutePath(), Toast.LENGTH_LONG).show();
-        share(lastLog + "\n\n[saved on device: " + file.getAbsolutePath() + "]\n");
+        Toast.makeText(this, "日志已保存：" + file.getAbsolutePath(), Toast.LENGTH_LONG).show();
+        share(lastLog + "\n\n[已保存到设备：" + file.getAbsolutePath() + "]\n");
     }
 
     /**
@@ -448,24 +460,23 @@ public class MainActivity extends Activity {
     private void share(String text) {
         Intent send = new Intent(Intent.ACTION_SEND);
         send.setType("text/plain");
-        send.putExtra(Intent.EXTRA_SUBJECT, "bunanana root detection report");
+        send.putExtra(Intent.EXTRA_SUBJECT, "bunanana 检测报告");
         send.putExtra(Intent.EXTRA_TEXT, text);
         try {
-            startActivity(Intent.createChooser(send, "Export log"));
+            startActivity(Intent.createChooser(send, "导出日志"));
         } catch (Exception e) {
-            Toast.makeText(this, "no app can share the log: " + e, Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "没有可分享日志的应用：" + e, Toast.LENGTH_LONG).show();
         }
     }
 
     private String fallbackInstructions() {
-        return "\nThis build could not run the bundled scanner in-process. The same\n"
-                + "binary is also shipped as a plain command line tool:\n\n"
+        return "\n这个版本无法在应用内运行内置扫描器。同一个二进制也可以作为\n"
+                + "命令行工具单独使用：\n\n"
                 + "  adb push out/rootdetect-arm64 /data/local/rx\n"
                 + "  adb shell chmod 700 /data/local/rx\n"
-                + "  adb shell /data/local/rx -v        # shell view\n"
-                + "  adb root && adb shell /data/local/rx -v   # deep kernel view\n"
-                + "\n(/data/local, not /data/local/tmp: the latter is group- and\n"
-                + "other-writable by the `shell` user, so a root-run binary there can be\n"
-                + "swapped out between the push and the exec.)\n";
+                + "  adb shell /data/local/rx -v        # shell 视角\n"
+                + "  adb root && adb shell /data/local/rx -v   # 深度内核视角\n"
+                + "\n（用 /data/local 而不是 /data/local/tmp：后者对 `shell` 用户\n"
+                + "可写，root 身份运行的二进制可能在 push 与 exec 之间被替换。）\n";
     }
 }

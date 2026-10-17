@@ -23,8 +23,10 @@ with z:
         dex = b""
     if dex:
         print("== classes.dex (%d bytes) ==" % len(dex))
+        # The button label is Chinese now ("开始检测"); the dex string table stores
+        # BMP characters as UTF-8, so match the encoded bytes.
         for s in [b"MainActivity", b"com/rootdetect/app/MainActivity", b"librootdetect.so",
-                  b"Run detection", b"nativeLibraryDir"]:
+                  "开始检测".encode("utf-8"), b"nativeLibraryDir"]:
             print(("   found   " if s in dex else "   MISSING ") + s.decode())
     else:
         print("== classes.dex MISSING ==")
