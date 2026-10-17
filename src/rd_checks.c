@@ -49,6 +49,38 @@ const char *const RD_HIDING_PATHS[] = {
 };
 const size_t RD_HIDING_PATH_COUNT = sizeof(RD_HIDING_PATHS) / sizeof(RD_HIDING_PATHS[0]);
 
+/* Installer/loader layout of the susfs_guard_lkm LKM
+ * (github.com/inforcqb/susfs4ksu-lkm). Kept out of the generic corpora so that
+ * "a su binary exists" (which may predate rooting) and "this exact hiding LKM
+ * is installed" stay distinguishable findings. Paths verified against the
+ * project's module/customize.sh, module/load.sh, module/early-dispatch.sh,
+ * tools/pack_module.py and README:
+ *  - the flashable KernelSU module installs to /data/adb/modules/susfs_guard_lkm
+ *    with lib/susfs_guard_lkm-<kmi>.ko, bin/susfs_insmod, module.prop
+ *    (id=susfs_guard_lkm) and an optional early_load marker;
+ *  - customize.sh also installs /data/adb/post-fs-data.d/00-susfs-guard-lkm.sh;
+ *  - the manual route in the README loads /data/adb/loader/susfs_guard_lkm.ko
+ *    (KernelSU: `ksud insmod`, otherwise the susfs_insmod loader).
+ * The KMI-suffixed .ko names under .../lib are found by a directory scan in
+ * rd_check_susfs_lkm(), not by this table, because the suffix is open-ended. */
+const char *const RD_SUSFS_LKM_PATHS[] = {
+    "/data/adb/modules/susfs_guard_lkm",
+    "/data/adb/modules/susfs_guard_lkm/module.prop",
+    "/data/adb/modules/susfs_guard_lkm/load.log",
+    "/data/adb/modules/susfs_guard_lkm/early_load",
+    "/data/adb/modules/susfs_guard_lkm/skip_mount",
+    "/data/adb/modules/susfs_guard_lkm/bin/susfs_insmod",
+    "/data/adb/modules/susfs_guard_lkm/kmi.sh",
+    "/data/adb/modules_update/susfs_guard_lkm",
+    "/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh",
+    "/data/adb/loader/susfs_guard_lkm.ko",
+    "/data/adb/loader/susfs_insmod",
+    "/data/local/tmp/susfs_guard_lkm.ko",
+    "/data/local/tmp/susfs_insmod",
+    "/sdcard/susfs_guard_lkm.ko",
+};
+const size_t RD_SUSFS_LKM_PATH_COUNT = sizeof(RD_SUSFS_LKM_PATHS) / sizeof(RD_SUSFS_LKM_PATHS[0]);
+
 const char *const RD_ROOT_PACKAGES[] = {
     "com.topjohnwu.magisk", "io.github.huskydg.magisk", "io.github.vvb2060.magisk",
     "me.weishu.kernelsu", "com.rifsxd.ksunext", "me.bmax.apatch", "me.garfieldhan.apatch.next",

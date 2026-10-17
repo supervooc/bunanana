@@ -35,7 +35,7 @@ android-rootdetect/
 │   ├── rd.h                    # 类型、接口、语料表声明
 │   ├── rd_util.c               # IO / exec / getprop / 原始 syscall 探针 / 报告模型
 │   ├── rd_checks.c             # 环境、路径、包名、挂载、进程
-│   ├── rd_kernel.c             # 模块、kallsyms、SuSFS 节点、交叉验证、root 深度检查
+│   ├── rd_kernel.c             # 模块、kallsyms、SuSFS 节点、交叉验证、root 深度检查、susfs_guard_lkm 专项
 │   ├── rd_extra.c              # 低成本额外信号：控制 socket、ptrace、调用方环境、失联映射
 │   ├── rd_selftest.c           # --selftest：逻辑单测 + 误报卫士
 │   └── main.c                  # CLI
@@ -138,6 +138,24 @@ adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 
 > 关于「为什么不是简单 grep 关键字」：SuSFS 这类模块已经把关键字、路径、模块名、符号名都藏干净了。上面这些项检查的是**它藏东西这个行为本身留下的矛盾**，而不是它的名字。
 
+### D. 专项：`susfs_guard_lkm`（LKM 版 SuSFS，github.com/inforcqb/susfs4ksu-lkm）
+
+该移植把 SuSFS 做成内核可加载模块（GKI 设备无需重编内核）。它的源码/文档里有多处「自曝」，专项检测直接建立在这些事实之上，而不是碰运气匹配模块名：
+
+| id | 级别 | 原理 |
+|---|---|---|
+| `susfs-lkm-module-filtered` | **CRITICAL** | **模块自过滤被抓现行**：`/sys/module/susfs_guard_lkm`（或其 `parameters/`、kallsyms 的 `[susfs_guard_lkm]` 标签）在内核里可见，而 `/proc/modules` 没有对应行。它的加载横幅原文写着「本模块会被从 `/proc/modules` 中滤除，对包括 root 在内的所有调用者生效，请改用 `/sys/module/susfs_guard_lkm` 判断是否已加载」——两个视图互相矛盾，就是过滤器正在工作 |
+| `susfs-lkm-module` | HIGH | 模块被 `/proc/modules` 列出（自过滤未启用或 hide 列表被 `clear`），或 `/proc/modules` 不可读但 sysfs / 参数 / kallsyms 任一可见——隐藏能力本身已就位 |
+| `susfs-lkm-artefact` | HIGH | 磁盘上的安装/加载布局：`/data/adb/modules{,s_update}/susfs_guard_lkm`（含 `module.prop`、`lib/susfs_guard_lkm-<kmi>.ko`、`bin/susfs_insmod`、`early_load`）、`/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh`、README 手动路线的 `/data/adb/loader/susfs_guard_lkm.ko`。`.ko` 必须留盘以便开机重插，藏不掉 |
+| `susfs-lkm-artefact-hidden` | **CRITICAL** | 上述路径对部分 syscall 可见、对另一部分 ENOENT——按路径的隐藏规则只拦截了一部分接口 |
+| `susfs-lkm-node-fingerprint` | **CRITICAL** | `/proc/susfs_*` 节点**内容**与该移植版文档（`PROC_INTERFACES.md`）记载的计数器/表格格式吻合：`opath/openat nr=`、`maps: armed=`、`stat nr `、`hide_modules:`、`priv_app_sid=`…。光「节点存在」可能被伪造，能复现这些读数说明是模块自己的 read handler 在响应 |
+| `susfs-lkm-usedby` | HIGH | `hide_modules` 只删模块自己那一行；其他模块的 used-by 列仍会写出它的名字 |
+| `kernel-module-list-ghost` | MEDIUM | `tainted` 的 bit 12 (OE) 置位（装载过 out-of-tree 模块）而 `/proc/modules` 一条都不列。taint 是黏性的（rmmod 后仍保留），所以只算佐证：要么模块被卸载过，要么列表被清空 |
+
+模块名按**前缀**匹配（`susfs_guard_lkm`、`susfs_guard_lkm_android13_5_15`…）：该模块以 `.ko` 文件名作为模块名，而发布包叫 `susfs_guard_lkm-<kmi>.ko`。
+
+> 非 root 时的盲区（如实说明）：hide 规则武装后 sysfs 目录对非 root 不可见、`/proc/susfs_*` 一律 ENOENT——上面一半证据只有 uid 0 拿得到，与 §8「深度检查需 root」一致。
+
 ---
 
 ## 5. `--selftest`
@@ -146,10 +164,11 @@ adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 
 1. **决策逻辑**：投票表在各种组合下的判定、verdict 映射、JSON 转义、缓冲区边界、verdict 对应的 flag。
 2. **误报卫士**：在「干净设备」上，最容易误报的两项必须保持沉默——`uname()` 必须等于 `/proc/sys/kernel/osrelease`，`/proc/mounts` 与 `/proc/self/mountinfo` 的挂载目标集合必须相等。
+3. **专项检测一致性**：`susfs_guard_lkm` 专项检查的结论用独立扫描从 `/proc/modules`、`/sys/module`、kallsyms 现场重算后比对——干净设备必须沉默，模块存在时必须给出对应结论；节点内容指纹另有纯逻辑用例。
 
 ```
 $ adb shell /data/local/rx/rx --selftest
-rootdetect 1.0.2 self-test   uid=2000
+rootdetect 1.0.3 self-test   uid=2000
 -- decision logic --
   PASS  keyword: magisk package name
   ...
@@ -282,6 +301,7 @@ powershell -ExecutionPolicy Bypass -File scripts/inject-root-fixtures.ps1 -Clean
 | 新的一类交叉验证 | 在 `rd_kernel.c` 加函数并在 `rd_check_consistency()` 里调用 |
 | 新的报告项 id 与它对 verdict 的贡献 | `rd_add*()` 调用处 + `rd_util.c` 的 `id_flags()` 表（verdict 只认这张表，保证可复现） |
 | 新的内核深度检查 | `rd_kernel.c` 的 `rd_check_deep()`（仅在 uid 0 下运行） |
+| `susfs_guard_lkm`（LKM 版）专项检测 | `rd_kernel.c` 的 `rd_check_susfs_lkm()`；安装路径语料在 `rd_checks.c` 的 `RD_SUSFS_LKM_PATHS`；节点内容指纹在 `rd_susfs_lkm_node_fingerprint()` |
 
 ---
 
@@ -383,7 +403,7 @@ APK 内容（已逐项核验）：
 
 产物（已核验）：
 
-- 产物：`out/bunanana.apk`，**2,885,164 字节**，`sha256=8318e0348d12ba509ac8204b67e13a4809a7edbd55f7789ece668d60b8545998`
+- 产物：`out/bunanana.apk`，**7,218,732 字节**，`sha256=c78d49584ddca3719b82dad0be7fc56fd4f806dfe08c21eac39d2089f2cec59b`
 - 下载直链：https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
 
 设计要点：

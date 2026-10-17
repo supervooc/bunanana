@@ -92,6 +92,7 @@ int main(int argc, char **argv) {
   rd_check_mounts(&ctx, &rep);
   rd_check_kernel(&ctx, &rep);
   rd_check_susfs(&ctx, &rep);
+  rd_check_susfs_lkm(&ctx, &rep);
   rd_check_processes(&ctx, &rep);
   rd_check_extra(&ctx, &rep);
   if (!fast) rd_check_consistency(&ctx, &rep);
