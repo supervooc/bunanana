@@ -164,7 +164,6 @@ typedef struct {
   pid_t pid;
   bool is_root;      /* running as uid 0 */
   const char *abi;   /* "x86_64", "aarch64", ... */
-  bool verbose;
 } rd_ctx;
 
 /* Each check appends findings to `rep`. */

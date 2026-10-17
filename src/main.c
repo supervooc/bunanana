@@ -75,7 +75,6 @@ int main(int argc, char **argv) {
   ctx.pid = getpid();
   ctx.is_root = (ctx.uid == 0);
   ctx.abi = detect_abi();
-  ctx.verbose = verbose;
   rd_props_load(&ctx.props);
 
   rd_report rep;

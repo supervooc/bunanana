@@ -81,12 +81,29 @@ static void set_fmt(char *const *a, size_t na, char *out, size_t osz) {
     o += (size_t)snprintf(out + o, osz - o, "%s%s", i ? "," : "", a[i]);
 }
 
+/* Directory of the running executable. On Android the only writable place for
+ * the parser tests is the binary's own dir when the APK ran it from the copy in
+ * the app's private files dir (a shell/app uid cannot write /data/local/tmp). */
+static const char *exe_dir(void) {
+  static char d[512];
+  static int done = 0;
+  if (!done) {
+    done = 1;
+    ssize_t n = readlink("/proc/self/exe", d, sizeof d - 1);
+    if (n <= 0) { d[0] = '\0'; return d; }
+    d[n] = '\0';
+    char *s = strrchr(d, '/');
+    if (s) *s = '\0';
+  }
+  return d;
+}
+
 /* Create a private temp file with `body` in it. Prefers /data/local/tmp on a
- * device, /tmp (then $TMPDIR) on a plain Linux kernel. */
+ * device, /tmp (then $TMPDIR, then the exe dir) on a plain Linux kernel. */
 static bool tmp_write_file(char *path, size_t psz, const char *body) {
-  const char *dirs[3] = {"/data/local/tmp", "/tmp", getenv("TMPDIR")};
+  const char *dirs[4] = {"/data/local/tmp", "/tmp", getenv("TMPDIR"), exe_dir()};
   int fd = -1;
-  for (int i = 0; i < 3 && fd < 0; i++) {
+  for (int i = 0; i < 4 && fd < 0; i++) {
     if (!dirs[i] || !dirs[i][0]) continue;
     snprintf(path, psz, "%s/rootdetect-selftest-XXXXXX", dirs[i]);
     fd = mkstemp(path);
@@ -318,10 +335,10 @@ static void test_live_probes(void) {
 
   /* Pick the first writable staging directory: a device has /data/local/tmp, a
    * plain Linux boot (the QEMU/WSL harness) has /tmp. */
-  const char *tmpdirs[4] = {"/data/local/tmp", "/tmp", getenv("TMPDIR"), NULL};
+  const char *tmpdirs[4] = {"/data/local/tmp", "/tmp", getenv("TMPDIR"), exe_dir()};
   char p[320] = "";
   int fd = -1;
-  for (size_t i = 0; i < 3; i++) {
+  for (size_t i = 0; i < 4; i++) {
     if (!tmpdirs[i] || !tmpdirs[i][0]) continue;
     snprintf(p, sizeof p, "%s/rootdetect-self-XXXXXX", tmpdirs[i]);
     fd = mkstemp(p);
@@ -460,14 +477,22 @@ static void test_kernel_parsers(void) {
     }
     free(raw_mods);
     const rd_finding *fm = find_finding(&rep, "kernel-module");
-    ok(fm != NULL, "/proc/modules scan always records what it saw", NULL);
+    /* rd_check_kernel emits SEV_HIGH with the "N of M ... match" detail when a
+     * module name matches a keyword, and SEV_INFO with "N modules listed"
+     * otherwise. sscanf("%d modules listed") also matched the HIGH form's first
+     * %d (it returns 1 after failing the literal), so the guard must be the
+     * severity plus the exact format - otherwise the "total" was compared with
+     * mod_hits and the check FAILed on any host with a keyword-named module. */
     char dm[160] = "";
     int reported = -1;
-    if (fm && fm->detail && sscanf(fm->detail, "%d modules listed", &reported) == 1) {
+    if (fm && fm->sev == SEV_INFO && fm->detail &&
+        sscanf(fm->detail, "%d modules listed", &reported) == 1) {
       snprintf(dm, sizeof dm, "sscanf=%d independent=%zu", reported, lines);
       ok((size_t)reported == lines, "/proc/modules first field counted once per line", dm);
     } else {
-      skip("/proc/modules count cross-check", "a loaded module name matches a hiding keyword");
+      skip("/proc/modules count cross-check",
+           fm && fm->sev == SEV_HIGH ? "a loaded module name matches a hiding keyword"
+                                     : "/proc/modules not readable as a plain list");
     }
     if (lines == 0)
       skip("/proc/modules first-field split on real data", "this kernel lists no loadable modules");
@@ -536,8 +561,10 @@ static void test_kernel_parsers(void) {
     } else {
       ok(fh != NULL, "kallsyms tags missing from /proc/modules are reported", dk);
     }
-    /* The cross-check only runs when nothing is missing; each tag must be seen. */
-    if (have_mods && fh == NULL) {
+    /* The cross-check only runs when /proc/modules is readable AND non-empty
+     * (nn > 0); with an empty module list rd_check_kernel deliberately reports
+     * kernel-modules-crosscheck-skipped, which is not kernel-module-crosscheck. */
+    if (have_mods && nn > 0 && fh == NULL) {
       const rd_finding *fx = find_finding(&rep, "kernel-module-crosscheck");
       int vis = -1;
       char dv[160] = "";
@@ -664,9 +691,21 @@ static int mount_views_agree(char *detail, size_t dsz) {
   int all_same = 1;
   size_t off = 0;
   appends(detail, dsz, &off, "/proc/mounts=%zu", nb);
+  /* /proc/1/mountinfo is only a second view of the SAME table when init shares
+   * this process's mount namespace (per-app namespaces / su --mount-master /
+   * containers make it legitimately different). rd_check_mounts() guards this;
+   * the self-test must too, or it FAILs on a clean device when run from the app. */
+  char self_ns[64] = "", init_ns[64] = "";
+  int init_view_ok = rd_read_link("/proc/self/ns/mnt", self_ns, sizeof self_ns) > 0 &&
+                     rd_read_link("/proc/1/ns/mnt", init_ns, sizeof init_ns) > 0 &&
+                     strcmp(self_ns, init_ns) == 0;
   const char *files[3] = {"/proc/self/mountinfo", "/proc/1/mountinfo", "/proc/self/mountstats"};
   const int fields[3] = {4, 4, 4};
   for (int f = 0; f < 3; f++) {
+    if (f == 1 && !init_view_ok) {
+      appends(detail, dsz, &off, " /proc/1/mountinfo=skipped (different mount namespace)");
+      continue;
+    }
     size_t no = rd_collect_mount_targets(files[f], fields[f], other, 512);
     int same = (no == nb);
     for (size_t i = 0; same && i < nb; i++) {
