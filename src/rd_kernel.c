@@ -47,8 +47,12 @@ typedef struct {
 
 static void ksym_add(ksym_tab *t, const char *name, unsigned long long addr, const char *mod) {
   if (t->n == t->cap) {
-    t->cap = t->cap ? t->cap * 2 : 512;
-    t->v = (ksym *)realloc(t->v, t->cap * sizeof(ksym));
+    /* cap advances only on a successful realloc (same rule as find_push()). */
+    size_t ncap = t->cap ? t->cap * 2 : 512;
+    ksym *nv = (ksym *)realloc(t->v, ncap * sizeof(ksym));
+    if (!nv) return;
+    t->v = nv;
+    t->cap = ncap;
   }
   ksym *k = &t->v[t->n++];
   snprintf(k->name, sizeof(k->name), "%s", name);
@@ -288,7 +292,19 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
                        ktab->v[i].name, kptr_str(ktab->v[i].addr, buf, sizeof(buf)));
         }
       }
-      if (hidden_mod)
+      /* Only conclude "hidden" when /proc/modules was actually readable AND
+       * non-empty. If it is unreadable (some kernels/SELinux restrict it to
+       * root) or empty, kallsyms still carries [module] tags and every one of
+       * them would be reported as hidden - turning a clean device into
+       * HIDING_DETECTED. That is worse than not checking. */
+      if (hidden_mod && (mods == NULL || mod_count == 0))
+        rd_add(rep, SEV_INFO, "kernel-modules-crosscheck-skipped",
+               "module list unavailable or empty, cross-check skipped",
+               "/proc/modules could not be read or lists no modules, so the %d module symbol(s) "
+               "seen in kallsyms cannot be told apart from a filtered module list; "
+               "skipping the hidden-module conclusion.",
+               hidden_mod);
+      else if (hidden_mod)
         rd_add_ev(rep, SEV_HIGH, "kernel-module-hidden",
                   "module symbols visible in kallsyms but the module is missing from /proc/modules",
                   mod_ev2,
@@ -951,12 +967,16 @@ static bool abi_candidate(char *out, size_t sz, char *reason, size_t rsz) {
                                       "rootdetect-x86_64", "rx32", "rx64", NULL};
   static const char *const dirs[] = {NULL /* self dir */, "/data/local/rx" /* root-only */,
                                       "/data/local/tmp" /* only usable unprivileged */, NULL};
-  char candidates[16][512];
+  /* 8 names x 3 directories = 24 candidates; the array and the bound must allow
+   * all of them or the last directory (/data/local/tmp, the only one usable
+   * unprivileged) would never be scanned. */
+  enum { RD_ABI_MAXCAND = 40 };
+  char candidates[RD_ABI_MAXCAND][512];
   size_t nc = 0;
   for (int d = 0; dirs[d] || d == 0; d++) {
     const char *base = (d == 0) ? (dir[0] ? dir : NULL) : dirs[d];
     if (!base) continue;
-    for (int i = 0; names[i] && nc < 16; i++) {
+    for (int i = 0; names[i] && nc < RD_ABI_MAXCAND; i++) {
       snprintf(candidates[nc], sizeof(candidates[0]), "%s/%s", base, names[i]);
       nc++;
     }

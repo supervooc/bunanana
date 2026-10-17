@@ -121,7 +121,8 @@ if (-not $SkipSign) {
     & "$bt\apksigner.bat" verify --print-certs "$apk"
   }
 } else {
-  Copy-Item "$work\aligned.apk" (Join-Path $out "bunanana-unsigned.apk") -Force
+  $apk = Join-Path $out "bunanana-unsigned.apk"
+  Copy-Item "$work\aligned.apk" $apk -Force
 }
 
 Step "badging" {
