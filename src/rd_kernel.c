@@ -125,6 +125,7 @@ bool rd_parse_proc_modules_line(const char *line, char *name, size_t sz) {
 
 static ksym_tab *kallsyms_parse(const char *txt, const char *const *want) {
   ksym_tab *t = (ksym_tab *)calloc(1, sizeof(ksym_tab));
+  if (!t) return NULL;
   char *copy = strdup(txt);
   if (!copy) { free(t); return NULL; }
   char *save = NULL;
@@ -210,9 +211,21 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
       else if (t & 1)
         rd_add_ev(rep, SEV_LOW, "kernel-taint", "kernel tainted by a proprietary module", ev,
                   "taint bit 0 (P): common on stock devices with vendor modules.");
-      else
-        rd_add_ev(rep, SEV_MEDIUM, "kernel-taint", "kernel is tainted", ev,
-                  "a module/condition marked the kernel, which stock builds typically avoid.");
+      else {
+        /* Bits that stock / vendor kernels set routinely without meaning
+         * anything: S(2), M(4), B(5), U(6), A(8), W(9), C(10), I(11).
+         * Module-related bits (F(1), R(3), O(12, handled above), E(13), L(14),
+         * K(15)) are not benign; anything else also keeps the MEDIUM. */
+        unsigned long benign = (1ul << 2) | (1ul << 4) | (1ul << 5) | (1ul << 6) |
+                               (1ul << 8) | (1ul << 9) | (1ul << 10) | (1ul << 11);
+        if (((unsigned long)t & ~benign) == 0)
+          rd_add_ev(rep, SEV_LOW, "kernel-taint", "kernel tainted by benign conditions", ev,
+                    "only taint bits stock/vendor kernels set routinely (W/A/C/M/S/B/U/I) are "
+                    "present; no module or hooking bit is set.");
+        else
+          rd_add_ev(rep, SEV_MEDIUM, "kernel-taint", "kernel is tainted", ev,
+                    "a module/condition marked the kernel, which stock builds typically avoid.");
+      }
     }
   }
 
@@ -240,16 +253,20 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
       }
     }
   }
-  if (mod_hits)
+  if (!mods)
+    rd_add(rep, SEV_INFO, "kernel-module", "/proc/modules unreadable",
+           "the loaded-module list could not be read (SELinux restricts it to root on some "
+           "devices), so the module-name check did not run - this is not a clean result.");
+  else if (mod_hits)
     rd_add_ev(rep, SEV_HIGH, "kernel-module", "loaded kernel module names a root framework",
               mod_ev, "%d of %d loaded modules match a hiding-framework name.", mod_hits, mod_count);
   else
     rd_add(rep, SEV_INFO, "kernel-module", "no suspicious module name in /proc/modules",
            "%d modules listed.", mod_count);
 
-  /* /sys/module: names matching a framework, and names whose sysfs node is
-   * missing although the module is listed (sus_path only hides the nodes it was
-   * told about). */
+  /* /sys/module: names matching a framework. (The cross-check of /proc/modules
+   * names against their /sys/module node - which sus_path hides independently -
+   * is NOT implemented here; an earlier comment claimed it was.) */
   char sys_ev[RD_MAXEVID];
   sys_ev[0] = '\0';
   int sys_hits = 0;
@@ -385,14 +402,18 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
         } else {
           unsigned long long entry = 0;
           if (kcore_read(sct + (unsigned long long)__NR_openat * 8, &entry, 8)) {
-            if (entry != openat)
+            if (entry != openat) {
+              /* Two distinct buffers: kptr_str() returns its argument, so passing
+               * the same buffer twice made both %s read the last-written value
+               * (and the two writes were unsequenced). */
+              char buf2[64];
               rd_add(rep, SEV_CRITICAL, "kernel-syscall-table-patched",
                      "sys_call_table entry does not point at the real syscall",
                      "sys_call_table[%d]=%s but kallsyms says the syscall is at %s - the table "
                      "was rewritten at runtime (SuSFS susfs_fp_hook / any syscall hook).",
                      __NR_openat, kptr_str(entry, buf, sizeof(buf)),
-                     kptr_str(openat, buf, sizeof(buf)));
-            else
+                     kptr_str(openat, buf2, sizeof(buf2)));
+            } else
               rd_add(rep, SEV_INFO, "kernel-syscall-table",
                      "sys_call_table[openat] matches kallsyms",
                      "verified through /proc/kcore: %s", kptr_str(entry, buf, sizeof(buf)));

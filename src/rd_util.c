@@ -449,7 +449,7 @@ int rd_run(const char *const argv[], char *out, size_t outsz) {
   if (pid < 0) { close(pfd[0]); close(pfd[1]); return -1; }
   if (pid == 0) {
     /* child */
-    int devnull = open("/dev/null", O_RDWR);
+    int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
     if (devnull >= 0) { dup2(devnull, STDIN_FILENO); }
     if (out) {
       dup2(pfd[1], STDOUT_FILENO);
@@ -485,15 +485,19 @@ int rd_run(const char *const argv[], char *out, size_t outsz) {
      * exits normally and the truncation is reported as a normal exit. */
     if (full) {
       char sink[4096];
-      while (read(pfd[0], sink, sizeof(sink)) > 0) {}
+      ssize_t r;
+      while ((r = read(pfd[0], sink, sizeof(sink))) > 0 || (r < 0 && errno == EINTR)) {}
     }
   } else {
     char sink[4096];
-    while (read(pfd[0], sink, sizeof(sink)) > 0) {}
+    ssize_t r;
+    while ((r = read(pfd[0], sink, sizeof(sink))) > 0 || (r < 0 && errno == EINTR)) {}
   }
   close(pfd[0]);
   int status = 0;
-  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+  pid_t waited;
+  while ((waited = waitpid(pid, &status, 0)) < 0 && errno == EINTR) {}
+  if (waited < 0) return -1; /* e.g. ECHILD: the caller set SIGCHLD to SIG_IGN */
   if (WIFEXITED(status)) return WEXITSTATUS(status);
   return -1;
 }
@@ -793,7 +797,12 @@ bool rd_row_inconsistent(const rd_probe_row *row, char *cons_out, size_t cons_sz
     if (probes[i].v == 0) yes[ny++] = probes[i].n;
     else if (probes[i].v == 1) no[nn++] = probes[i].n;
   }
-  if (!ny || !nn) return false;
+  if (!ny || !nn) {
+    /* "Not inconsistent" is still an answer: NUL the caller's buffer so the
+     * self-test never prints uninitialised bytes, then report false. */
+    if (cons_sz && cons_out) cons_out[0] = '\0';
+    return false;
+  }
   /* Callers may pass a NULL buffer to ask "is this row inconsistent?". Returning
    * here also removes the cons_sz-1 pointer arithmetic below, which was UB for
    * cons_sz == 0 (cons_out + SIZE_MAX). Found by the t2 self-test review. */
