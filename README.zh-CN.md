@@ -10,7 +10,7 @@
 | 我想…… | 怎么做 |
 |---|---|
 | **直接装上用** | 下载 [`out/bunanana.apk`](out/bunanana.apk) 安装到手机（需允许未知来源），打开后点 **RUN DETECTION** |
-| **在电脑上用 adb 跑** | 见 §7：`adb push out/rootdetect-arm64 /data/local/tmp/rx` → `adb shell chmod 755 /data/local/tmp/rx` → `adb shell /data/local/tmp/rx -v` |
+| **在电脑上用 adb 跑** | 见 §7：`adb push out/rootdetect-arm64 /data/local/rx/rx` → `adb shell chmod 755 /data/local/rx/rx` → `adb shell /data/local/rx/rx -v` |
 | **只要命令行扫描器** | 自行构建：`powershell -ExecutionPolicy Bypass -File build/build.ps1 -Abi arm64` |
 | **想先看它凭什么能抓到隐藏** | §4 检测矩阵 + §11 实测记录（真 Linux 内核 + API 30 模拟器 + KVM） |
 | **想知道它自己有哪些已知盲区** | [review/detection-review.md](review/detection-review.md)：红队视角的 15 层覆盖矩阵、误报与投毒面、**15 条源码 bug**（本轮已修 16 处） |
@@ -62,12 +62,12 @@ powershell -ExecutionPolicy Bypass -File build/build.ps1 -Abi x86_64 -DebugBuild
 
 ```bash
 # 推送到设备（shell 身份：应用视角）
-adb push out/rootdetect-arm64 /data/local/tmp/rx && adb shell chmod 755 /data/local/tmp/rx
-adb shell /data/local/tmp/rx                 # 人类可读报告
-adb shell /data/local/tmp/rx --json          # 机器可读
-adb shell /data/local/tmp/rx -v              # 附带 INFO 级上下文
-adb shell /data/local/tmp/rx --selftest      # 自检：逻辑 + 误报卫士
-adb root && adb shell /data/local/tmp/rx     # uid 0：开启内核深度检查
+adb push out/rootdetect-arm64 /data/local/rx/rx && adb shell chmod 755 /data/local/rx/rx
+adb shell /data/local/rx/rx                 # 人类可读报告
+adb shell /data/local/rx/rx --json          # 机器可读
+adb shell /data/local/rx/rx -v              # 附带 INFO 级上下文
+adb shell /data/local/rx/rx --selftest      # 自检：逻辑 + 误报卫士
+adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 ```
 
 | 退出码 | 含义 |
@@ -137,7 +137,7 @@ adb root && adb shell /data/local/tmp/rx     # uid 0：开启内核深度检查
 2. **误报卫士**：在「干净设备」上，最容易误报的两项必须保持沉默——`uname()` 必须等于 `/proc/sys/kernel/osrelease`，`/proc/mounts` 与 `/proc/self/mountinfo` 的挂载目标集合必须相等。
 
 ```
-$ adb shell /data/local/tmp/rx --selftest
+$ adb shell /data/local/rx/rx --selftest
 rootdetect 1.0.0 self-test   uid=2000
 -- decision logic --
   PASS  keyword: magisk package name
@@ -224,18 +224,23 @@ powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell getprop sys.boot_
 ## 7. 在真机上验证（不依赖模拟器）
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 push out/rootdetect-arm64 /data/local/tmp/rx
-powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell chmod 755 /data/local/tmp/rx
+# Root-only deployment: when the scanner runs as root it must not be executed from
+# a directory others can write to (/data/local/tmp is drwxrwx--x shell shell), or
+# another adb shell user could replace the binary before it runs.
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 root
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell "mkdir -p /data/local/rx && chmod 700 /data/local/rx"
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 push out/rootdetect-arm64 /data/local/rx/rx
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell chmod 755 /data/local/rx/rx
 
 # 1) 基线：shell 身份，期望没有 HIGH/CRITICAL（userdebug 设备会有 env-build 的 MEDIUM）
-powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/tmp/rx
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/rx/rx
 
 # 2) 自检：逻辑 + 误报卫士
-powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/tmp/rx --selftest
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/rx/rx --selftest
 
 # 3) 真阳性：在 root 设备上跑（有 su / Magisk / KernelSU 的设备）
 powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 root
-powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/tmp/rx -v
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/rx/rx -v
 ```
 
 如果手上是**干净**的设备，可以用注入脚本造出可检出的痕迹（仅模拟器/non-production）：
@@ -278,11 +283,11 @@ powershell -ExecutionPolicy Bypass -File scripts/inject-root-fixtures.ps1 -Clean
 于是：**64 位进程把 32 位兄弟产物用 `--probe-dump` 跑一遍，对同一批路径逐项比对 7 个接口的结果。**
 
 ```bash
-adb push out/rootdetect-arm64 /data/local/tmp/rx                # 主程序
+adb push out/rootdetect-arm64 /data/local/rx/rx                # 主程序
 adb shell "mkdir -p /data/local/rx && chmod 700 /data/local/rx"   # root-only: helpers are never exec'd from /data/local/tmp as root
 adb push out/rootdetect-arm   /data/local/rx/rootdetect-arm       # 32-bit helper
-adb shell chmod 755 /data/local/tmp/rx /data/local/rx/rootdetect-arm
-adb shell /data/local/tmp/rx        # 自动发现助手并启用差分
+adb shell chmod 755 /data/local/rx/rx /data/local/rx/rootdetect-arm
+adb shell /data/local/rx/rx        # 自动发现助手并启用差分
 ```
 
 * 找到助手 → `abi-consistency`（一致，INFO）或 `abi-consistency-mismatch`（不一致，**CRITICAL**，逐路径列出两个 ABI 的七个探针结果）。
@@ -367,7 +372,7 @@ APK 内容（已逐项核验）：
 
 产物（已核验）：
 
-- 产物：`out/bunanana.apk`，**7,214,636 字节**，`sha256=dfee8d8b8fad3667f930aa8741121009af9f5eaaa57160cfc5d7ff7363ab4909`
+- 产物：`out/bunanana.apk`，**7,218,732 字节**，`sha256=c78d49584ddca3719b82dad0be7fc56fd4f806dfe08c21eac39d2089f2cec59b`
 - 下载直链：https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
 
 设计要点：
@@ -440,7 +445,7 @@ wsl -u root -e bash scripts/wsl-android-verify.sh   # 推送 + 全量验证
 ### 红队 #1：在真机上复现并修复
 
 ```
-修复前：adb shell 'ln -sf /nonexistent /data/local/tmp/su; /data/local/tmp/rx -q'
+修复前：adb shell 'ln -sf /nonexistent /data/local/tmp/su; /data/local/rx/rx -q'
         [CRITICAL] path-consistency-mismatch ...  →  HIDING_DETECTED (exit 3)
 修复后：ROOT_DETECTED (exit 2) + [MEDIUM] artefact-dangling-symlink
 ```

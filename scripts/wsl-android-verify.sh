@@ -6,6 +6,10 @@ set -u
 SRC=/mnt/c/Users/86134/Documents/deepseek-harness/default-workspace/android-rootdetect
 ADB=/opt/rx-android/platform-tools/adb
 RX=/data/local/tmp/rx
+if [ "$($ADB shell id -u 2>/dev/null | tr -d '\r')" = "0" ]; then
+  $ADB shell "mkdir -p /data/local/rx && chmod 700 /data/local/rx" > /dev/null 2>&1
+  RX=/data/local/rx/rx
+fi
 hr() { echo; echo "================ $* ================"; }
 
 hr "device"

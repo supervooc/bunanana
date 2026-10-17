@@ -10,7 +10,7 @@
 | I want to… | How |
 |---|---|
 | **Just install and use it** | Download [`out/bunanana.apk`](out/bunanana.apk) and install it on the phone (unknown sources must be allowed), then open it and tap **RUN DETECTION** |
-| **Run it over adb from a PC** | See §7: `adb push out/rootdetect-arm64 /data/local/tmp/rx` → `adb shell chmod 755 /data/local/tmp/rx` → `adb shell /data/local/tmp/rx -v` |
+| **Run it over adb from a PC** | See §7: `adb push out/rootdetect-arm64 /data/local/rx/rx` → `adb shell chmod 755 /data/local/rx/rx` → `adb shell /data/local/rx/rx -v` |
 | **Only the command-line scanner** | Build it yourself: `powershell -ExecutionPolicy Bypass -File build/build.ps1 -Abi arm64` |
 | **See why it can catch hiding** | §4 detection matrix + §11 field results (real Linux kernel + API 30 emulator + KVM) |
 | **Know which blind spots it admits to** | [review/detection-review.md](review/detection-review.md): a red-team view - 15-layer coverage matrix, false-positive and poisoning surfaces, **15 source-code bugs** (16 code changes applied this round) |
@@ -62,12 +62,12 @@ powershell -ExecutionPolicy Bypass -File build/build.ps1 -Abi x86_64 -DebugBuild
 
 ```bash
 # push to the device (shell identity: the app's point of view)
-adb push out/rootdetect-arm64 /data/local/tmp/rx && adb shell chmod 755 /data/local/tmp/rx
-adb shell /data/local/tmp/rx                 # human-readable report
-adb shell /data/local/tmp/rx --json          # machine-readable
-adb shell /data/local/tmp/rx -v              # include INFO-level context
-adb shell /data/local/tmp/rx --selftest      # self-test: logic + false-positive guards
-adb root && adb shell /data/local/tmp/rx     # uid 0: enables the deep kernel checks
+adb push out/rootdetect-arm64 /data/local/rx/rx && adb shell chmod 755 /data/local/rx/rx
+adb shell /data/local/rx/rx                 # human-readable report
+adb shell /data/local/rx/rx --json          # machine-readable
+adb shell /data/local/rx/rx -v              # include INFO-level context
+adb shell /data/local/rx/rx --selftest      # self-test: logic + false-positive guards
+adb root && adb shell /data/local/rx/rx     # uid 0: enables the deep kernel checks
 ```
 
 | Exit code | Meaning |
@@ -137,7 +137,7 @@ Runs on the device and verifies two things:
 2. **False-positive guards**: on a "clean device" the two most false-positive-prone items must stay silent — `uname()` must equal `/proc/sys/kernel/osrelease`, and `/proc/mounts` and `/proc/self/mountinfo` must list the same mount targets.
 
 ```
-$ adb shell /data/local/tmp/rx --selftest
+$ adb shell /data/local/rx/rx --selftest
 rootdetect 1.0.0 self-test   uid=2000
 -- decision logic --
   PASS  keyword: magisk package name
@@ -224,18 +224,23 @@ powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell getprop sys.boot_
 ## 7. Verifying on a real device (no emulator needed)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 push out/rootdetect-arm64 /data/local/tmp/rx
-powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell chmod 755 /data/local/tmp/rx
+# Root-only deployment: when the scanner runs as root it must not be executed from
+# a directory others can write to (/data/local/tmp is drwxrwx--x shell shell), or
+# another adb shell user could replace the binary before it runs.
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 root
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell "mkdir -p /data/local/rx && chmod 700 /data/local/rx"
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 push out/rootdetect-arm64 /data/local/rx/rx
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell chmod 755 /data/local/rx/rx
 
 # 1) Baseline: shell identity, expect no HIGH/CRITICAL (a userdebug device will show the env-build MEDIUM)
-powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/tmp/rx
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/rx/rx
 
 # 2) Self-test: logic + false-positive guards
-powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/tmp/rx --selftest
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/rx/rx --selftest
 
 # 3) True positive: run on a rooted device (one with su / Magisk / KernelSU)
 powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 root
-powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/tmp/rx -v
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/rx/rx -v
 ```
 
 If you have a **clean** device, an injection script can create detectable traces (emulator / non-production only):
@@ -278,11 +283,11 @@ A hiding module installs its syscall table patches **per table**: inside SuSFS's
 Hence: **a 64-bit process runs the 32-bit sibling product with `--probe-dump` and compares the seven interfaces item by item for the same batch of paths.**
 
 ```bash
-adb push out/rootdetect-arm64 /data/local/tmp/rx                # main program
+adb push out/rootdetect-arm64 /data/local/rx/rx                # main program
 adb shell "mkdir -p /data/local/rx && chmod 700 /data/local/rx"   # root-only: helpers are never exec'd from /data/local/tmp as root
 adb push out/rootdetect-arm   /data/local/rx/rootdetect-arm       # 32-bit helper
-adb shell chmod 755 /data/local/tmp/rx /data/local/rx/rootdetect-arm
-adb shell /data/local/tmp/rx        # auto-discovers the helper and enables the diff
+adb shell chmod 755 /data/local/rx/rx /data/local/rx/rootdetect-arm
+adb shell /data/local/rx/rx        # auto-discovers the helper and enables the diff
 ```
 
 * helper found → `abi-consistency` (agree, INFO) or `abi-consistency-mismatch` (disagree, **CRITICAL**, listing the seven probe results of both ABIs per path).
@@ -367,7 +372,7 @@ APK contents (verified item by item):
 
 Product (verified):
 
-- Product: `out/bunanana.apk`, **7,214,636 bytes**, `sha256=dfee8d8b8fad3667f930aa8741121009af9f5eaaa57160cfc5d7ff7363ab4909`
+- Product: `out/bunanana.apk`, **7,218,732 bytes**, `sha256=c78d49584ddca3719b82dad0be7fc56fd4f806dfe08c21eac39d2089f2cec59b`
 - Direct download: https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
 
 Design points:
@@ -440,7 +445,7 @@ This round split three non-overlapping workstreams across three teammates, each 
 ### Red-team case #1: reproduced on a real device and fixed
 
 ```
-Before: adb shell 'ln -sf /nonexistent /data/local/tmp/su; /data/local/tmp/rx -q'
+Before: adb shell 'ln -sf /nonexistent /data/local/tmp/su; /data/local/rx/rx -q'
         [CRITICAL] path-consistency-mismatch ...  →  HIDING_DETECTED (exit 3)
 After:  ROOT_DETECTED (exit 2) + [MEDIUM] artefact-dangling-symlink
 ```

@@ -868,15 +868,9 @@ static bool abi_helper_trusted(const char *path, char *why, size_t whysz) {
   }
   if (me == 0) {
     char dir[512];
-    snprintf(dir, sizeof(dir), "%s", path);
-    char *slash = strrchr(dir, '/');
-    if (slash) {
-      *slash = '\0';
-      struct stat ds;
-      if (stat(dir[0] ? dir : "/", &ds) == 0 && (ds.st_mode & (S_IWGRP | S_IWOTH))) {
-        snprintf(why, whysz, "directory %s is group/other writable", dir);
-        return false;
-      }
+    if (rd_dir_writable_by_others(path, dir, sizeof(dir))) {
+      snprintf(why, whysz, "directory %s is group/other writable", dir[0] ? dir : "?");
+      return false;
     }
   }
   int fd = open(path, O_RDONLY | O_CLOEXEC);

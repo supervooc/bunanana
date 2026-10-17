@@ -48,19 +48,27 @@ fi
 hr "2. Android emulator (KVM inside WSL)"
 if $ADB devices 2>/dev/null | grep -q "emulator-.*device"; then
   $ADB wait-for-device
-  $ADB push "$RX" /data/local/tmp/rx > /dev/null 2>&1
-  $ADB shell chmod 755 /data/local/tmp/rx > /dev/null 2>&1
+  # Deploy to a root-only directory when adbd is root: a root process executing a
+  # file from a group/other-writable directory (/data/local/tmp is drwxrwx--x
+  # shell shell) could have had its binary replaced by any adb shell user.
+  RXDEV=/data/local/tmp/rx
+  if [ "$($ADB shell id -u 2>/dev/null | tr -d '\r')" = "0" ]; then
+    $ADB shell "mkdir -p /data/local/rx && chmod 700 /data/local/rx" > /dev/null 2>&1
+    RXDEV=/data/local/rx/rx
+  fi
+  $ADB push "$RX" "$RXDEV" > /dev/null 2>&1
+  $ADB shell chmod 755 "$RXDEV" > /dev/null 2>&1
 
-  $ADB shell /data/local/tmp/rx --selftest 2>&1 | tr -d '\r' > "$RESULTS/android-selftest.txt"
+  $ADB shell $RXDEV --selftest 2>&1 | tr -d '\r' > "$RESULTS/android-selftest.txt"
   # As the shell domain two checks are SKIPped (/proc/sys/kernel/osrelease and
   # version are not readable), as uid 0 none are; only failures are mandatory.
   verdict "android self-test: 0 failures" "0 failure\(s\)" "$RESULTS/android-selftest.txt"
 
-  $ADB shell /data/local/tmp/rx --json 2>&1 | tr -d '\r' > "$RESULTS/android-shell.json"
+  $ADB shell $RXDEV --json 2>&1 | tr -d '\r' > "$RESULTS/android-shell.json"
   verdict "android (shell): no CRITICAL crafted from SELinux denials" '"critical": 0' "$RESULTS/android-shell.json"
 
   $ADB root > /dev/null 2>&1; sleep 4
-  $ADB shell /data/local/tmp/rx -v 2>&1 | tr -d '\r' > "$RESULTS/android-root.txt"
+  $ADB shell $RXDEV -v 2>&1 | tr -d '\r' > "$RESULTS/android-root.txt"
   verdict "android (uid 0): deep checks ran" "deep-skipped|kernel-syscall-table|kernel-kcore|hook-kprobe|deep-dmesg" "$RESULTS/android-root.txt"
 
   hr "2b. injected root artefacts must be detected"
@@ -68,7 +76,7 @@ if $ADB devices 2>/dev/null | grep -q "emulator-.*device"; then
   $ADB shell "printf 'MAGISK\n' > /data/adb/magisk/util_functions.sh" > /dev/null 2>&1
   $ADB shell cp /system/bin/toybox /data/local/tmp/su > /dev/null 2>&1
   $ADB shell chmod 755 /data/local/tmp/su > /dev/null 2>&1
-  $ADB shell /data/local/tmp/rx -v 2>&1 | tr -d '\r' > "$RESULTS/android-fixtures.txt"
+  $ADB shell $RXDEV -v 2>&1 | tr -d '\r' > "$RESULTS/android-fixtures.txt"
   verdict "fixtures: package-hidden CRITICAL" "package-hidden" "$RESULTS/android-fixtures.txt"
   verdict "fixtures: artefacts reported" "artefact-present" "$RESULTS/android-fixtures.txt"
   $ADB shell rm -rf /data/adb /data/data/com.topjohnwu.magisk /data/local/tmp/su > /dev/null 2>&1
