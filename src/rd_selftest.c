@@ -536,11 +536,41 @@ static void test_kernel_parsers(void) {
            "this kernel has no loadable module tags in /proc/kallsyms");
   }
 
-  /* These two parsers are static; only their happy path is reachable today. */
-  skip("kallsyms parser: malformed line / unterminated [module tag",
-       "kallsyms_parse() is static (rd_kernel.c:67); needs an exposed interface");
-  skip("/proc/modules parser: empty line / leading tab division",
-       "the split is inline in rd_check_kernel (rd_kernel.c:174); needs an exposed interface");
+  /* The two kernel-list parsers, malformed cases included. These used to be
+   * skipped because the parsers were static; they are exposed now, so the skip
+   * would only hide a regression. */
+  {
+    unsigned long long a = 0;
+    char nm[64] = "", md[64] = "";
+    ok(rd_parse_kallsyms_line("ffffffff81000000 T do_exit", &a, nm, sizeof nm, md, sizeof md) &&
+         a == 0xffffffff81000000ULL && strcmp(nm, "do_exit") == 0 && md[0] == '\0',
+       "kallsyms line: address, type and symbol name", nm);
+    ok(rd_parse_kallsyms_line("ffffffffc0000000 t helper [mymod]", &a, nm, sizeof nm, md, sizeof md) &&
+         strcmp(nm, "helper") == 0 && strcmp(md, "mymod") == 0,
+       "kallsyms line: [module] tag stripped", md);
+    ok(rd_parse_kallsyms_line("ffffffffc0000000 t broken [unterminated", &a, nm, sizeof nm, md, sizeof md) &&
+         strcmp(nm, "broken") == 0 && md[0] == '\0',
+       "kallsyms line: unterminated [module tag keeps the name, drops the module", nm);
+    ok(!rd_parse_kallsyms_line("", &a, nm, sizeof nm, md, sizeof md) &&
+         !rd_parse_kallsyms_line("not a kallsyms line", &a, nm, sizeof nm, md, sizeof md),
+       "kallsyms line: empty and malformed lines are rejected", "");
+    char m1[16] = "";
+    ok(rd_parse_proc_modules_line("my_module 16384 1 - Live 0xffffffffc0000000", m1, sizeof m1) &&
+         strcmp(m1, "my_module") == 0,
+       "/proc/modules line: first field is the module name", m1);
+    char m2[16] = "";
+    ok(rd_parse_proc_modules_line("\tleading_tab 4096 0 - Live 0x0", m2, sizeof m2) &&
+         strcmp(m2, "leading_tab") == 0,
+       "/proc/modules line: a leading tab is not part of the name", m2);
+    char m3[16] = "";
+    ok(!rd_parse_proc_modules_line("", m3, sizeof m3) &&
+         !rd_parse_proc_modules_line("   ", m3, sizeof m3),
+       "/proc/modules line: empty and blank lines are rejected", "");
+    char m4[8] = "";
+    ok(rd_parse_proc_modules_line("abcdefghijklmnop 1 0 - Live 0x0", m4, sizeof m4) &&
+         strlen(m4) == 7,
+       "/proc/modules line: a short buffer truncates instead of overflowing", m4);
+  }
   rd_report_free(&rep);
 }
 

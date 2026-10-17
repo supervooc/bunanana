@@ -237,16 +237,25 @@ static void print_finding_text(const rd_finding *f, int use_color) {
 
 void rd_print_text(const rd_report *r, int use_color, int verbose) {
   int shown = 0;
+  /* INFO rows are printed exactly once, by the informational block below. The
+   * previous condition ("!verbose && sev == INFO") let -v print them twice: the
+   * main loop rendered every row and the block then rendered the INFO ones again
+   * (46 INFO lines for 23 unique ids). */
   for (size_t i = 0; i < r->n; i++) {
-    if (!verbose && r->items[i].sev == SEV_INFO) continue;
+    if (r->items[i].sev == SEV_INFO) continue;
     print_finding_text(&r->items[i], use_color);
     shown++;
   }
   if (!shown) printf("(no findings above INFO)\n");
   if (verbose) {
     printf("\n--- informational ---\n");
+    int n_info = 0;
     for (size_t i = 0; i < r->n; i++)
-      if (r->items[i].sev == SEV_INFO) print_finding_text(&r->items[i], use_color);
+      if (r->items[i].sev == SEV_INFO) {
+        print_finding_text(&r->items[i], use_color);
+        n_info++;
+      }
+    if (!n_info) printf("(none)\n");
   }
   printf("\nsummary: %d critical, %d high, %d medium, %d low, %d info\n",
          r->counts[SEV_CRITICAL], r->counts[SEV_HIGH], r->counts[SEV_MEDIUM],
