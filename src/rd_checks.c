@@ -177,11 +177,17 @@ void rd_check_environment(rd_ctx *c, rd_report *rep) {
        "dm-verity is not enforcing"},
       {"ro.boot.selinux", "enforcing", CMP_NOT_EQUAL, SEV_MEDIUM,
        "`ro.boot.selinux` is not enforcing"},
-      {"ro.build.tags", "release-keys", CMP_NOT_EQUAL, SEV_LOW, "build is signed with test-keys"},
+      {"ro.build.tags", "release-keys", CMP_NOT_EQUAL, SEV_LOW,
+       "build is not signed with release-keys"},
   };
   for (size_t i = 0; i < sizeof(build) / sizeof(build[0]); i++) {
     const char *v = rd_prop(&c->props, build[i].key);
-    if (!v) continue;
+    /* An empty value means the property is not set on this build at all
+     * (`getprop` prints "[]" for it). Comparing "" against the stock value
+     * declared a deviation - e.g. ro.boot.veritymode is empty on devices whose
+     * bootloader does not export it even though dm-verity is enforcing - and
+     * turned a clean device into a MEDIUM. */
+    if (!v || !*v) continue;
     bool bad = (build[i].mode == CMP_EQUAL) ? (strcmp(v, build[i].val) == 0)
                                            : (strcmp(v, build[i].val) != 0);
     if (bad)
@@ -328,6 +334,20 @@ static int rd_path_state(const char *path) {
   return 0;
 }
 
+/* Data directory of `pkg` as seen by *this* user. /data/data is the user-0 view
+ * (a symlink to /data/user/0), so probing it unconditionally made a root manager
+ * installed in another profile look like a hidden install: a work-profile
+ * process saw /data/data/<pkg> for the primary user and reported CRITICAL
+ * package-hidden, and the mirror-image direction hid the real one. App uids are
+ * user*100000 + appid, so the user id is a division away. */
+static void current_user_data_dirs(const char *pkg, char *data, size_t dsz, char *user, size_t usz,
+                                   bool *probe_data) {
+  unsigned u = (unsigned)getuid() / 100000u;
+  snprintf(data, dsz, "/data/data/%s", pkg);
+  snprintf(user, usz, "/data/user/%u/%s", u, pkg);
+  *probe_data = (u == 0);
+}
+
 void rd_check_packages(rd_ctx *c, rd_report *rep) {
   (void)c;
   char *out = (char *)malloc(1 << 21);
@@ -367,15 +387,16 @@ void rd_check_packages(rd_ctx *c, rd_report *rep) {
     int data_dirs = 0;
     for (size_t i = 0; i < RD_ROOT_PACKAGE_COUNT; i++) {
       char dp[256], du[256];
-      snprintf(dp, sizeof(dp), "/data/data/%s", RD_ROOT_PACKAGES[i]);
-      snprintf(du, sizeof(du), "/data/user/0/%s", RD_ROOT_PACKAGES[i]);
-      if (!rd_path_exists(dp) && !rd_path_exists(du)) continue;
+      bool probe_dp;
+      current_user_data_dirs(RD_ROOT_PACKAGES[i], dp, sizeof(dp), du, sizeof(du), &probe_dp);
+      bool dp_seen = probe_dp && rd_path_exists(dp);
+      if (!dp_seen && !rd_path_exists(du)) continue;
       data_dirs++;
       rd_add(rep, SEV_CRITICAL, "package-hidden",
              "root manager data dir exists while the package list is unavailable",
              "%s exists while `cmd package list packages` failed (rc=%d). A root manager that "
              "hides its own package commonly makes enumeration fail or return nothing, so the "
-             "data directory is the evidence.", dp, rc);
+             "data directory is the evidence.", dp_seen ? dp : du, rc);
     }
     if (data_dirs)
       rd_add(rep, SEV_HIGH, "package-enum-blocked",
@@ -397,6 +418,10 @@ void rd_check_packages(rd_ctx *c, rd_report *rep) {
   char unk[RD_MAXEVID];
   unk[0] = '\0';
   int hit = 0, hidden = 0, unknown = 0, definite = 0;
+  /* Severity of the aggregate row follows the worst single hit: a name that is
+   * only registered (no reachable data dir) is MEDIUM on its own, so the list
+   * must not turn it into an "installed" HIGH. */
+  rd_sev worst_hit = SEV_MEDIUM;
   for (size_t i = 0; i < RD_ROOT_PACKAGE_COUNT; i++) {
     const char *pkg = RD_ROOT_PACKAGES[i];
     bool listed = false;
@@ -408,14 +433,19 @@ void rd_check_packages(rd_ctx *c, rd_report *rep) {
       if (after == '\n' || after == '\r' || after == '\0') { listed = true; break; }
     }
     char dp[256], du[256];
-    snprintf(dp, sizeof(dp), "/data/data/%s", pkg);
-    snprintf(du, sizeof(du), "/data/user/0/%s", pkg);
-    int dsp = rd_path_state(dp), dsu = rd_path_state(du);
+    bool probe_dp;
+    current_user_data_dirs(pkg, dp, sizeof(dp), du, sizeof(du), &probe_dp);
+    int dsp = probe_dp ? rd_path_state(dp) : 0;
+    int dsu = rd_path_state(du);
     bool data_dir = dsp == 1 || dsu == 1;
     bool data_unknown = dsp < 0 || dsu < 0;
+    /* The path that carried the signal, so the evidence names the directory that
+     * was actually probed (dp is the user-0 view and is not probed otherwise). */
+    const char *seen = (dsp == 1) ? dp : du;
     if (data_dir || !data_unknown) definite++;
     if (listed && (data_dir || data_unknown)) {
       hit++;
+      worst_hit = SEV_HIGH;
       rd_add(rep, SEV_HIGH, "package-roots", "root manager application installed", "%s", pkg);
     } else if (listed) {
       hit++;
@@ -427,24 +457,31 @@ void rd_check_packages(rd_ctx *c, rd_report *rep) {
              "root manager data dir exists but the package is hidden from the package manager",
              "%s: %s exists yet `cmd package list packages` does not list it - the definitive "
              "signature of KernelSU's \"hide the app\" / Magisk DenyList-style renaming.",
-             pkg, dp);
+             pkg, seen);
     } else if (data_unknown) {
       unknown++;
-      if (strlen(unk) < sizeof(unk) - 64) rd_appendf(unk, sizeof(unk), "%s (%s)\n", pkg, dp);
+      if (strlen(unk) < sizeof(unk) - 64) rd_appendf(unk, sizeof(unk), "%s (%s)\n", pkg, du);
     }
     if (listed && strlen(ev) < sizeof(ev) - 64) rd_appendf(ev, sizeof(ev), "%s\n", pkg);
   }
   if (hit && ev[0])
-    rd_add_ev(rep, SEV_HIGH, "package-roots-list", "known root managers enumerated", ev,
-              "%d of %zu known root manager packages are installed.", hit, RD_ROOT_PACKAGE_COUNT);
+    rd_add_ev(rep, worst_hit, "package-roots-list", "known root managers enumerated", ev,
+              worst_hit == SEV_HIGH
+                  ? "%d of %zu known root manager packages are installed."
+                  : "%d of %zu known root manager packages are registered while their data "
+                    "directory is not reachable from this uid.",
+              hit, RD_ROOT_PACKAGE_COUNT);
   if (unknown) {
     /* The name is neither listed nor stat-able, so "package-clean" would have
      * been a false negative waiting to happen (a hidden manager whose data dir
      * this uid cannot stat looks exactly like an absent one). Report the
-     * inconclusiveness instead. When the data directory is otherwise readable
-     * (definite > 0) an EACCES on these specific names is itself suspicious;
-     * when the whole directory is unsearchable it is informational only - run
-     * as root for a definitive answer. */
+     * inconclusiveness instead.
+     *
+     * definite > 0 means at least one probed data path was determinable, so an
+     * EACCES on these specific names stands out. When the whole data directory
+     * is unsearchable every path returns EACCES and no EACCES is informative:
+     * "hidden" and "absent" are indistinguishable without root, so that case
+     * stays informational instead of pretending to be evidence. */
     if (definite)
       rd_add_ev(rep, SEV_MEDIUM, "package-unverifiable",
                 "known root manager package(s) could not be verified", unk,
@@ -454,9 +491,10 @@ void rd_check_packages(rd_ctx *c, rd_report *rep) {
     else
       rd_add_ev(rep, SEV_INFO, "package-unverifiable",
                 "known root manager package(s) could not be verified", unk,
-                "%d known root manager name(s) are neither listed nor readable because this uid "
-                "cannot search the app data directory; run as root for a definitive answer.",
-                unknown);
+                "%d known root manager name(s) are neither listed nor readable: this uid cannot "
+                "search the app data directory at all (every path returned EACCES), so a hidden "
+                "install and an absent one look identical here - run as root for a definitive "
+                "answer. A listed manager is reported by package-roots already.", unknown);
   }
   if (!hit && !hidden && !unknown)
     rd_add(rep, SEV_INFO, "package-clean", "no known root manager package",
@@ -468,12 +506,20 @@ void rd_check_packages(rd_ctx *c, rd_report *rep) {
 
 /* Collect the mount target field of every line. field: 1 for /proc/mounts,
  * 4 for mountinfo (0-based). */
-static size_t collect_targets(const char *file, int field, char **out, size_t max) {
+static size_t collect_targets(const char *file, int field, char **out, size_t max, bool *truncated) {
   size_t n = 0;
+  if (truncated) *truncated = false;
   char *txt = rd_slurp(file, NULL);
   if (!txt) return 0;
   char *save = NULL;
-  for (char *line = strtok_r(txt, "\n", &save); line && n < max; line = strtok_r(NULL, "\n", &save)) {
+  for (char *line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+    if (n >= max) {
+      /* More lines than the caller can hold. Returning silently made a truncated
+       * set look complete, and the difference between two differently truncated
+       * views was reported as CRITICAL mount-view-inconsistency. */
+      if (truncated) *truncated = true;
+      break;
+    }
     char *p = line;
     for (int f = 0; f < field; f++) {
       while (*p == ' ') p++;
@@ -511,7 +557,7 @@ static size_t collect_targets(const char *file, int field, char **out, size_t ma
 }
 
 size_t rd_collect_mount_targets(const char *file, int field, char **out, size_t max) {
-  return collect_targets(file, field, out, max);
+  return collect_targets(file, field, out, max, NULL);
 }
 
 static bool set_has(char **set, size_t n, const char *v) {
@@ -534,7 +580,8 @@ void rd_check_mounts(rd_ctx *c, rd_report *rep) {
    * Getting one of these wrong invents 30+ phantom mount points and turns a
    * clean device into HIDING_DETECTED - see the mountstats guard in --selftest. */
   const int field[4] = {1, 4, 4, 4};
-  for (int i = 0; i < 4; i++) ns[i] = collect_targets(files[i], field[i], sets[i], MAXX);
+  bool tr[4] = {false, false, false, false};
+  for (int i = 0; i < 4; i++) ns[i] = collect_targets(files[i], field[i], sets[i], MAXX, &tr[i]);
 
   if (ns[0] == 0) {
     int peers = (ns[1] ? 1 : 0) + (ns[2] ? 1 : 0) + (ns[3] ? 1 : 0);
@@ -614,10 +661,21 @@ void rd_check_mounts(rd_ctx *c, rd_report *rep) {
    * containers make the two differ legitimately, which otherwise produced a
    * CRITICAL mount-view-inconsistency (-> HIDING_DETECTED) on a clean system. */
   char self_ns[64] = "", init_ns[64] = "";
-  int init_view_ok = rd_read_link("/proc/self/ns/mnt", self_ns, sizeof(self_ns)) > 0 &&
-                     rd_read_link("/proc/1/ns/mnt", init_ns, sizeof(init_ns)) > 0 &&
-                     strcmp(self_ns, init_ns) == 0;
-  if (!init_view_ok)
+  long self_n = rd_read_link("/proc/self/ns/mnt", self_ns, sizeof(self_ns));
+  long init_n = rd_read_link("/proc/1/ns/mnt", init_ns, sizeof(init_ns));
+  /* Three states, not two: a readlink() that fails (SELinux, a hide module that
+   * filters /proc/1) is not the same thing as "init is in another namespace".
+   * Collapsing both into !init_view_ok made a blocked readlink silently disable
+   * the /proc/1/mountinfo cross-check while blaming a namespace difference. */
+  int ns_state = (self_n <= 0 || init_n <= 0) ? -1 : (strcmp(self_ns, init_ns) == 0);
+  int init_view_ok = (ns_state == 1);
+  if (ns_state < 0)
+    rd_add(rep, SEV_INFO, "mount-view-namespace",
+           "cannot tell whether /proc/1 shares this mount namespace",
+           "/proc/1/ns/mnt or /proc/self/ns/mnt is not readable from this domain, so "
+           "/proc/1/mountinfo is not compared. This is not a statement about hiding - the "
+           "cross-check simply cannot run here.");
+  else if (!init_view_ok)
     rd_add(rep, SEV_INFO, "mount-view-namespace",
            "/proc/1 is in a different mount namespace",
            "init does not share this process's mount namespace, so /proc/1/mountinfo is not "
@@ -625,6 +683,17 @@ void rd_check_mounts(rd_ctx *c, rd_report *rep) {
   for (int i = 1; i < 4; i++) {
     if (ns[0] == 0) continue;
     if (i == 2 && !init_view_ok) continue;
+    if (tr[0] || tr[i]) {
+      /* One of the two sets hit the entry cap, so a difference between them can
+       * be a truncation artefact rather than filtering. Say so instead of
+       * emitting CRITICAL for a benign reason. */
+      rd_add(rep, SEV_INFO, "mount-view-truncated",
+             "mount view comparison skipped: entry cap reached",
+             "%s cannot be compared with /proc/mounts because at least one of them lists more "
+             "than %d mounts; the truncated sets would differ for a benign reason, so no "
+             "cross-view verdict is issued.", files[i], (int)MAXX);
+      continue;
+    }
     if (ns[i] == 0) {
       /* An empty peer view while /proc/mounts has entries is anomalous: the
        * cheapest way to defeat a cross-check is to return an empty file, which
@@ -679,7 +748,14 @@ typedef struct {
   rd_ctx *c;
   rd_report *rep;
   int count;
+  int skipped;
 } proc_scan_state;
+
+/* Basename without modifying the source string. */
+static const char *path_basename(const char *p) {
+  const char *slash = strrchr(p, '/');
+  return slash ? slash + 1 : p;
+}
 
 static void scan_one_proc(const char *pid, rd_ctx *c, rd_report *rep) {
   char path[512];
@@ -691,6 +767,13 @@ static void scan_one_proc(const char *pid, rd_ctx *c, rd_report *rep) {
   size_t cn = clen < sizeof(cmd) - 1 ? clen : sizeof(cmd) - 1;
   memcpy(cmd, cmdbuf, cn);
   cmd[cn] = '\0';
+  char argv0[512];
+  size_t a0 = 0;
+  while (a0 < cn && cmd[a0] && a0 + 1 < sizeof(argv0)) {
+    argv0[a0] = cmd[a0];
+    a0++;
+  }
+  argv0[a0] = '\0';
   free(cmdbuf);
   /* /proc/<pid>/cmdline is NUL separated and the old loop tested cmd[i] in its
    * condition, so it stopped at the first NUL: "ksud"/"zygiskd" in argv[1..] was
@@ -698,36 +781,66 @@ static void scan_one_proc(const char *pid, rd_ctx *c, rd_report *rep) {
   for (size_t i = 0; i < cn; i++)
     if (cmd[i] == '\0') cmd[i] = ' ';
 
+  char self[32];
+  snprintf(self, sizeof(self), "%d", (int)getpid());
+  bool is_self = strcmp(pid, self) == 0;
+
+  /* Identity evidence only: the executable and argv[0], never the arguments.
+   * Matching the whole command line meant `pm install magisk.apk`, a `grep
+   * magisk ...` or a script whose path contains a keyword reported SUSPICIOUS on
+   * a clean device - argument text is chosen freely by any process and proves
+   * nothing about what is running. */
+  char exe[512] = "";
+  snprintf(path, sizeof(path), "/proc/%s/exe", pid);
+  long exe_n = rd_read_link(path, exe, sizeof(exe));
   const char *which = NULL;
-  if (has_keyword_ci(cmd, &which)) {
+  bool ident = false;
+  if (exe_n > 0 && !rd_contains(exe, " (deleted)"))
+    ident = has_keyword_ci(path_basename(exe), &which);
+  if (!ident && argv0[0]) ident = has_keyword_ci(path_basename(argv0), &which);
+  if (ident) {
     if (strcmp(which, "busybox") != 0)
-      rd_add(rep, SEV_MEDIUM, "proc-cmdline", "process command line names a root framework",
-             "pid %s: %s", pid, cmd);
+      rd_add(rep, SEV_MEDIUM, "proc-cmdline",
+             "process executable names a root framework",
+             "pid %s: exe=%s argv0=%s", pid, exe_n > 0 ? exe : "?", argv0);
+  } else if (!is_self && has_keyword_ci(cmd, &which) && strcmp(which, "busybox") != 0) {
+    /* The name only appears in the arguments. Keep it visible - review B8 wanted
+     * argv[1..] covered - but informational, because it is not identity. */
+    rd_add(rep, SEV_INFO, "proc-cmdline-ref", "command line mentions a root framework",
+           "pid %s: %s", pid, cmd);
   }
 
-  /* maps: injected userspace frameworks (Frida, Zygisk, Riru, Xposed) */
+  /* maps: injected userspace frameworks (Frida, Zygisk, Riru, Xposed). Only an
+   * executable, file backed mapping is code, and only the pathname field of the
+   * row is matched: the old strstr() over the whole maps text fired on any path
+   * that merely contained a keyword, so running the scanner from a directory
+   * named "magisk" made a clean host report HIGH proc-injected-lib and
+   * ROOT_DETECTED (reproduced). Our own mappings are covered by self-rwx. */
+  if (is_self) return;
   snprintf(path, sizeof(path), "/proc/%s/maps", pid);
   char *maps = rd_slurp(path, NULL);
   if (!maps) return;
-  static const char *const inj[] = {"frida", "gum-js-loop", "frida-gadget", "zygisk", "riru", "xposed",
-                                    "lsposed", "substrate", "magisk", "susfs", "shamiko",
-                                    "libhook", "edxp"};
-  for (size_t i = 0; i < sizeof(inj) / sizeof(inj[0]); i++) {
-    char *hit = NULL;
-    if ((hit = strstr(maps, inj[i])) != NULL) {
-      /* take the mapped file name for evidence */
-      char *ls = hit;
-      while (ls > maps && ls[-1] != '\n') ls--;
-      char *le = hit;
-      while (*le && *le != '\n') le++;
-      char line[512];
-      size_t n = (size_t)(le - ls);
-      if (n >= sizeof(line)) n = sizeof(line) - 1;
-      memcpy(line, ls, n);
-      line[n] = '\0';
-      rd_add(rep, SEV_HIGH, "proc-injected-lib", "injected userspace framework mapped in a process",
-             "pid %s (%s) maps %s", pid, cmd[0] ? cmd : "?", line);
+  static const char *const libs[] = {"gum-js", "libhook", "edxp"}; /* not in RD_KEYWORDS */
+  char *save = NULL;
+  for (char *line = strtok_r(maps, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+    /* "<addr>-<addr> <perms> <offset> <dev> <inode> <pathname>" */
+    char *f = line;
+    while (*f && *f != ' ') f++;
+    while (*f == ' ') f++;
+    if (!(f[0] && f[1] && f[2] == 'x')) continue; /* only executable regions are code */
+    for (int i = 0; i < 4; i++) {                  /* perms, offset, dev, inode */
+      while (*f && *f != ' ') f++;
+      while (*f == ' ') f++;
     }
+    if (*f != '/') continue; /* anonymous, [vdso], [anon:...], memfd/ashmem */
+    if (!has_keyword_ci(f, &which)) {
+      which = NULL;
+      for (size_t k = 0; k < sizeof(libs) / sizeof(libs[0]) && !which; k++)
+        if (rd_contains_ci(f, libs[k])) which = libs[k];
+      if (!which) continue;
+    }
+    rd_add(rep, SEV_HIGH, "proc-injected-lib", "injected userspace framework mapped in a process",
+           "pid %s (%s) maps %s", pid, argv0[0] ? argv0 : "?", f);
   }
   free(maps);
   (void)c;
@@ -738,7 +851,11 @@ static void proc_dir_cb(const char *dir, const char *name, void *ud) {
   proc_scan_state *st = (proc_scan_state *)ud;
   for (const char *p = name; *p; p++)
     if (!isdigit((unsigned char)*p)) return;
-  if (st->count++ > 800) return; /* safety cap */
+  if (st->count >= 800) { /* safety cap */
+    st->skipped++;
+    return;
+  }
+  st->count++;
   scan_one_proc(name, st->c, st->rep);
 }
 
@@ -747,7 +864,15 @@ void rd_check_processes(rd_ctx *c, rd_report *rep) {
   st.c = c;
   st.rep = rep;
   st.count = 0;
+  st.skipped = 0;
   scan_dir("/proc", proc_dir_cb, &st);
+  if (st.skipped)
+    /* Silently stopping at the cap meant the checks disappeared without a trace
+     * on exactly the busy systems where a hiding daemon is most likely. */
+    rd_add(rep, SEV_INFO, "proc-scan-limit", "process scan stopped at the entry cap",
+           "%d /proc entries were not scanned (cap 800); root or hiding daemons outside that "
+           "window are not examined by this pass.",
+           st.skipped);
 
   /* Our own address space: with a static binary the only way to shadow these
    * checks is an inline hook or a kernel hook, so an unexpected rwx mapping is
