@@ -77,8 +77,12 @@ static void check_tracer_and_env(rd_report *rep) {
 static void check_map_backing(rd_report *rep) {
   char *txt = rd_slurp("/proc/self/maps", NULL);
   if (!txt) return;
-  char ev[RD_MAXEVID];
-  ev[0] = '\0';
+  /* Two separate accumulators: the hidden-mapping and the deleted-mapping
+   * findings are independent, and sharing one buffer mixed their evidence. */
+  char ev_missing[RD_MAXEVID];
+  ev_missing[0] = '\0';
+  char ev_deleted[RD_MAXEVID];
+  ev_deleted[0] = '\0';
   int missing = 0, deleted = 0;
   char *save = NULL;
   for (char *line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
@@ -99,7 +103,11 @@ static void check_map_backing(rd_report *rep) {
         rd_starts_with(f, "/dev/dma_heap") || rd_contains(f, "kgsl"))
       continue;
 
-    char path[512];
+    /* /proc/self/maps pathnames are bounded by PATH_MAX (4096). Probing a
+     * truncation of a longer path would report a real file as hidden, so skip
+     * anything that does not fit instead. */
+    char path[4096];
+    if (strlen(f) >= sizeof(path)) continue;
     snprintf(path, sizeof(path), "%s", f);
     /* Strip only the kernel's " (deleted)" suffix: truncating at the first space
      * made every mapped file whose path contains a space look hidden (review B3). */
@@ -109,7 +117,8 @@ static void check_map_backing(rd_report *rep) {
     if (rd_contains(f, "(deleted)")) {
       if (exec) {
         deleted++;
-        if (strlen(ev) < sizeof(ev) - 256) rd_appendf(ev, sizeof(ev), "%s\n", line);
+        if (strlen(ev_deleted) < sizeof(ev_deleted) - 256)
+          rd_appendf(ev_deleted, sizeof(ev_deleted), "%s\n", line);
       }
       continue;
     }
@@ -117,18 +126,19 @@ static void check_map_backing(rd_report *rep) {
     rd_probe_all(path, &row);
     if (row.stat_r == 1 && row.open_read_r == 1) {
       missing++;
-      if (strlen(ev) < sizeof(ev) - 256) rd_appendf(ev, sizeof(ev), "%s\n", line);
+      if (strlen(ev_missing) < sizeof(ev_missing) - 256)
+        rd_appendf(ev_missing, sizeof(ev_missing), "%s\n", line);
     }
   }
   free(txt);
   if (missing)
     rd_add_ev(rep, SEV_CRITICAL, "map-backing-hidden",
-              "mapped file is not visible to stat/open", ev,
+              "mapped file is not visible to stat/open", ev_missing,
               "%d mapped files exist in this address space but are hidden from the filesystem "
               "interfaces - a per-path hiding layer that does not cover the mmap path.", missing);
   if (deleted)
     rd_add_ev(rep, SEV_MEDIUM, "map-deleted-exec",
-              "executable mapping backed by a deleted file", ev,
+              "executable mapping backed by a deleted file", ev_deleted,
               "%d executable regions come from files that were unlinked after mapping.", deleted);
   if (!missing && !deleted)
     rd_add(rep, SEV_INFO, "map-backing", "all mapped files are visible on disk", "");
