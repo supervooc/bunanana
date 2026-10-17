@@ -312,6 +312,18 @@ void rd_check_paths(rd_ctx *c, rd_report *rep) {
 
 /* ---------------------------------------------------------------- packages */
 
+/* 1 = the path exists, 0 = it does not, -1 = it exists but cannot be stat'ed
+ * (EACCES/EPERM). The distinction matters: under SELinux a `shell` uid cannot
+ * lstat another app's /data/data/<pkg>, and treating that "unknown" as "absent"
+ * downgraded a listed root manager from HIGH to MEDIUM - and a MEDIUM does not
+ * set a flag or drive the verdict, so the install was reported as CLEAN. */
+static int rd_path_state(const char *path) {
+  struct stat st;
+  if (lstat(path, &st) == 0) return 1;
+  if (errno == EACCES || errno == EPERM) return -1;
+  return 0;
+}
+
 void rd_check_packages(rd_ctx *c, rd_report *rep) {
   (void)c;
   char *out = (char *)malloc(1 << 21);
@@ -392,8 +404,10 @@ void rd_check_packages(rd_ctx *c, rd_report *rep) {
     char dp[256], du[256];
     snprintf(dp, sizeof(dp), "/data/data/%s", pkg);
     snprintf(du, sizeof(du), "/data/user/0/%s", pkg);
-    bool data_dir = rd_path_exists(dp) || rd_path_exists(du);
-    if (listed && data_dir) {
+    int dsp = rd_path_state(dp), dsu = rd_path_state(du);
+    bool data_dir = dsp == 1 || dsu == 1;
+    bool data_unknown = dsp < 0 || dsu < 0;
+    if (listed && (data_dir || data_unknown)) {
       hit++;
       rd_add(rep, SEV_HIGH, "package-roots", "root manager application installed", "%s", pkg);
     } else if (listed) {
@@ -546,8 +560,32 @@ void rd_check_mounts(rd_ctx *c, rd_report *rep) {
   /* C) cross-view comparison: the mount hide hooks are wired per proc file
    * (show_vfsmnt / show_mountinfo / show_vfsstat). If one view lost entries the
    * other still has, something is filtering. */
+  /* /proc/1/mountinfo is only a meaningful second view when init shares our
+   * mount namespace. Per-app mount namespaces, `su --mount-master` and
+   * containers make the two differ legitimately, which otherwise produced a
+   * CRITICAL mount-view-inconsistency (-> HIDING_DETECTED) on a clean system. */
+  char self_ns[64] = "", init_ns[64] = "";
+  int init_view_ok = rd_read_link("/proc/self/ns/mnt", self_ns, sizeof(self_ns)) > 0 &&
+                     rd_read_link("/proc/1/ns/mnt", init_ns, sizeof(init_ns)) > 0 &&
+                     strcmp(self_ns, init_ns) == 0;
+  if (!init_view_ok)
+    rd_add(rep, SEV_INFO, "mount-view-namespace",
+           "/proc/1 is in a different mount namespace",
+           "init does not share this process's mount namespace, so /proc/1/mountinfo is not "
+           "compared (a difference there would be normal, not hiding).");
   for (int i = 1; i < 4; i++) {
-    if (ns[i] == 0 || ns[0] == 0) continue;
+    if (ns[0] == 0) continue;
+    if (i == 2 && !init_view_ok) continue;
+    if (ns[i] == 0) {
+      /* An empty peer view while /proc/mounts has entries is anomalous: the
+       * cheapest way to defeat a cross-check is to return an empty file, which
+       * the old `ns[i] == 0 -> continue` skipped in silence. */
+      rd_add(rep, SEV_MEDIUM, "mount-view-empty",
+             "a kernel mount view returned no entries",
+             "%s parsed to 0 mount targets while /proc/mounts has %zu: an emptied view is "
+             "cheaper than a filtered one and conceals the same mounts.", files[i], ns[0]);
+      continue;
+    }
     size_t missing = 0;
     char miss[RD_MAXEVID];
     miss[0] = '\0';
