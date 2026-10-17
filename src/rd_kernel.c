@@ -28,6 +28,17 @@ static bool read_first_line_public(const char *p, char *b, size_t s) {
   return rd_read_first_line(p, b, s);
 }
 
+/* Bounded copy that always NUL-terminates. Used in place of
+ * snprintf(dst, n, "%s", src) so that a long source is truncated explicitly
+ * instead of tripping the compiler's -Wformat-truncation analysis. */
+static void rd_copy(char *dst, size_t n, const char *src) {
+  if (n == 0) return;
+  size_t l = strlen(src);
+  if (l >= n) l = n - 1;
+  memcpy(dst, src, l);
+  dst[l] = '\0';
+}
+
 static const char *kptr_str(unsigned long long a, char *buf, size_t sz) {
   if (a == 0) { snprintf(buf, sz, "0 (kptr_restrict)"); return buf; }
   snprintf(buf, sz, "0x%llx", a);
@@ -924,7 +935,8 @@ static bool abi_helper_trusted(const char *path, char *why, size_t whysz) {
   if (me == 0) {
     char dir[512];
     if (rd_dir_writable_by_others(path, dir, sizeof(dir))) {
-      snprintf(why, whysz, "directory %s is group/other writable", dir[0] ? dir : "?");
+      if (whysz) why[0] = '\0';
+      rd_appendf(why, whysz, "directory %s is group/other writable", dir[0] ? dir : "?");
       return false;
     }
   }
@@ -958,7 +970,7 @@ static bool abi_candidate(char *out, size_t sz, char *reason, size_t rsz) {
   char self[512] = "", dir[512] = "";
   if (rd_read_link("/proc/self/exe", self, sizeof(self)) >= 0) {
     char *slash = strrchr(self, '/');
-    if (slash) { *slash = '\0'; snprintf(dir, sizeof(dir), "%s", self); }
+    if (slash) { *slash = '\0'; rd_copy(dir, sizeof(dir), self); }
   }
   /* Names a user is likely to have pushed side by side. Both directions are
    * listed: a 32-bit build can exec a 64-bit helper and vice versa. */
@@ -977,7 +989,14 @@ static bool abi_candidate(char *out, size_t sz, char *reason, size_t rsz) {
     const char *base = (d == 0) ? (dir[0] ? dir : NULL) : dirs[d];
     if (!base) continue;
     for (int i = 0; names[i] && nc < RD_ABI_MAXCAND; i++) {
-      snprintf(candidates[nc], sizeof(candidates[0]), "%s/%s", base, names[i]);
+      /* Build the path with an explicit length check instead of
+       * snprintf("%s/%s"): a silently truncated path would make the cross-ABI
+       * diff compare the wrong file. */
+      size_t bl = strlen(base), nl = strlen(names[i]);
+      if (bl + 1 + nl + 1 > sizeof(candidates[0])) continue;
+      memcpy(candidates[nc], base, bl);
+      candidates[nc][bl] = '/';
+      memcpy(candidates[nc] + bl + 1, names[i], nl + 1);
       nc++;
     }
   }
@@ -986,17 +1005,17 @@ static bool abi_candidate(char *out, size_t sz, char *reason, size_t rsz) {
     if (!rd_path_exists(candidates[i])) continue;
     char why[256] = "";
     if (abi_helper_trusted(candidates[i], why, sizeof(why))) {
-      snprintf(out, sz, "%s", candidates[i]);
+      rd_copy(out, sz, candidates[i]);
       return true;
     }
     if (!rejected[0]) {
-      snprintf(rejected, sizeof(rejected), "%s", candidates[i]);
-      snprintf(reject_why, sizeof(reject_why), "%s", why);
+      rd_copy(rejected, sizeof(rejected), candidates[i]);
+      rd_copy(reject_why, sizeof(reject_why), why);
     }
   }
   if (rejected[0]) {
-    snprintf(out, sz, "%s", rejected);
-    if (reason && rsz) snprintf(reason, rsz, "%s", reject_why);
+    rd_copy(out, sz, rejected);
+    if (reason && rsz) rd_copy(reason, rsz, reject_why);
   }
   return false;
 }

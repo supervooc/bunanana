@@ -601,9 +601,9 @@ int rd_probe_open_o_path(const char *path) {
 }
 
 int rd_probe_open_read(const char *path) {
-  /* O_NONBLOCK matters: this probe runs on paths from the artefact corpus, and
-   * /data/local/tmp/* is writable by any `adb shell` user. Opening a FIFO that
-   * lives there for reading blocks until a writer appears, which let an
+  /* O_NONBLOCK matters: the artefact corpus includes paths under
+   * /data/local/tmp/, and that directory is writable by any `adb shell` user.
+   * Opening a FIFO there for reading blocks until a writer appears, which let an
    * unprivileged user hang the whole scan (including a root run) indefinitely.
    * With O_NONBLOCK the open returns immediately; the file still counts as
    * present, so the vote is unchanged. */
