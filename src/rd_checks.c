@@ -559,9 +559,13 @@ void rd_check_mounts(rd_ctx *c, rd_report *rep) {
       }
     }
     if (missing || extra) {
+      /* Built with bounded appends: one snprintf() from miss (up to 2999 bytes)
+       * plus ext could overflow RD_MAXEVID and was truncated by the compiler's
+       * own analysis (-Wformat-truncation). rd_appendf() truncates safely. */
       char evidence[RD_MAXEVID];
-      snprintf(evidence, sizeof(evidence), "missing from %s (%zu):\n%s\nonly in %s (%zu):\n%s",
-               files[i], missing, miss, files[i], extra, ext);
+      evidence[0] = '\0';
+      rd_appendf(evidence, sizeof(evidence), "missing from %s (%zu):\n%s\n", files[i], missing, miss);
+      rd_appendf(evidence, sizeof(evidence), "only in %s (%zu):\n%s", files[i], extra, ext);
       rd_add_ev(rep, SEV_CRITICAL, "mount-view-inconsistency",
                 "the kernel mount views disagree with each other", evidence,
                 "/proc/mounts and %s describe different mount tables (%zu vs %zu entries). "
@@ -583,7 +587,7 @@ typedef struct {
 } proc_scan_state;
 
 static void scan_one_proc(const char *pid, rd_ctx *c, rd_report *rep) {
-  char path[256];
+  char path[512];
   snprintf(path, sizeof(path), "/proc/%s/cmdline", pid);
   size_t clen = 0;
   char *cmdbuf = rd_slurp(path, &clen);
