@@ -16,7 +16,15 @@ SRC=/mnt/c/Users/86134/Documents/deepseek-harness/default-workspace/android-root
 HOST64=$SRC/out/rootdetect-x86_64
 HOST86=$SRC/out/rootdetect-x86
 REPORT=$SRC/out/abi-diff-report.txt
-D=/data/local/tmp
+# A helper is only executed when its directory is not group/other writable while
+# we run as root (see abi_helper_trusted in src/rd_kernel.c): /data/local/tmp is
+# drwxrwx--x shell shell, so a root run must use a root-only directory instead.
+if [ "$($ADB shell id -u 2>/dev/null | tr -d '\r')" = "0" ]; then
+  D=/data/local/rx
+  $ADB shell "mkdir -p $D && chmod 700 $D" > /dev/null 2>&1
+else
+  D=/data/local/tmp
+fi
 RAW64=/tmp/abi-diff-64.raw
 RAW86=/tmp/abi-diff-32.raw
 

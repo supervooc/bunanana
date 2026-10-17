@@ -279,8 +279,9 @@ powershell -ExecutionPolicy Bypass -File scripts/inject-root-fixtures.ps1 -Clean
 
 ```bash
 adb push out/rootdetect-arm64 /data/local/tmp/rx                # 主程序
-adb push out/rootdetect-arm   /data/local/tmp/rootdetect-arm    # 32 位助手
-adb shell chmod 755 /data/local/tmp/rx /data/local/tmp/rootdetect-arm
+adb shell "mkdir -p /data/local/rx && chmod 700 /data/local/rx"   # root-only: helpers are never exec'd from /data/local/tmp as root
+adb push out/rootdetect-arm   /data/local/rx/rootdetect-arm       # 32-bit helper
+adb shell chmod 755 /data/local/tmp/rx /data/local/rx/rootdetect-arm
 adb shell /data/local/tmp/rx        # 自动发现助手并启用差分
 ```
 
@@ -366,7 +367,7 @@ APK 内容（已逐项核验）：
 
 产物（已核验）：
 
-- 产物：`out/bunanana.apk`，**7,210,540 字节**，`sha256=70e6d8f07be946ae61e698ca61cff17e636d5f957ebdbf35368bb4c64b155832`
+- 产物：`out/bunanana.apk`，**7,214,636 字节**，`sha256=dfee8d8b8fad3667f930aa8741121009af9f5eaaa57160cfc5d7ff7363ab4909`
 - 下载直链：https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
 
 设计要点：

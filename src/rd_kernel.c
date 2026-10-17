@@ -832,9 +832,79 @@ static int abi_parse(char *text, char *helper_abi, size_t abi_sz, abi_row *rows,
   return n > 0 ? (int)n : -1;
 }
 
-static bool abi_candidate(char *out, size_t sz) {
+/* Whether the file at `path` may be executed as the ABI helper.
+ *
+ * This is a security boundary, not a formality. The helper used to be exec'd
+ * straight from /data/local/tmp to the names below, but on Android that
+ * directory is drwxrwx--x shell shell WITHOUT the sticky bit: any `adb shell`
+ * user can create a file named rootdetect-x86 there, or unlink a root-owned one
+ * and drop their own, and the next run executes it with this process's
+ * privileges (root, in the deep-check run). It could equally feed a forged
+ * --probe-dump and fake the verdict. So a helper is only executed when
+ *   - it is a regular file (not a symlink or a wrapper),
+ *   - it is owned by root (when we run as root) or by us,
+ *   - it is not writable by group/others,
+ *   - its parent directory is not group/other writable (only enforced when we
+ *     run as root: /data/local/tmp itself is group-writable),
+ *   - and it really is an ELF (a shell script is what a forged helper is).
+ */
+static bool abi_helper_trusted(const char *path, char *why, size_t whysz) {
+  struct stat st;
+  if (whysz) why[0] = '\0';
+  if (lstat(path, &st) != 0) { snprintf(why, whysz, "cannot be stat'ed"); return false; }
+  if (!S_ISREG(st.st_mode)) { snprintf(why, whysz, "not a regular file"); return false; }
+  uid_t me = geteuid();
+  if (me == 0 && st.st_uid != 0) {
+    snprintf(why, whysz, "owned by uid %d, not root", (int)st.st_uid);
+    return false;
+  }
+  if (me != 0 && st.st_uid != me) {
+    snprintf(why, whysz, "owned by uid %d, not by this process", (int)st.st_uid);
+    return false;
+  }
+  if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+    snprintf(why, whysz, "writable by group or others");
+    return false;
+  }
+  if (me == 0) {
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+      *slash = '\0';
+      struct stat ds;
+      if (stat(dir[0] ? dir : "/", &ds) == 0 && (ds.st_mode & (S_IWGRP | S_IWOTH))) {
+        snprintf(why, whysz, "directory %s is group/other writable", dir);
+        return false;
+      }
+    }
+  }
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) { snprintf(why, whysz, "cannot be opened"); return false; }
+  unsigned char magic[4] = {0};
+  ssize_t n = read(fd, magic, 4);
+  close(fd);
+  if (n != 4 || magic[0] != 0x7f || magic[1] != 'E' || magic[2] != 'L' || magic[3] != 'F') {
+    snprintf(why, whysz, "not an ELF executable");
+    return false;
+  }
+  return true;
+}
+
+/* Picks a helper. Returns false when none is usable; if a file existed but was
+ * refused, `out` holds its path and `reason` says why. */
+static bool abi_candidate(char *out, size_t sz, char *reason, size_t rsz) {
+  if (reason && rsz) reason[0] = '\0';
+  if (out && sz) out[0] = '\0';
   const char *e = getenv("ROOTDETECT_ABI_HELPER");
-  if (e && *e && rd_path_exists(e)) { snprintf(out, sz, "%s", e); return true; }
+  if (e && *e && rd_path_exists(e)) {
+    if (abi_helper_trusted(e, reason, rsz)) {
+      snprintf(out, sz, "%s", e);
+      return true;
+    }
+    snprintf(out, sz, "%s", e);
+    return false;
+  }
 
   char self[512] = "", dir[512] = "";
   if (rd_read_link("/proc/self/exe", self, sizeof(self)) >= 0) {
@@ -846,7 +916,8 @@ static bool abi_candidate(char *out, size_t sz) {
   static const char *const names[] = {"rootdetect-x86", "rootdetect-arm", "rootdetect-i386",
                                       "rootdetect-armeabi", "rootdetect-arm64",
                                       "rootdetect-x86_64", "rx32", "rx64", NULL};
-  static const char *const dirs[] = {NULL /* self dir */, "/data/local/tmp", NULL};
+  static const char *const dirs[] = {NULL /* self dir */, "/data/local/rx" /* root-only */,
+                                      "/data/local/tmp" /* only usable unprivileged */, NULL};
   char candidates[16][512];
   size_t nc = 0;
   for (int d = 0; dirs[d] || d == 0; d++) {
@@ -857,21 +928,52 @@ static bool abi_candidate(char *out, size_t sz) {
       nc++;
     }
   }
+  char rejected[512] = "", reject_why[256] = "";
   for (size_t i = 0; i < nc; i++) {
-    if (rd_path_exists(candidates[i])) { snprintf(out, sz, "%s", candidates[i]); return true; }
+    if (!rd_path_exists(candidates[i])) continue;
+    char why[256] = "";
+    if (abi_helper_trusted(candidates[i], why, sizeof(why))) {
+      snprintf(out, sz, "%s", candidates[i]);
+      return true;
+    }
+    if (!rejected[0]) {
+      snprintf(rejected, sizeof(rejected), "%s", candidates[i]);
+      snprintf(reject_why, sizeof(reject_why), "%s", why);
+    }
+  }
+  if (rejected[0]) {
+    snprintf(out, sz, "%s", rejected);
+    if (reason && rsz) snprintf(reason, rsz, "%s", reject_why);
   }
   return false;
 }
 
 void rd_check_abi_diff(rd_ctx *c, rd_report *rep) {
   (void)c;
-  char helper[512] = "";
-  if (!abi_candidate(helper, sizeof(helper))) {
-    rd_add(rep, SEV_INFO, "abi-diff-skipped", "no second-ABI helper binary found",
-           "push the 32-bit build next to this one (e.g. /data/local/tmp/rootdetect-x86) or set "
-           "ROOTDETECT_ABI_HELPER to enable the cross-ABI comparison. SuSFS patches the native "
-           "and compat syscall tables separately, so this is one of the strongest checks "
-           "available.");
+  char helper[512] = "", why[256] = "";
+  if (!abi_candidate(helper, sizeof(helper), why, sizeof(why))) {
+    if (helper[0] && why[0]) {
+      /* A file exists but is not safe to execute. Report it: on a rooted device
+       * this is either a misconfiguration or someone trying to get code run as
+       * root, and both deserve visibility. */
+      rd_add(rep, geteuid() == 0 ? SEV_MEDIUM : SEV_LOW, "abi-helper-rejected",
+             "an ABI helper file was found but refused to be executed",
+             "refusing %s: %s. A helper in a group/other-writable directory (/data/local/tmp "
+             "is drwxrwx--x shell shell on Android, and not sticky) can be planted or replaced "
+             "by any adb shell user while this process may be root, so it is never executed. "
+             "Put a root-owned copy in a root-only directory and point ROOTDETECT_ABI_HELPER "
+             "at it, e.g.: mkdir -m 700 /data/local/rx; cp rootdetect-x86 /data/local/rx/; "
+             "chmod 755 /data/local/rx/rootdetect-x86; "
+             "ROOTDETECT_ABI_HELPER=/data/local/rx/rootdetect-x86 rootdetect-x86_64 -v",
+             helper, why);
+    } else {
+      rd_add(rep, SEV_INFO, "abi-diff-skipped", "no second-ABI helper binary found",
+             "push the other ABI's build into a root-only directory and point "
+             "ROOTDETECT_ABI_HELPER at it to enable the cross-ABI comparison. SuSFS patches the "
+             "native and compat syscall tables separately, so this is one of the strongest "
+             "checks available. Files under group/other-writable directories such as "
+             "/data/local/tmp are deliberately ignored.");
+    }
     return;
   }
 

@@ -279,8 +279,9 @@ Hence: **a 64-bit process runs the 32-bit sibling product with `--probe-dump` an
 
 ```bash
 adb push out/rootdetect-arm64 /data/local/tmp/rx                # main program
-adb push out/rootdetect-arm   /data/local/tmp/rootdetect-arm    # 32-bit helper
-adb shell chmod 755 /data/local/tmp/rx /data/local/tmp/rootdetect-arm
+adb shell "mkdir -p /data/local/rx && chmod 700 /data/local/rx"   # root-only: helpers are never exec'd from /data/local/tmp as root
+adb push out/rootdetect-arm   /data/local/rx/rootdetect-arm       # 32-bit helper
+adb shell chmod 755 /data/local/tmp/rx /data/local/rx/rootdetect-arm
 adb shell /data/local/tmp/rx        # auto-discovers the helper and enables the diff
 ```
 
@@ -366,7 +367,7 @@ APK contents (verified item by item):
 
 Product (verified):
 
-- Product: `out/bunanana.apk`, **7,210,540 bytes**, `sha256=70e6d8f07be946ae61e698ca61cff17e636d5f957ebdbf35368bb4c64b155832`
+- Product: `out/bunanana.apk`, **7,214,636 bytes**, `sha256=dfee8d8b8fad3667f930aa8741121009af9f5eaaa57160cfc5d7ff7363ab4909`
 - Direct download: https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
 
 Design points:
