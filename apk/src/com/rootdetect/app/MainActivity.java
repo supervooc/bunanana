@@ -225,23 +225,42 @@ public class MainActivity extends Activity {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final String report = scan();
-                final String verdict = verdictOf(report);
-                final String banner = buildSummary(verdict, parseFindings(report));
-                final String log = header() + "\n\n" + banner + "\n\n"
-                        + "----------------------------------------------\n" + report;
+                String verdict;
+                String banner;
+                String log;
+                try {
+                    String report = scan();
+                    verdict = verdictOf(report);
+                    banner = buildSummary(verdict, parseFindings(report));
+                    log = header() + "\n\n" + banner + "\n\n"
+                            + "----------------------------------------------\n" + report;
+                } catch (Throwable t) {
+                    /* Nothing caught an unchecked failure or an Error here
+                     * before: no result was ever delivered, so the scan ended
+                     * as a crash (the default uncaught handler ends the process)
+                     * instead of a "扫描出错" banner - and where the process
+                     * survived, sScanning stayed true and both buttons stayed
+                     * disabled with no way to retry. Report it as a scan error
+                     * so the UI always comes back. */
+                    log = header() + "\n\n检测线程异常中止：" + t + "\n";
+                    verdict = verdictOf(log);   // no verdict line -> SCAN_ERROR
+                    banner = buildSummary(verdict, parseFindings(log));
+                }
+                final String fVerdict = verdict;
+                final String fBanner = banner;
+                final String fLog = log;
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
                         sScanning = false;
-                        sPendingReport = log;
+                        sPendingReport = fLog;
                         /* Deliver to the current Activity: this one when the scan
                          * finished before a rotation, the recreated one when it
                          * did not (see sCurrent/onDestroy). */
                         MainActivity target = (isFinishing() || isDestroyed())
                                 ? sCurrent : MainActivity.this;
                         if (target != null && !target.isFinishing() && !target.isDestroyed()) {
-                            target.applyResult(banner, verdict, log);
+                            target.applyResult(fBanner, fVerdict, fLog);
                         }
                     }
                 });
@@ -349,6 +368,34 @@ public class MainActivity extends Activity {
     }
 
     /**
+     * Kill a scanner that is still running when the watchdog fires.
+     *
+     * destroyForcibly() is API 26+ while this app declares minSdkVersion 24, so on
+     * Android 7.0/7.1 the call throws NoSuchMethodError. That is an Error, not an
+     * Exception: it escaped the watchdog's catch (InterruptedException), so the
+     * watchdog died without killing anything and the uncaught exception reached
+     * Android's default handler, which ends the process - the app force-closed
+     * exactly when the watchdog existed to recover from a wedged scanner. (Where
+     * a handler is installed the process survives, but the reader stays blocked
+     * in readLine() and the UI stays on "正在检测……" with both buttons disabled.)
+     * Plain destroy() - SIGTERM, what the normal path already uses - is the
+     * fallback on those two releases, and catch (Throwable) keeps any future
+     * Error from disarming the one thread that can unblock the reader.
+     */
+    private static void killProcess(Process proc) {
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                proc.destroyForcibly();
+            } else {
+                proc.destroy();
+            }
+        } catch (Throwable ignored) {
+            /* Never let this throw: the watchdog is the only thing that can
+             * unblock the reader. */
+        }
+    }
+
+    /**
      * Run one command with stderr folded into stdout, appending everything to
      * `out`. Returns true when the process started and exited before the
      * timeout; the exit code (and its verdict) is appended in that case.
@@ -381,10 +428,13 @@ public class MainActivity extends Activity {
                         Thread.sleep(SCAN_TIMEOUT_MS);
                     } catch (InterruptedException e) {
                         return;   // the scan finished in time; expected
+                    } catch (Throwable t) {
+                        /* Anything else (an Error) must not stop the watchdog:
+                         * it is the only thing that can unblock the reader. */
                     }
                     if (!finished.get()) {
                         timedOut.set(true);
-                        proc.destroyForcibly();
+                        killProcess(proc);
                     }
                 }
             });
@@ -560,14 +610,18 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 File written = null;
-                Exception error = null;
+                Throwable error = null;
                 try {
                     written = writeLog(text);
-                } catch (Exception e) {
+                } catch (Throwable e) {
+                    /* Throwable, not Exception: an Error here (OOM while
+                     * serialising a big report, ...) also has to re-enable the
+                     * button, otherwise the export button stays greyed out for
+                     * the rest of the Activity's life. */
                     error = e;
                 }
                 final File file = written;
-                final Exception err = error;
+                final Throwable err = error;
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
