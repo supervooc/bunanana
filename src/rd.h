@@ -61,8 +61,10 @@ typedef struct {
 
 void rd_add(rd_report *r, rd_sev sev, const char *id, const char *title,
             const char *fmt, ...);
-/* Same, but with an evidence blob that is printed verbatim (already escaped by
- * the caller when it contains user-controlled bytes). */
+/* Same, but with an evidence blob that may contain raw device bytes (another
+ * process's command line, /proc maps, kernel text). Neither renderer needs the
+ * caller to pre-escape: rd_print_text() escapes control bytes and malformed
+ * UTF-8 via rd_text_escape(), rd_print_json() escapes for JSON. */
 void rd_add_ev(rd_report *r, rd_sev sev, const char *id, const char *title,
                const char *evidence, const char *fmt, ...);
 void rd_report_init(rd_report *r);
@@ -114,6 +116,11 @@ bool rd_read_first_line(const char *path, char *buf, size_t bufsz);
 void rd_appendf(char *buf, size_t bufsz, const char *fmt, ...);
 /* HTML/JSON-ish escaping into out. */
 void rd_json_escape(const char *in, char *out, size_t outsz);
+/* Escapes the bytes a terminal would act on (<0x20, 0x7f and malformed UTF-8)
+ * as \xNN so a process cannot repaint the report by naming itself with ANSI/CR
+ * sequences. `in` must be inside a NUL terminated buffer. Returns the number of
+ * bytes written (never more than outsz-1). */
+size_t rd_text_escape(const char *in, size_t inlen, char *out, size_t outsz);
 size_t rd_trim(char *s);
 
 /* Syscall-level probes: each answers "does this path exist from this angle?"

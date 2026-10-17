@@ -260,6 +260,69 @@ void rd_json_escape(const char *in, char *out, size_t outsz) {
   out[o] = '\0';
 }
 
+/* Escape the bytes a terminal would act on, for the human readable report.
+ *
+ * Detail/evidence blobs are built from other processes' own files
+ * (/proc/<pid>/cmdline, maps, environ) and from kernel text, so a process that
+ * wants to stay hidden can name itself "\033[2K\r..." and have the line that
+ * exposes it repainted when the report is read in a terminal. rd_json_escape()
+ * covered only the -j path; the text renderer printed the bytes verbatim, and
+ * rd.h explicitly promises the caller escapes "when it contains user controlled
+ * bytes" while no caller did.  Control bytes, DEL and malformed UTF-8 (a lone
+ * 0x9B is CSI in a non-UTF-8 locale) become \xNN; well formed UTF-8, including a
+ * Chinese path, passes through unchanged. A literal backslash is deliberately
+ * left alone, so a "\x1b" in the printed line is always the escaped form of a
+ * real ESC byte - nothing ever decodes an escape back into a control byte.
+ *
+ * `in` must point into a NUL terminated buffer (utf8_seq_len() peeks at the
+ * continuation bytes; the line break or terminator that ends the line makes
+ * those reads safe). Writes at most outsz-1 bytes plus the terminator and
+ * returns the number of bytes written; an escape that does not fit is dropped
+ * entirely instead of being cut in half. */
+size_t rd_text_escape(const char *in, size_t inlen, char *out, size_t outsz) {
+  static const char hex[] = "0123456789abcdef";
+  size_t o = 0;
+  const unsigned char *p = (const unsigned char *)in;
+  const unsigned char *end = p + inlen;
+  if (!outsz) return 0;
+  while (p < end && *p) {
+    unsigned char c = *p;
+    size_t len = 0, need;
+    if (c < 0x20 || c == 0x7f) {
+      need = 4;
+    } else if (c >= 0x80) {
+      len = utf8_seq_len(p);
+      need = len ? len : 4;
+    } else {
+      need = 1;
+    }
+    if (o + need >= outsz) break;
+    if (len) {
+      for (size_t i = 0; i < len; i++) out[o++] = (char)p[i];
+      p += len;
+    } else if (need == 4) {
+      out[o++] = '\\';
+      out[o++] = 'x';
+      out[o++] = hex[c >> 4];
+      out[o++] = hex[c & 0xf];
+      p++;
+    } else {
+      out[o++] = (char)c;
+      p++;
+    }
+  }
+  out[o] = '\0';
+  return o;
+}
+
+/* One indented report line, escaped. The frame is reused by every call, so the
+ * buffer costs nothing per line. */
+static void print_indented(const char *line, size_t len, const char *lead) {
+  char esc[RD_MAXEVID * 4 + 8]; /* worst case: every byte becomes \xNN */
+  rd_text_escape(line, len, esc, sizeof esc);
+  printf("           %s%s\n", lead, esc);
+}
+
 static void print_finding_text(const rd_finding *f, int use_color) {
   const char *col = "", *rst = "";
   if (use_color) {
@@ -279,7 +342,7 @@ static void print_finding_text(const rd_finding *f, int use_color) {
     while (*p) {
       const char *nl = strchr(p, '\n');
       size_t len = nl ? (size_t)(nl - p) : strlen(p);
-      printf("           %.*s\n", (int)len, p);
+      print_indented(p, len, "");
       if (!nl) break;
       p = nl + 1;
     }
@@ -289,7 +352,7 @@ static void print_finding_text(const rd_finding *f, int use_color) {
     while (*p) {
       const char *nl = strchr(p, '\n');
       size_t len = nl ? (size_t)(nl - p) : strlen(p);
-      printf("           | %.*s\n", (int)len, p);
+      print_indented(p, len, "| ");
       if (!nl) break;
       p = nl + 1;
     }
