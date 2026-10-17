@@ -58,8 +58,12 @@ typedef struct {
 
 static void ksym_add(ksym_tab *t, const char *name, unsigned long long addr, const char *mod) {
   if (t->n == t->cap) {
-    t->cap = t->cap ? t->cap * 2 : 512;
-    t->v = (ksym *)realloc(t->v, t->cap * sizeof(ksym));
+    /* cap advances only on a successful realloc (same rule as find_push()). */
+    size_t ncap = t->cap ? t->cap * 2 : 512;
+    ksym *nv = (ksym *)realloc(t->v, ncap * sizeof(ksym));
+    if (!nv) return;
+    t->v = nv;
+    t->cap = ncap;
   }
   ksym *k = &t->v[t->n++];
   snprintf(k->name, sizeof(k->name), "%s", name);
@@ -121,6 +125,7 @@ bool rd_parse_proc_modules_line(const char *line, char *name, size_t sz) {
 
 static ksym_tab *kallsyms_parse(const char *txt, const char *const *want) {
   ksym_tab *t = (ksym_tab *)calloc(1, sizeof(ksym_tab));
+  if (!t) return NULL;
   char *copy = strdup(txt);
   if (!copy) { free(t); return NULL; }
   char *save = NULL;
@@ -206,9 +211,26 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
       else if (t & 1)
         rd_add_ev(rep, SEV_LOW, "kernel-taint", "kernel tainted by a proprietary module", ev,
                   "taint bit 0 (P): common on stock devices with vendor modules.");
-      else
-        rd_add_ev(rep, SEV_MEDIUM, "kernel-taint", "kernel is tainted", ev,
-                  "a module/condition marked the kernel, which stock builds typically avoid.");
+      else {
+        /* Bits that stock / vendor kernels set routinely and that say nothing
+         * about "something was loaded into the kernel", which is what this
+         * MEDIUM is about: S(2), M(4), B(5), U(6), D(7, an OOPS/BUG happened at
+         * some point), A(8), W(9), C(10), I(11), L(14, a soft lockup) and
+         * T(17, struct randomization). Leaving D/L/T out of the mask reported a
+         * crashed but otherwise stock kernel as suspicious. Module-related bits
+         * (F(1), R(3), O(12, handled above), E(13), K(15), X(16)) are not
+         * benign; anything else also keeps the MEDIUM. */
+        unsigned long benign = (1ul << 2) | (1ul << 4) | (1ul << 5) | (1ul << 6) |
+                               (1ul << 7) | (1ul << 8) | (1ul << 9) | (1ul << 10) |
+                               (1ul << 11) | (1ul << 14) | (1ul << 17);
+        if (((unsigned long)t & ~benign) == 0)
+          rd_add_ev(rep, SEV_LOW, "kernel-taint", "kernel tainted by benign conditions", ev,
+                    "only taint bits stock/vendor kernels set routinely (S/D/M/B/U/A/W/C/I/L/T) "
+                    "are present; no module or hooking bit is set.");
+        else
+          rd_add_ev(rep, SEV_MEDIUM, "kernel-taint", "kernel is tainted", ev,
+                    "a module/condition marked the kernel, which stock builds typically avoid.");
+      }
     }
   }
 
@@ -225,7 +247,10 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
       char name[128] = "";
       if (!rd_parse_proc_modules_line(line, name, sizeof(name))) continue;
       mod_count++;
-      if (n_mod_names < 512) mod_names[n_mod_names++] = strdup(name);
+      if (n_mod_names < 512) {
+        char *dup = strdup(name);
+        if (dup) mod_names[n_mod_names++] = dup;
+      }
       const char *which = NULL;
       if (has_kw(name, &which)) {
         mod_hits++;
@@ -233,27 +258,28 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
       }
     }
   }
-  if (mod_hits)
+  if (!mods)
+    rd_add(rep, SEV_INFO, "kernel-module", "/proc/modules unreadable",
+           "the loaded-module list could not be read (SELinux restricts it to root on some "
+           "devices), so the module-name check did not run - this is not a clean result.");
+  else if (mod_hits)
     rd_add_ev(rep, SEV_HIGH, "kernel-module", "loaded kernel module names a root framework",
               mod_ev, "%d of %d loaded modules match a hiding-framework name.", mod_hits, mod_count);
   else
     rd_add(rep, SEV_INFO, "kernel-module", "no suspicious module name in /proc/modules",
            "%d modules listed.", mod_count);
 
-  /* /sys/module: names matching a framework, and names whose sysfs node is
-   * missing although the module is listed (sus_path only hides the nodes it was
-   * told about). */
+  /* /sys/module: names matching a framework. (The cross-check of /proc/modules
+   * names against their /sys/module node - which sus_path hides independently -
+   * is NOT implemented here; an earlier comment claimed it was.) */
   char sys_ev[RD_MAXEVID];
   sys_ev[0] = '\0';
   int sys_hits = 0;
   DIR *d = opendir("/sys/module");
-  char *sys_names[1024];
-  size_t n_sys = 0;
   if (d) {
     struct dirent *e;
     while ((e = readdir(d))) {
       if (e->d_name[0] == '.') continue;
-      if (n_sys < 1024) sys_names[n_sys++] = strdup(e->d_name);
       const char *which = NULL;
       if (has_kw(e->d_name, &which)) {
         sys_hits++;
@@ -299,7 +325,19 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
                        ktab->v[i].name, kptr_str(ktab->v[i].addr, buf, sizeof(buf)));
         }
       }
-      if (hidden_mod)
+      /* Only conclude "hidden" when /proc/modules was actually readable AND
+       * non-empty. If it is unreadable (some kernels/SELinux restrict it to
+       * root) or empty, kallsyms still carries [module] tags and every one of
+       * them would be reported as hidden - turning a clean device into
+       * HIDING_DETECTED. That is worse than not checking. */
+      if (hidden_mod && (mods == NULL || mod_count == 0))
+        rd_add(rep, SEV_INFO, "kernel-modules-crosscheck-skipped",
+               "module list unavailable or empty, cross-check skipped",
+               "/proc/modules could not be read or lists no modules, so the %d module symbol(s) "
+               "seen in kallsyms cannot be told apart from a filtered module list; "
+               "skipping the hidden-module conclusion.",
+               hidden_mod);
+      else if (hidden_mod)
         rd_add_ev(rep, SEV_HIGH, "kernel-module-hidden",
                   "module symbols visible in kallsyms but the module is missing from /proc/modules",
                   mod_ev2,
@@ -369,14 +407,18 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
         } else {
           unsigned long long entry = 0;
           if (kcore_read(sct + (unsigned long long)__NR_openat * 8, &entry, 8)) {
-            if (entry != openat)
+            if (entry != openat) {
+              /* Two distinct buffers: kptr_str() returns its argument, so passing
+               * the same buffer twice made both %s read the last-written value
+               * (and the two writes were unsequenced). */
+              char buf2[64];
               rd_add(rep, SEV_CRITICAL, "kernel-syscall-table-patched",
                      "sys_call_table entry does not point at the real syscall",
                      "sys_call_table[%d]=%s but kallsyms says the syscall is at %s - the table "
                      "was rewritten at runtime (SuSFS susfs_fp_hook / any syscall hook).",
                      __NR_openat, kptr_str(entry, buf, sizeof(buf)),
-                     kptr_str(openat, buf, sizeof(buf)));
-            else
+                     kptr_str(openat, buf2, sizeof(buf2)));
+            } else
               rd_add(rep, SEV_INFO, "kernel-syscall-table",
                      "sys_call_table[openat] matches kallsyms",
                      "verified through /proc/kcore: %s", kptr_str(entry, buf, sizeof(buf)));
@@ -395,7 +437,6 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
   ksym_free(ktab);
   if (mods) free(mods);
   for (size_t i = 0; i < n_mod_names; i++) free(mod_names[i]);
-  for (size_t i = 0; i < n_sys; i++) free(sys_names[i]);
 
   if (read_first_line_public("/proc/sys/kernel/kptr_restrict", buf, sizeof(buf)))
     rd_add(rep, SEV_INFO, "kernel-kptr", "kptr_restrict", "%s", buf);
@@ -898,21 +939,37 @@ static void check_uname_spoof(rd_report *rep) {
   }
 
   bool mismatch = false;
+  int compared = 0;
   char ev[RD_MAXEVID];
   ev[0] = '\0';
   rd_appendf(ev, sizeof(ev), "uname(2).release      = %s\n", u.release);
   if (have_sys) rd_appendf(ev, sizeof(ev), "/proc/sys/kernel/osrelease = %s\n", sys_rel);
   if (file_rel[0]) rd_appendf(ev, sizeof(ev), "/proc/version (release)    = %s\n", file_rel);
 
-  if (have_sys && strcmp(sys_rel, u.release) != 0) mismatch = true;
-  if (file_rel[0] && strcmp(file_rel, u.release) != 0) mismatch = true;
+  if (have_sys) {
+    compared++;
+    if (strcmp(sys_rel, u.release) != 0) mismatch = true;
+  }
+  if (file_rel[0]) {
+    compared++;
+    if (strcmp(file_rel, u.release) != 0) mismatch = true;
+  }
 
   if (have_sysver) {
     rd_appendf(ev, sizeof(ev), "uname(2).version      = %s\n/proc/sys/kernel/version   = %s\n",
                u.version, sys_ver);
-    /* /proc/sys/kernel/version may be truncated to UTS_VERSION_LENGTH, so only
-     * a divergence in the leading build id is treated as a spoof. */
-    if (sys_ver[0] && strncmp(sys_ver, u.version, 8) != 0) mismatch = true;
+    /* /proc/sys/kernel/version may be truncated to UTS_VERSION_LENGTH, so
+     * compare as much as both sides have. The old 8-byte strncmp() only looked
+     * at the leading build id: a spoof that keeps "#1 SMP PREEMPT" and rewrites
+     * the rest of the string went unnoticed even though the file was complete. */
+    size_t n = strlen(sys_ver);
+    if (n > strlen(u.version)) n = strlen(u.version);
+    if (n >= 8) {
+      compared++;
+      if (strncmp(sys_ver, u.version, n) != 0) mismatch = true;
+    } else {
+      rd_appendf(ev, sizeof(ev), "(/proc/sys/kernel/version is too short to compare)\n");
+    }
   }
 
   if (mismatch)
@@ -922,22 +979,51 @@ static void check_uname_spoof(rd_report *rep) {
               "kretprobe on the syscall entry, while /proc/version and "
               "/proc/sys/kernel/{osrelease,version} keep printing init_uts_ns. A disagreement is "
               "therefore direct proof that a kernel-level spoofer is active.");
+  else if (compared == 0)
+    /* "All utsname sources agree" was printed even when not a single one of them
+     * could be read, which turns "the check did not run" into an apparent clean
+     * result (the exact failure mode a hiding layer wants). */
+    rd_add_ev(rep, SEV_INFO, "spoof-uname", "uname() could not be cross-checked", ev,
+              "none of /proc/version, /proc/sys/kernel/osrelease or /proc/sys/kernel/version were "
+              "readable from this domain, so nothing was compared - this is not a consistent "
+              "result.");
   else
     rd_add_ev(rep, SEV_INFO, "spoof-uname", "uname() is consistent with /proc", ev,
-              "all utsname sources agree.");
+              "%d readable utsname source(s) agree with the uname(2) syscall.", compared);
 }
 
 /* Compare the kernel command line against the ro.boot.* properties init derives
  * from it - this is SuSFS's cmdline layer's blind spot. */
 static void check_cmdline_spoof(rd_ctx *c, rd_report *rep) {
   char *cmdline = rd_slurp("/proc/cmdline", NULL);
-  if (!cmdline || !cmdline[0]) { free(cmdline); return; }
+  if (!cmdline || !cmdline[0]) {
+    /* Returning silently hid the fact that the cross-check never ran. */
+    rd_add(rep, SEV_INFO, "spoof-cmdline", "/proc/cmdline is not readable",
+           "the kernel command line could not be read from this domain (SELinux or a hiding "
+           "layer), so the ro.boot.* cross-check did not run - this is not a clean result.");
+    free(cmdline);
+    return;
+  }
   size_t clen = strlen(cmdline);
-  if (clen < 32) { free(cmdline); return; } /* truncated/empty: nothing to compare */
+  if (clen < 32) {
+    rd_add(rep, SEV_INFO, "spoof-cmdline", "kernel command line is too short to compare",
+           "/proc/cmdline is %zu bytes long, so it carries no androidboot.* parameter to verify "
+           "the property table against.", clen);
+    free(cmdline);
+    return;
+  }
   /* Android 12+ passes boot parameters through bootconfig, which the cmdline
    * hiding layer does not touch; a match in either file counts. Without this,
    * every property on a GKI device looked missing -> false HIGH (review B4). */
   char *bootconfig = rd_slurp("/proc/bootconfig", NULL);
+
+  /* A cmdline-hiding layer rewrites one of the two files, but they are only
+   * useful as a reference if they expose androidboot.* tokens at all: an
+   * app/shell SELinux domain, a vendor that strips them and a non-Android
+   * kernel all leave /proc/cmdline without any, and then "no counterpart" says
+   * nothing - "hidden here" and "never passed here" are indistinguishable. */
+  bool cmd_ref = strstr(cmdline, "androidboot.") != NULL;
+  bool bc_ref = bootconfig && strstr(bootconfig, "androidboot.") != NULL;
 
   char ev[RD_MAXEVID];
   ev[0] = '\0';
@@ -957,8 +1043,8 @@ static void check_cmdline_spoof(rd_ctx *c, rd_report *rep) {
         !(bootconfig && (strstr(bootconfig, needle) || strstr(bootconfig, needle_bc)))) {
       mismatch++;
       if (strlen(ev) < sizeof(ev) - 256)
-        rd_appendf(ev, sizeof(ev), "%s=%s has no androidboot.%s= in /proc/cmdline\n", k,
-                   c->props.vals[i], sub);
+        rd_appendf(ev, sizeof(ev), "%s=%s has no androidboot.%s in /proc/cmdline or "
+                                   "/proc/bootconfig\n", k, c->props.vals[i], sub);
     }
   }
   /* A couple of ro.boot.* properties are not sourced from the command line at
@@ -967,12 +1053,20 @@ static void check_cmdline_spoof(rd_ctx *c, rd_report *rep) {
    * are normal. A cmdline-hiding layer rewrites the file wholesale and misses
    * most of them, hence the majority rule. Measured on a pristine emulator:
    * 3 of 10 missing. */
-  if (checked >= 3 && mismatch * 2 > checked)
+  if (checked >= 3 && mismatch * 2 > checked && (cmd_ref || bc_ref))
     rd_add_ev(rep, SEV_HIGH, "spoof-cmdline",
               "property table and kernel command line disagree", ev,
               "%d of %d ro.boot.* properties have no counterpart in /proc/cmdline. SuSFS's cmdline "
               "layer rewrites /proc/cmdline only; init has already copied the real values into "
               "ro.boot.*, so the two views diverge.", mismatch, checked);
+  else if (checked >= 3 && mismatch * 2 > checked)
+    rd_add_ev(rep, SEV_INFO, "spoof-cmdline",
+              "property table and command line cannot be compared", ev,
+              "%d of %d ro.boot.* properties have no counterpart, but neither source exposes any "
+              "androidboot.* token from this domain (/proc/cmdline: %s; /proc/bootconfig: %s), so "
+              "the parameters are not visible here rather than hidden - there is nothing to "
+              "compare against.", mismatch, checked, cmd_ref ? "has tokens" : "no tokens",
+              bootconfig ? (bc_ref ? "has tokens" : "no tokens") : "unreadable");
   else if (checked)
     rd_add(rep, SEV_INFO, "spoof-cmdline", "command line and ro.boot.* properties agree",
            "%d properties cross-checked, %d without a cmdline counterpart (a few are expected: "
@@ -1062,31 +1156,86 @@ static void check_control_paths(rd_report *rep) {
            "%d ordinary paths probed.", checked);
 }
 
+/* Does `text` contain a line that defines exactly `key` ("key=" at a line
+ * start)? Used to find keys a later partition may legitimately override. */
+static bool text_defines_key(const char *text, const char *key) {
+  if (!text || !key || !*key) return false;
+  size_t klen = strlen(key);
+  for (const char *p = text; (p = strstr(p, key)) != NULL; p++) {
+    if (p != text && p[-1] != '\n') continue;
+    if (p[klen] != '=') continue;
+    return true;
+  }
+  return false;
+}
+
 /* /system/build.prop is world readable and is the on-disk source of many
  * ro.* properties; comparing it with the live property service catches
  * resetprop-style tampering. */
 static void check_buildprop_spoof(rd_ctx *c, rd_report *rep) {
   char *bp = rd_slurp("/system/build.prop", NULL);
   if (!bp) return;
+  /* /system/build.prop is only the first of several property files: init reads
+   * vendor/, odm/, product/ and system_ext/ build.prop afterwards, and a later
+   * declaration wins. Comparing /system alone therefore reported every
+   * legitimate override as a resetprop edit (the live value is the vendor's,
+   * not /system's), so keys defined by a later partition are skipped. The files
+   * that cannot be read simply do not contribute. */
+  static const char *const later[] = {"/vendor/build.prop", "/odm/build.prop",
+                                      "/product/build.prop", "/system_ext/build.prop", NULL};
+  char *later_txt = NULL;
+  size_t later_len = 0;
+  for (int i = 0; later[i]; i++) {
+    size_t n = 0;
+    char *t = rd_slurp(later[i], &n);
+    if (!t) continue;
+    char *nt = (char *)realloc(later_txt, later_len + n + 2);
+    if (!nt) {
+      free(t);
+      break;
+    }
+    later_txt = nt;
+    memcpy(later_txt + later_len, t, n);
+    later_len += n;
+    later_txt[later_len++] = '\n';
+    free(t);
+  }
+  if (later_txt) later_txt[later_len] = '\0';
+
   char ev[RD_MAXEVID];
   ev[0] = '\0';
-  int checked = 0, bad = 0;
+  int checked = 0, bad = 0, overridden = 0;
   char *save = NULL;
   for (char *line = strtok_r(bp, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+    while (*line == ' ' || *line == '\t' || *line == '\r') line++; /* build.prop is CRLF sometimes */
+    if (!*line || *line == '#') continue;
     char *eq = strchr(line, '=');
-    if (!eq || line[0] == '#') continue;
+    if (!eq || eq == line) continue;
     *eq = '\0';
-    char key[128];
-    snprintf(key, sizeof(key), "%s", line);
+    char *key = line;
+    char *kend = key + strlen(key);
+    while (kend > key && (kend[-1] == ' ' || kend[-1] == '\t')) *--kend = '\0';
+    char *val = eq + 1;
+    while (*val == ' ' || *val == '\t') val++;
+    char *vend = val + strlen(val);
+    /* getprop trims trailing whitespace; a trailing space in the file is not a
+     * property change. */
+    while (vend > val && (vend[-1] == ' ' || vend[-1] == '\t' || vend[-1] == '\r')) *--vend = '\0';
+    if (!*key || !*val) continue;
     const char *live = rd_prop(&c->props, key);
     if (!live) continue;
+    if (text_defines_key(later_txt, key)) {
+      overridden++;
+      continue; /* a later partition decides this key, /system's copy is unused */
+    }
     checked++;
-    if (strcmp(live, eq + 1) != 0) {
+    if (strcmp(live, val) != 0) {
       bad++;
       if (strlen(ev) < sizeof(ev) - 256)
-        rd_appendf(ev, sizeof(ev), "%s: build.prop=%s getprop=%s\n", key, eq + 1, live);
+        rd_appendf(ev, sizeof(ev), "%s: /system/build.prop=%s getprop=%s\n", key, val, live);
     }
   }
+  free(later_txt);
   free(bp);
   if (bad)
     rd_add_ev(rep, SEV_HIGH, "spoof-property",
@@ -1095,7 +1244,8 @@ static void check_buildprop_spoof(rd_ctx *c, rd_report *rep) {
               "fake ro.debuggable/ro.boot.* values.", bad);
   else if (checked)
     rd_add(rep, SEV_INFO, "spoof-property", "properties match build.prop",
-           "%d properties cross-checked.", checked);
+           "%d properties cross-checked (%d skipped: a later partition redefines them).", checked,
+           overridden);
 }
 
 void rd_check_consistency(rd_ctx *c, rd_report *rep) {
@@ -1278,30 +1428,64 @@ void rd_abi_probe_dump(FILE *out) {
   fflush(out);
 }
 
-/* Parse a --probe-dump payload. Returns the number of rows, or -1. */
+/* Parse a --probe-dump payload. Returns the number of rows, or -1.
+ *
+ * The payload comes from a helper we exec (see abi_helper_trusted()), but its
+ * shape is still validated: the old field loop ran exactly RD_ABI_FIELDS times
+ * even when a line carried fewer numbers, and strtol() then returned 0 for
+ * every missing field. A truncated or stale helper therefore looked like "all
+ * probes answered ENOENT" and could be compared into a CRITICAL ABI mismatch.
+ * A row is accepted only with the full field count, and a payload without a
+ * "# rd-probe-dump 1" header is refused instead of being half-read. */
 static int abi_parse(char *text, char *helper_abi, size_t abi_sz, abi_row *rows, size_t max) {
   size_t n = 0;
+  int malformed = 0;
+  bool have_header = false;
   if (abi_sz) helper_abi[0] = '\0';
   char *save = NULL;
   for (char *line = strtok_r(text, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
     if (line[0] == '#') {
+      int ver = 0;
       char abi[64] = "";
-      if (sscanf(line, "# rd-probe-dump %*d %63s", abi) == 1 && abi_sz)
-        snprintf(helper_abi, abi_sz, "%s", abi);
+      if (sscanf(line, "# rd-probe-dump %d %63s", &ver, abi) != 2)
+        continue; /* some other comment */
+      if (ver != 1) return -1; /* unknown format: not a payload we can compare */
+      have_header = true;
+      if (abi_sz) snprintf(helper_abi, abi_sz, "%s", abi);
       continue;
     }
+    if (!have_header) continue; /* data before any header: nothing to trust */
     if (n >= max) break;
+    if (!line[0]) continue;
     char *tab = strchr(line, '\t');
-    if (!tab) continue;
-    *tab = '\0';
-    snprintf(rows[n].path, sizeof(rows[n].path), "%s", line);
-    char *q = tab + 1;
-    for (int k = 0; k < RD_ABI_FIELDS; k++) {
-      rows[n].r[k] = (int)strtol(q, &q, 10);
-      if (*q == '\t') q++;
+    if (!tab) {
+      malformed++;
+      continue;
     }
+    *tab = '\0';
+    char *q = tab + 1;
+    int got = 0;
+    for (int k = 0; k < RD_ABI_FIELDS; k++) {
+      if (k) {
+        if (*q != '\t') break; /* a field is missing */
+        q++;
+      }
+      char *end = NULL;
+      long v = strtol(q, &end, 10);
+      if (end == q) break; /* not a number */
+      rows[n].r[k] = (int)v;
+      q = end;
+      got++;
+    }
+    if (got != RD_ABI_FIELDS || (*q && *q != '\t')) {
+      malformed++;
+      continue;
+    }
+    snprintf(rows[n].path, sizeof(rows[n].path), "%s", line);
     n++;
   }
+  if (!have_header) return -1;
+  if (malformed && !n) return -1;
   return n > 0 ? (int)n : -1;
 }
 
@@ -1342,7 +1526,8 @@ static bool abi_helper_trusted(const char *path, char *why, size_t whysz) {
   if (me == 0) {
     char dir[512];
     if (rd_dir_writable_by_others(path, dir, sizeof(dir))) {
-      snprintf(why, whysz, "directory %s is group/other writable", dir[0] ? dir : "?");
+      if (whysz) why[0] = '\0';
+      rd_appendf(why, whysz, "directory %s is group/other writable", dir[0] ? dir : "?");
       return false;
     }
   }
@@ -1376,7 +1561,7 @@ static bool abi_candidate(char *out, size_t sz, char *reason, size_t rsz) {
   char self[512] = "", dir[512] = "";
   if (rd_read_link("/proc/self/exe", self, sizeof(self)) >= 0) {
     char *slash = strrchr(self, '/');
-    if (slash) { *slash = '\0'; snprintf(dir, sizeof(dir), "%s", self); }
+    if (slash) { *slash = '\0'; rd_copy(dir, sizeof(dir), self); }
   }
   /* Names a user is likely to have pushed side by side. Both directions are
    * listed: a 32-bit build can exec a 64-bit helper and vice versa. */
@@ -1385,13 +1570,24 @@ static bool abi_candidate(char *out, size_t sz, char *reason, size_t rsz) {
                                       "rootdetect-x86_64", "rx32", "rx64", NULL};
   static const char *const dirs[] = {NULL /* self dir */, "/data/local/rx" /* root-only */,
                                       "/data/local/tmp" /* only usable unprivileged */, NULL};
-  char candidates[16][512];
+  /* 8 names x 3 directories = 24 candidates; the array and the bound must allow
+   * all of them or the last directory (/data/local/tmp, the only one usable
+   * unprivileged) would never be scanned. */
+  enum { RD_ABI_MAXCAND = 40 };
+  char candidates[RD_ABI_MAXCAND][512];
   size_t nc = 0;
   for (int d = 0; dirs[d] || d == 0; d++) {
     const char *base = (d == 0) ? (dir[0] ? dir : NULL) : dirs[d];
     if (!base) continue;
-    for (int i = 0; names[i] && nc < 16; i++) {
-      snprintf(candidates[nc], sizeof(candidates[0]), "%s/%s", base, names[i]);
+    for (int i = 0; names[i] && nc < RD_ABI_MAXCAND; i++) {
+      /* Build the path with an explicit length check instead of
+       * snprintf("%s/%s"): a silently truncated path would make the cross-ABI
+       * diff compare the wrong file. */
+      size_t bl = strlen(base), nl = strlen(names[i]);
+      if (bl + 1 + nl + 1 > sizeof(candidates[0])) continue;
+      memcpy(candidates[nc], base, bl);
+      candidates[nc][bl] = '/';
+      memcpy(candidates[nc] + bl + 1, names[i], nl + 1);
       nc++;
     }
   }
@@ -1400,17 +1596,17 @@ static bool abi_candidate(char *out, size_t sz, char *reason, size_t rsz) {
     if (!rd_path_exists(candidates[i])) continue;
     char why[256] = "";
     if (abi_helper_trusted(candidates[i], why, sizeof(why))) {
-      snprintf(out, sz, "%s", candidates[i]);
+      rd_copy(out, sz, candidates[i]);
       return true;
     }
     if (!rejected[0]) {
-      snprintf(rejected, sizeof(rejected), "%s", candidates[i]);
-      snprintf(reject_why, sizeof(reject_why), "%s", why);
+      rd_copy(rejected, sizeof(rejected), candidates[i]);
+      rd_copy(reject_why, sizeof(reject_why), why);
     }
   }
   if (rejected[0]) {
-    snprintf(out, sz, "%s", rejected);
-    if (reason && rsz) snprintf(reason, rsz, "%s", reject_why);
+    rd_copy(out, sz, rejected);
+    if (reason && rsz) rd_copy(reason, rsz, reject_why);
   }
   return false;
 }

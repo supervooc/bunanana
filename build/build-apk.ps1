@@ -71,7 +71,10 @@ Step "javac (java sources -> classes)" {
   $srcs = @(Get-ChildItem "$apkSrc\src" -Recurse -Filter *.java | ForEach-Object { $_.FullName })
   # Quote every path: an unquoted -bootclasspath argument gets mangled by
   # PowerShell's native-command argument handling ("invalid flag: :").
-  & "$jdk\bin\javac.exe" -source 8 -target 8 -nowarn -bootclasspath "$androidJar" `
+  # -encoding UTF-8: the Activity's UI strings are Chinese (and the sources are
+  # UTF-8); without this javac 17 reads them with the platform ANSI codepage on
+  # Windows and mangles the literals.
+  & "$jdk\bin\javac.exe" -source 8 -target 8 -nowarn -encoding UTF-8 -bootclasspath "$androidJar" `
     -d "$work\classes" @srcs
 }
 
@@ -87,6 +90,14 @@ foreach ($a in @("arm64", "arm", "x86_64")) {
   $bin = Join-Path $out "rootdetect-$a"
   if (Test-Path $bin) { $entries += ("lib/{0}/librootdetect.so={1}" -f $abiMap[$a], (ToWsl $bin)) }
 }
+# A build with zero embedded scanners passes every later check vacuously
+# (classes.dex alone is still a valid pair for list_apk.py), so require one.
+$libEntries = @($entries | Where-Object { $_ -like 'lib/*' })
+if ($libEntries.Count -eq 0) {
+  throw "no native scanner embedded: build out/rootdetect-arm64 (build/build.ps1) first"
+}
+Write-Host ("    embedded scanners: {0} -> {1}" -f $libEntries.Count,
+            (($libEntries | ForEach-Object { ($_ -split '=')[0] }) -join ', '))
 $pyArgs = @("python3", (ToWsl "$apkSrc\assemble.py"), (ToWsl "$work\unsigned.apk"),
             (ToWsl "$work\base.apk")) + $entries
 $cmdline = ($pyArgs | ForEach-Object { if ($_ -match ' ') { '"' + $_ + '"' } else { $_ } }) -join ' '
@@ -121,7 +132,8 @@ if (-not $SkipSign) {
     & "$bt\apksigner.bat" verify --print-certs "$apk"
   }
 } else {
-  Copy-Item "$work\aligned.apk" (Join-Path $out "bunanana-unsigned.apk") -Force
+  $apk = Join-Path $out "bunanana-unsigned.apk"
+  Copy-Item "$work\aligned.apk" $apk -Force
 }
 
 Step "badging" {
@@ -129,10 +141,19 @@ Step "badging" {
 }
 
 Write-Host "`n==> apk contents and embedded binary check"
+# Quote any argument that contains a space: a workspace path like
+# "C:\Users\First Last\..." would otherwise be split by `cmd /c`.
 $listArgs = @("python3", (ToWsl "$apkSrc\list_apk.py"), (ToWsl "$apk")) + $entries
+$listCmd = ($listArgs | ForEach-Object { if ($_ -match ' ') { '"' + $_ + '"' } else { $_ } }) -join ' '
 $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-& cmd /c "wsl -e $($listArgs -join ' ')" 2>&1 | ForEach-Object { Write-Host "    $_" }
+& cmd /c "wsl -e $listCmd" 2>&1 | ForEach-Object { Write-Host "    $_" }
+$listRc = $LASTEXITCODE
 & "$bt\zipalign.exe" -c -v 4 "$apk" 2>&1 |
   Select-String -Pattern 'Verification|OK' | ForEach-Object { Write-Host "    $_" }
+$alignRc = $LASTEXITCODE
 $ErrorActionPreference = $prev
+# These two are the build's only integrity gate; without checking their exit
+# codes a truncated or mismatched scanner shipped with "done: ...".
+if ($listRc -ne 0) { throw "embedded binary verification failed (list_apk.py exit $listRc)" }
+if ($alignRc -ne 0) { throw "zipalign verification failed (exit $alignRc)" }
 Write-Host "`ndone: $apk"

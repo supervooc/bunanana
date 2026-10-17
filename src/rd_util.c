@@ -45,6 +45,10 @@ void rd_report_init(rd_report *r) {
   memset(r, 0, sizeof(*r));
   r->cap = 16;
   r->items = (rd_finding *)calloc(r->cap, sizeof(rd_finding));
+  /* If the initial calloc fails, leaving cap=16 with items==NULL makes the first
+   * find_push() skip its grow branch (0 < 16) and dereference items[0]. cap=0
+   * forces it onto the realloc path instead. */
+  if (!r->items) r->cap = 0;
 }
 
 void rd_report_free(rd_report *r) {
@@ -70,11 +74,20 @@ static rd_finding *find_push(rd_report *r, rd_sev sev, const char *id, const cha
     r->items = ni;
     r->cap = ncap;
   }
-  rd_finding *f = &r->items[r->n++];
+  rd_finding *f = &r->items[r->n];
   memset(f, 0, sizeof(*f));
-  f->sev = sev;
   f->id = xstrdup(id ? id : "unnamed");
   f->title = xstrdup(title ? title : "");
+  if (!f->id || !f->title) {
+    /* OOM: drop the finding rather than publish NULLs that rd_json_escape(),
+     * the text printer and rd_report_free() would all dereference. */
+    free(f->id);
+    free(f->title);
+    memset(f, 0, sizeof(*f));
+    return NULL;
+  }
+  f->sev = sev;
+  r->n++;
   r->counts[sev]++;
   return f;
 }
@@ -184,26 +197,137 @@ void rd_finalize(rd_report *r) {
   r->verdict = xstrdup(verdict);
 }
 
+/* Length of the well-formed UTF-8 sequence starting at p, or 0 when p is not a
+ * valid lead byte (or the sequence is truncated, overlong, or a surrogate).
+ * p is NUL-terminated, so a 0x00 encountered as a continuation byte is rejected
+ * by the (byte & 0xC0) == 0x80 test before any read past the string. */
+static size_t utf8_seq_len(const unsigned char *p) {
+  unsigned char c = p[0];
+  if (c < 0x80) return 1;
+  if (c >= 0xC2 && c <= 0xDF)
+    return (p[1] & 0xC0) == 0x80 ? 2 : 0;
+  if (c >= 0xE0 && c <= 0xEF) {
+    if ((p[1] & 0xC0) != 0x80) return 0;
+    if (c == 0xE0 && p[1] < 0xA0) return 0;   /* overlong encoding */
+    if (c == 0xED && p[1] >= 0xA0) return 0;  /* UTF-16 surrogate half */
+    return (p[2] & 0xC0) == 0x80 ? 3 : 0;
+  }
+  if (c >= 0xF0 && c <= 0xF4) {
+    if ((p[1] & 0xC0) != 0x80) return 0;
+    if (c == 0xF0 && p[1] < 0x90) return 0;   /* overlong encoding */
+    if (c == 0xF4 && p[1] > 0x8F) return 0;   /* above U+10FFFF */
+    if ((p[2] & 0xC0) != 0x80) return 0;
+    return (p[3] & 0xC0) == 0x80 ? 4 : 0;
+  }
+  return 0; /* 0x80-0xC1 and 0xF5-0xFF are never lead bytes */
+}
+
+/* RFC 8259 requires the JSON text to be valid UTF-8, but the strings we escape
+ * come from kernel/proc/socket/environ bytes that need not be: an unprivileged
+ * process can put an arbitrary byte in its own /proc/<pid>/cmdline right next to
+ * a root keyword. The old version copied every byte >= 0x20 through verbatim, so
+ * `-j` produced output that strict parsers and UTF-8 decoders reject. Now a
+ * well-formed sequence is passed through unchanged (so non-ASCII text such as a
+ * Chinese path survives), and each malformed byte becomes U+FFFD. */
 void rd_json_escape(const char *in, char *out, size_t outsz) {
   size_t o = 0;
   if (!outsz) return;
-  for (const unsigned char *p = (const unsigned char *)in; *p && o + 7 < outsz; p++) {
+  const unsigned char *p = (const unsigned char *)in;
+  while (*p && o + 7 < outsz) {
     unsigned char c = *p;
     switch (c) {
-      case '"': out[o++] = '\\'; out[o++] = '"'; break;
-      case '\\': out[o++] = '\\'; out[o++] = '\\'; break;
-      case '\n': out[o++] = '\\'; out[o++] = 'n'; break;
-      case '\r': out[o++] = '\\'; out[o++] = 'r'; break;
-      case '\t': out[o++] = '\\'; out[o++] = 't'; break;
-      default:
-        if (c < 0x20) {
-          o += (size_t)snprintf(out + o, outsz - o, "\\u%04x", c);
-        } else {
-          out[o++] = (char)c;
-        }
+      case '"': out[o++] = '\\'; out[o++] = '"'; p++; continue;
+      case '\\': out[o++] = '\\'; out[o++] = '\\'; p++; continue;
+      case '\n': out[o++] = '\\'; out[o++] = 'n'; p++; continue;
+      case '\r': out[o++] = '\\'; out[o++] = 'r'; p++; continue;
+      case '\t': out[o++] = '\\'; out[o++] = 't'; p++; continue;
+      default: break;
+    }
+    if (c < 0x20) {
+      o += (size_t)snprintf(out + o, outsz - o, "\\u%04x", c);
+      p++;
+      continue;
+    }
+    if (c < 0x80) {
+      out[o++] = (char)c;
+      p++;
+      continue;
+    }
+    size_t len = utf8_seq_len(p);
+    if (len) {
+      for (size_t i = 0; i < len; i++) out[o++] = (char)p[i];
+      p += len;
+    } else {
+      out[o++] = (char)0xEF; /* U+FFFD REPLACEMENT CHARACTER */
+      out[o++] = (char)0xBF;
+      out[o++] = (char)0xBD;
+      p++;
     }
   }
   out[o] = '\0';
+}
+
+/* Escape the bytes a terminal would act on, for the human readable report.
+ *
+ * Detail/evidence blobs are built from other processes' own files
+ * (/proc/<pid>/cmdline, maps, environ) and from kernel text, so a process that
+ * wants to stay hidden can name itself "\033[2K\r..." and have the line that
+ * exposes it repainted when the report is read in a terminal. rd_json_escape()
+ * covered only the -j path; the text renderer printed the bytes verbatim, and
+ * rd.h explicitly promises the caller escapes "when it contains user controlled
+ * bytes" while no caller did.  Control bytes, DEL and malformed UTF-8 (a lone
+ * 0x9B is CSI in a non-UTF-8 locale) become \xNN; well formed UTF-8, including a
+ * Chinese path, passes through unchanged. A literal backslash is deliberately
+ * left alone, so a "\x1b" in the printed line is always the escaped form of a
+ * real ESC byte - nothing ever decodes an escape back into a control byte.
+ *
+ * `in` must point into a NUL terminated buffer (utf8_seq_len() peeks at the
+ * continuation bytes; the line break or terminator that ends the line makes
+ * those reads safe). Writes at most outsz-1 bytes plus the terminator and
+ * returns the number of bytes written; an escape that does not fit is dropped
+ * entirely instead of being cut in half. */
+size_t rd_text_escape(const char *in, size_t inlen, char *out, size_t outsz) {
+  static const char hex[] = "0123456789abcdef";
+  size_t o = 0;
+  const unsigned char *p = (const unsigned char *)in;
+  const unsigned char *end = p + inlen;
+  if (!outsz) return 0;
+  while (p < end && *p) {
+    unsigned char c = *p;
+    size_t len = 0, need;
+    if (c < 0x20 || c == 0x7f) {
+      need = 4;
+    } else if (c >= 0x80) {
+      len = utf8_seq_len(p);
+      need = len ? len : 4;
+    } else {
+      need = 1;
+    }
+    if (o + need >= outsz) break;
+    if (len) {
+      for (size_t i = 0; i < len; i++) out[o++] = (char)p[i];
+      p += len;
+    } else if (need == 4) {
+      out[o++] = '\\';
+      out[o++] = 'x';
+      out[o++] = hex[c >> 4];
+      out[o++] = hex[c & 0xf];
+      p++;
+    } else {
+      out[o++] = (char)c;
+      p++;
+    }
+  }
+  out[o] = '\0';
+  return o;
+}
+
+/* One indented report line, escaped. The frame is reused by every call, so the
+ * buffer costs nothing per line. */
+static void print_indented(const char *line, size_t len, const char *lead) {
+  char esc[RD_MAXEVID * 4 + 8]; /* worst case: every byte becomes \xNN */
+  rd_text_escape(line, len, esc, sizeof esc);
+  printf("           %s%s\n", lead, esc);
 }
 
 static void print_finding_text(const rd_finding *f, int use_color) {
@@ -225,7 +349,7 @@ static void print_finding_text(const rd_finding *f, int use_color) {
     while (*p) {
       const char *nl = strchr(p, '\n');
       size_t len = nl ? (size_t)(nl - p) : strlen(p);
-      printf("           %.*s\n", (int)len, p);
+      print_indented(p, len, "");
       if (!nl) break;
       p = nl + 1;
     }
@@ -235,7 +359,7 @@ static void print_finding_text(const rd_finding *f, int use_color) {
     while (*p) {
       const char *nl = strchr(p, '\n');
       size_t len = nl ? (size_t)(nl - p) : strlen(p);
-      printf("           | %.*s\n", (int)len, p);
+      print_indented(p, len, "| ");
       if (!nl) break;
       p = nl + 1;
     }
@@ -272,7 +396,10 @@ void rd_print_text(const rd_report *r, int use_color, int verbose) {
 }
 
 void rd_print_json(const rd_report *r) {
-  char esc[RD_MAXEVID * 2];
+  /* Worst case is six output bytes per input byte ("\u00xx"), and fields can be
+   * a full RD_MAXEVID; RD_MAXEVID*2 silently dropped ~2/3 of an escape-heavy
+   * field (a 2900-byte LD_PRELOAD of control bytes came out as 1008 chars). */
+  char esc[RD_MAXEVID * 6 + 8];
   printf("{\n  \"tool\": \"rootdetect\",\n  \"version\": \"%s\",\n", RD_VERSION);
   printf("  \"verdict\": \"%s\",\n", r->verdict ? r->verdict : "?");
   printf("  \"summary\": {\"critical\": %d, \"high\": %d, \"medium\": %d, \"low\": %d, \"info\": %d},\n",
@@ -337,7 +464,13 @@ char *rd_slurp(const char *path, size_t *len_out) {
 
 bool rd_read_small(const char *path, char *buf, size_t bufsz) {
   if (!bufsz) return false;
-  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  /* O_NONBLOCK: this is also used to read the SuSFS control nodes under
+   * /data/adb/susfs/ and /proc/susfs_*. rd_probe_open_read() already opens with
+   * O_NONBLOCK, but the re-open here did not, so a FIFO (or an LKM node whose
+   * read blocks) made the whole scan hang forever even though the non-blocking
+   * probe had just classified it as "present". Regular and procfs files ignore
+   * O_NONBLOCK, so this only changes the behaviour for special files. */
+  int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
   if (fd < 0) return false;
   ssize_t r = read(fd, buf, bufsz - 1);
   close(fd);
@@ -386,7 +519,7 @@ int rd_run(const char *const argv[], char *out, size_t outsz) {
   if (pid < 0) { close(pfd[0]); close(pfd[1]); return -1; }
   if (pid == 0) {
     /* child */
-    int devnull = open("/dev/null", O_RDWR);
+    int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
     if (devnull >= 0) { dup2(devnull, STDIN_FILENO); }
     if (out) {
       dup2(pfd[1], STDOUT_FILENO);
@@ -402,8 +535,9 @@ int rd_run(const char *const argv[], char *out, size_t outsz) {
   close(pfd[1]);
   size_t n = 0;
   if (out && outsz) {
+    int full = 0;
     for (;;) {
-      if (n + 1 >= outsz) break;
+      if (n + 1 >= outsz) { full = 1; break; }
       ssize_t r = read(pfd[0], out + n, outsz - 1 - n);
       if (r < 0) {
         if (errno == EINTR) continue;
@@ -413,13 +547,27 @@ int rd_run(const char *const argv[], char *out, size_t outsz) {
       n += (size_t)r;
     }
     out[n] = '\0';
+    /* The child may still be writing when the buffer is full. Closing the pipe
+     * now delivers SIGPIPE to it, so waitpid() reports "killed by signal" and
+     * rd_run() returns -1 - i.e. a merely large output (a big dmesg or
+     * `getprop`) is misread as "the command could not run" and the caller drops
+     * the whole result. Drain the remaining bytes (discarding them) so the child
+     * exits normally and the truncation is reported as a normal exit. */
+    if (full) {
+      char sink[4096];
+      ssize_t r;
+      while ((r = read(pfd[0], sink, sizeof(sink))) > 0 || (r < 0 && errno == EINTR)) {}
+    }
   } else {
     char sink[4096];
-    while (read(pfd[0], sink, sizeof(sink)) > 0) {}
+    ssize_t r;
+    while ((r = read(pfd[0], sink, sizeof(sink))) > 0 || (r < 0 && errno == EINTR)) {}
   }
   close(pfd[0]);
   int status = 0;
-  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+  pid_t waited;
+  while ((waited = waitpid(pid, &status, 0)) < 0 && errno == EINTR) {}
+  if (waited < 0) return -1; /* e.g. ECHILD: the caller set SIGCHLD to SIG_IGN */
   if (WIFEXITED(status)) return WEXITSTATUS(status);
   return -1;
 }
@@ -428,12 +576,26 @@ int rd_run(const char *const argv[], char *out, size_t outsz) {
 
 static void props_push(rd_props *p, const char *k, const char *v) {
   if (p->n == p->cap) {
-    p->cap = p->cap ? p->cap * 2 : 128;
-    p->keys = (char **)realloc(p->keys, p->cap * sizeof(char *));
-    p->vals = (char **)realloc(p->vals, p->cap * sizeof(char *));
+    /* Grow both arrays before touching cap: updating cap before a failed realloc
+     * would make the next write index past the (still small) allocation. */
+    size_t ncap = p->cap ? p->cap * 2 : 128;
+    char **nk = (char **)realloc(p->keys, ncap * sizeof(char *));
+    if (!nk) return;
+    char **nv = (char **)realloc(p->vals, ncap * sizeof(char *));
+    if (!nv) { p->keys = nk; return; }
+    p->keys = nk;
+    p->vals = nv;
+    p->cap = ncap;
   }
-  p->keys[p->n] = xstrdup(k);
-  p->vals[p->n] = xstrdup(v);
+  char *nk = xstrdup(k), *nv = xstrdup(v);
+  if (!nk || !nv) {
+    /* OOM: a NULL key would reach rd_prop()'s strcmp(p->keys[i], key). */
+    free(nk);
+    free(nv);
+    return;
+  }
+  p->keys[p->n] = nk;
+  p->vals[p->n] = nv;
   p->n++;
 }
 
@@ -441,6 +603,7 @@ void rd_props_load(rd_props *p) {
   memset(p, 0, sizeof(*p));
   char *out = (char *)malloc(1 << 20);
   if (!out) return;
+  out[0] = '\0'; /* no getprop binary => out is never written, so NUL it here */
   static const char *const cands[] = {"/system/bin/getprop", "/system/bin/getprop2",
                                       "/vendor/bin/getprop", NULL};
   for (int i = 0; cands[i]; i++) {
@@ -600,7 +763,13 @@ int rd_probe_open_o_path(const char *path) {
 }
 
 int rd_probe_open_read(const char *path) {
-  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  /* O_NONBLOCK matters: the artefact corpus includes paths under
+   * /data/local/tmp/, and that directory is writable by any `adb shell` user.
+   * Opening a FIFO there for reading blocks until a writer appears, which let an
+   * unprivileged user hang the whole scan (including a root run) indefinitely.
+   * With O_NONBLOCK the open returns immediately; the file still counts as
+   * present, so the vote is unchanged. */
+  int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
   if (fd >= 0) { close(fd); return 0; }
   return errno == ENOENT || errno == ENOTDIR ? 1 : -1;
 }
@@ -623,7 +792,16 @@ bool rd_dir_writable_by_others(const char *path, char *dir, size_t dirsz) {
   char tmp[512];
   snprintf(tmp, sizeof(tmp), "%s", path);
   char *slash = strrchr(tmp, '/');
-  if (!slash) return false;
+  if (!slash) {
+    /* A bare filename is relative to the current directory, not to "/".
+     * Returning false here skipped the guard entirely, so pointing
+     * ROOTDETECT_ABI_HELPER at ./helper in a world-writable cwd bypassed the
+     * "parent directory is not group/other writable" check. */
+    if (dir && dirsz) snprintf(dir, dirsz, ".");
+    struct stat cwd;
+    if (stat(".", &cwd) != 0) return false;
+    return (cwd.st_mode & (S_IWGRP | S_IWOTH)) != 0;
+  }
   *slash = '\0';
   struct stat ds;
   if (stat(tmp[0] ? tmp : "/", &ds) != 0) return false;
@@ -689,7 +867,12 @@ bool rd_row_inconsistent(const rd_probe_row *row, char *cons_out, size_t cons_sz
     if (probes[i].v == 0) yes[ny++] = probes[i].n;
     else if (probes[i].v == 1) no[nn++] = probes[i].n;
   }
-  if (!ny || !nn) return false;
+  if (!ny || !nn) {
+    /* "Not inconsistent" is still an answer: NUL the caller's buffer so the
+     * self-test never prints uninitialised bytes, then report false. */
+    if (cons_sz && cons_out) cons_out[0] = '\0';
+    return false;
+  }
   /* Callers may pass a NULL buffer to ask "is this row inconsistent?". Returning
    * here also removes the cons_sz-1 pointer arithmetic below, which was UB for
    * cons_sz == 0 (cons_out + SIZE_MAX). Found by the t2 self-test review. */

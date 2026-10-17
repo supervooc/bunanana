@@ -51,7 +51,11 @@ foreach ($a in $Abi) {
     "-Wl,--gc-sections", "-Wl,-z,noexecstack",
     "-o", $exe
   ) + $opt
-  $cmd = "`"$cc`" $($flags -join ' ') $($sources -join ' ')"
+  # Quote every path: an unquoted path containing a space (common under
+  # "C:\Users\First Last\...") is split into extra argv entries by cmd /c.
+  $quotedFlags = ($flags | ForEach-Object { if ($_ -match ' ') { '"' + $_ + '"' } else { $_ } }) -join ' '
+  $quotedSources = ($sources | ForEach-Object { '"' + $_ + '"' }) -join ' '
+  $cmd = "`"$cc`" $quotedFlags $quotedSources"
   # Native compilers write warnings to stderr; with ErrorActionPreference=Stop
   # PowerShell would abort on the first warning, so relax it for this call and
   # judge success by the exit code instead.

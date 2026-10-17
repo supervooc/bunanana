@@ -82,12 +82,29 @@ static void set_fmt(char *const *a, size_t na, char *out, size_t osz) {
     o += (size_t)snprintf(out + o, osz - o, "%s%s", i ? "," : "", a[i]);
 }
 
+/* Directory of the running executable. On Android the only writable place for
+ * the parser tests is the binary's own dir when the APK ran it from the copy in
+ * the app's private files dir (a shell/app uid cannot write /data/local/tmp). */
+static const char *exe_dir(void) {
+  static char d[512];
+  static int done = 0;
+  if (!done) {
+    done = 1;
+    ssize_t n = readlink("/proc/self/exe", d, sizeof d - 1);
+    if (n <= 0) { d[0] = '\0'; return d; }
+    d[n] = '\0';
+    char *s = strrchr(d, '/');
+    if (s) *s = '\0';
+  }
+  return d;
+}
+
 /* Create a private temp file with `body` in it. Prefers /data/local/tmp on a
- * device, /tmp (then $TMPDIR) on a plain Linux kernel. */
+ * device, /tmp (then $TMPDIR, then the exe dir) on a plain Linux kernel. */
 static bool tmp_write_file(char *path, size_t psz, const char *body) {
-  const char *dirs[3] = {"/data/local/tmp", "/tmp", getenv("TMPDIR")};
+  const char *dirs[4] = {"/data/local/tmp", "/tmp", getenv("TMPDIR"), exe_dir()};
   int fd = -1;
-  for (int i = 0; i < 3 && fd < 0; i++) {
+  for (int i = 0; i < 4 && fd < 0; i++) {
     if (!dirs[i] || !dirs[i][0]) continue;
     snprintf(path, psz, "%s/rootdetect-selftest-XXXXXX", dirs[i]);
     fd = mkstemp(path);
@@ -190,6 +207,17 @@ static void test_logic(void) {
   ok(strcmp(esc, "a\\\"b\\\\c\\nd\\te") == 0, "json escaping of quotes/backslash/control chars", esc);
   rd_json_escape("\x01\x02", esc, sizeof esc);
   ok(strcmp(esc, "\\u0001\\u0002") == 0, "json escaping of raw control bytes", esc);
+  /* -j must stay valid UTF-8 (RFC 8259): a well-formed sequence is kept, and a
+   * malformed byte is replaced with U+FFFD. */
+  rd_json_escape("a\xff b", esc, sizeof esc);
+  ok(strcmp(esc, "a\xef\xbf\xbd b") == 0,
+     "json escaping replaces an invalid UTF-8 byte with U+FFFD", esc);
+  rd_json_escape("\xe4\xbd\xa0\xe5\xa5\xbd", esc, sizeof esc);
+  ok(strcmp(esc, "\xe4\xbd\xa0\xe5\xa5\xbd") == 0,
+     "json escaping keeps a valid multi-byte UTF-8 sequence intact", esc);
+  rd_json_escape("\xe0\x80\x80", esc, sizeof esc); /* overlong NUL */
+  ok(strcmp(esc, "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd") == 0,
+     "json escaping rejects an overlong sequence byte by byte", esc);
 
   char buf[16] = "abc";
   rd_appendf(buf, sizeof buf, "%s", "0123456789abcdefghij");
@@ -238,6 +266,41 @@ static void test_logic(void) {
   rd_json_escape("0123456789012345678901234567890123456789", e, 32);
   ok(strlen(e) > 0 && strlen(e) < 32 && e[32] == '#' && e[63] == '#',
      "json: long string truncated in bounds, sentinel past the buffer intact", e);
+
+  /* --- text escape: the terminal report must not carry live control bytes ---
+   * Evidence is built from another process's own files, so ESC/CR/DEL and the
+   * 8-bit CSI (0x9B, which a non-UTF-8 locale still honours) have to come out as
+   * printable text - otherwise a process can erase the finding that exposes it. */
+  char te[64];
+  memset(te, '#', sizeof te);
+  size_t tn = rd_text_escape("/x/\x1b[2K\rFORGED", 14, te, sizeof te);
+  ok(strcmp(te, "/x/\\x1b[2K\\x0dFORGED") == 0, "text escape: ESC and CR become \\xNN", te);
+  ok(tn == strlen(te), "text escape: returns the number of bytes written", NULL);
+  ok(strchr(te, '\x1b') == NULL && strchr(te, '\r') == NULL,
+     "text escape: no live control byte survives", NULL);
+  memset(te, '#', sizeof te);
+  rd_text_escape("\x7f\x9b\xff", 3, te, sizeof te);
+  ok(strcmp(te, "\\x7f\\x9b\\xff") == 0,
+     "text escape: DEL, the 8-bit CSI and a lone 0xff are escaped", te);
+  memset(te, '#', sizeof te);
+  rd_text_escape("\xe4\xbd\xa0\xe5\xa5\xbd", 6, te, sizeof te);
+  ok(strcmp(te, "\xe4\xbd\xa0\xe5\xa5\xbd") == 0,
+     "text escape: valid UTF-8 (a Chinese path) passes through", te);
+  memset(te, '#', sizeof te);
+  rd_text_escape("/sbin/su", 8, te, sizeof te);
+  ok(strcmp(te, "/sbin/su") == 0, "text escape: an ordinary path is unchanged", te);
+  /* Worst case is 4 bytes per input byte, plus the terminator: pin the edge. */
+  memset(te, '#', sizeof te);
+  rd_text_escape("\x01\x02\x03", 3, te, 13);
+  ok(strcmp(te, "\\x01\\x02\\x03") == 0 && te[12] == '\0' && te[13] == '#',
+     "text escape: an exact (4*n+1) buffer holds every byte", te);
+  memset(te, '#', sizeof te);
+  rd_text_escape("\x01\x02\x03", 3, te, 12);
+  ok(strcmp(te, "\\x01\\x02") == 0 && te[8] == '\0' && te[12] == '#',
+     "text escape: one byte short drops the last escape whole", te);
+  memset(te, '#', sizeof te);
+  rd_text_escape("abc", 3, te, 0);
+  ok(te[0] == '#', "text escape: outsz 0 touches nothing", NULL);
 
   /* --- appendf / format_row overrun guards ------------------------------ */
   char ab[32];
@@ -355,10 +418,10 @@ static void test_live_probes(void) {
 
   /* Pick the first writable staging directory: a device has /data/local/tmp, a
    * plain Linux boot (the QEMU/WSL harness) has /tmp. */
-  const char *tmpdirs[4] = {"/data/local/tmp", "/tmp", getenv("TMPDIR"), NULL};
+  const char *tmpdirs[4] = {"/data/local/tmp", "/tmp", getenv("TMPDIR"), exe_dir()};
   char p[320] = "";
   int fd = -1;
-  for (size_t i = 0; i < 3; i++) {
+  for (size_t i = 0; i < 4; i++) {
     if (!tmpdirs[i] || !tmpdirs[i][0]) continue;
     snprintf(p, sizeof p, "%s/rootdetect-self-XXXXXX", tmpdirs[i]);
     fd = mkstemp(p);
@@ -497,14 +560,22 @@ static void test_kernel_parsers(void) {
     }
     free(raw_mods);
     const rd_finding *fm = find_finding(&rep, "kernel-module");
-    ok(fm != NULL, "/proc/modules scan always records what it saw", NULL);
+    /* rd_check_kernel emits SEV_HIGH with the "N of M ... match" detail when a
+     * module name matches a keyword, and SEV_INFO with "N modules listed"
+     * otherwise. sscanf("%d modules listed") also matched the HIGH form's first
+     * %d (it returns 1 after failing the literal), so the guard must be the
+     * severity plus the exact format - otherwise the "total" was compared with
+     * mod_hits and the check FAILed on any host with a keyword-named module. */
     char dm[160] = "";
     int reported = -1;
-    if (fm && fm->detail && sscanf(fm->detail, "%d modules listed", &reported) == 1) {
+    if (fm && fm->sev == SEV_INFO && fm->detail &&
+        sscanf(fm->detail, "%d modules listed", &reported) == 1) {
       snprintf(dm, sizeof dm, "sscanf=%d independent=%zu", reported, lines);
       ok((size_t)reported == lines, "/proc/modules first field counted once per line", dm);
     } else {
-      skip("/proc/modules count cross-check", "a loaded module name matches a hiding keyword");
+      skip("/proc/modules count cross-check",
+           fm && fm->sev == SEV_HIGH ? "a loaded module name matches a hiding keyword"
+                                     : "/proc/modules not readable as a plain list");
     }
     if (lines == 0)
       skip("/proc/modules first-field split on real data", "this kernel lists no loadable modules");
@@ -563,11 +634,20 @@ static void test_kernel_parsers(void) {
       skip("kallsyms tags vs /proc/modules", "/proc/modules unreadable");
     } else if (missing == 0) {
       ok(fh == NULL, "kallsyms tags all present in /proc/modules -> no hidden-module finding", dk);
+    } else if (nn == 0) {
+      /* /proc/modules is readable but lists nothing. The detector deliberately
+       * reports that as kernel-modules-crosscheck-skipped instead of
+       * kernel-module-hidden, because an emptied module list cannot be told
+       * apart from a filtered one without a second source. Asserting fh != NULL
+       * here contradicted the implementation. */
+      ok(fh == NULL, "empty /proc/modules -> cross-check skipped, no hidden-module finding", dk);
     } else {
       ok(fh != NULL, "kallsyms tags missing from /proc/modules are reported", dk);
     }
-    /* The cross-check only runs when nothing is missing; each tag must be seen. */
-    if (have_mods && fh == NULL) {
+    /* The cross-check only runs when /proc/modules is readable AND non-empty
+     * (nn > 0); with an empty module list rd_check_kernel deliberately reports
+     * kernel-modules-crosscheck-skipped, which is not kernel-module-crosscheck. */
+    if (have_mods && nn > 0 && fh == NULL) {
       const rd_finding *fx = find_finding(&rep, "kernel-module-crosscheck");
       int vis = -1;
       char dv[160] = "";
@@ -744,6 +824,25 @@ static void test_mount_check_e2e(void) {
 /* Every mount view must describe the same mount table. This guard exists
  * because a wrong field index in one of the four formats once turned a clean
  * system into HIDING_DETECTED. */
+
+/* Bounded append that keeps *off inside dsz. The naive
+ * `off += snprintf(dst + off, dsz - off, ...)` is unsafe: snprintf() returns the
+ * length it *would* have written, so as soon as off exceeds dsz the next
+ * `dsz - off` underflows to SIZE_MAX and the write runs far past the buffer. It
+ * tripped glibc's fortify ("buffer overflow detected") and ASan
+ * (stack-buffer-overflow) once the disagreement evidence exceeded dsz. */
+static void appends(char *dst, size_t dsz, size_t *off, const char *fmt, ...) {
+  if (!dsz || *off >= dsz - 1) return;
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(dst + *off, dsz - *off, fmt, ap);
+  va_end(ap);
+  if (n > 0) {
+    *off += (size_t)n;
+    if (*off > dsz - 1) *off = dsz - 1;
+  }
+}
+
 static int mount_views_agree(char *detail, size_t dsz) {
   static char *base[512], *other[512];
   size_t nb = rd_collect_mount_targets("/proc/mounts", 1, base, 512);
@@ -753,10 +852,22 @@ static int mount_views_agree(char *detail, size_t dsz) {
   }
   int all_same = 1;
   size_t off = 0;
-  off += (size_t)snprintf(detail + off, dsz - off, "/proc/mounts=%zu", nb);
+  appends(detail, dsz, &off, "/proc/mounts=%zu", nb);
+  /* /proc/1/mountinfo is only a second view of the SAME table when init shares
+   * this process's mount namespace (per-app namespaces / su --mount-master /
+   * containers make it legitimately different). rd_check_mounts() guards this;
+   * the self-test must too, or it FAILs on a clean device when run from the app. */
+  char self_ns[64] = "", init_ns[64] = "";
+  int init_view_ok = rd_read_link("/proc/self/ns/mnt", self_ns, sizeof self_ns) > 0 &&
+                     rd_read_link("/proc/1/ns/mnt", init_ns, sizeof init_ns) > 0 &&
+                     strcmp(self_ns, init_ns) == 0;
   const char *files[3] = {"/proc/self/mountinfo", "/proc/1/mountinfo", "/proc/self/mountstats"};
   const int fields[3] = {4, 4, 4};
   for (int f = 0; f < 3; f++) {
+    if (f == 1 && !init_view_ok) {
+      appends(detail, dsz, &off, " /proc/1/mountinfo=skipped (different mount namespace)");
+      continue;
+    }
     size_t no = rd_collect_mount_targets(files[f], fields[f], other, 512);
     int same = (no == nb);
     for (size_t i = 0; same && i < nb; i++) {
@@ -772,13 +883,13 @@ static int mount_views_agree(char *detail, size_t dsz) {
         for (size_t k = 0; k < no; k++)
           if (strcmp(base[i], other[k]) == 0) { found = 1; break; }
         if (!found) {
-          off += (size_t)snprintf(detail + off, dsz - off, "; absent from %s: %s", files[f], base[i]);
+          appends(detail, dsz, &off, "; absent from %s: %s", files[f], base[i]);
           shown++;
         }
       }
       all_same = 0;
     }
-    off += (size_t)snprintf(detail + off, dsz - off, " %s=%zu%s", files[f], no, same ? "" : " MISMATCH");
+    appends(detail, dsz, &off, " %s=%zu%s", files[f], no, same ? "" : " MISMATCH");
     for (size_t k = 0; k < no; k++) free(other[k]);
   }
   for (size_t k = 0; k < nb; k++) free(base[k]);

@@ -6,12 +6,88 @@
  */
 #include "rd.h"
 
+#include <ctype.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* ----------------------------------------------------------------- sockets */
+
+/* A /proc/net/unix row is "Num RefCount Protocol Flags Type St Inode [Path]"
+ * with the path optional, so the inode is the seventh whitespace field. */
+static bool unix_row_inode(const char *line, char *out, size_t outsz) {
+  char ino[64] = "";
+  if (sscanf(line, "%*s %*s %*s %*s %*s %*s %63s", ino) != 1 || !ino[0]) return false;
+  for (const char *p = ino; *p; p++)
+    if (!isdigit((unsigned char)*p)) return false; /* header line, or a path with no inode */
+  snprintf(out, outsz, "%s", ino);
+  return true;
+}
+
+/* uid of the process holding socket:[inode], or -1 when it cannot be found.
+ *
+ * /proc/net/unix is a system wide table with no owner column, and an abstract
+ * socket name needs no filesystem permission at all: any process can bind
+ * "@magisk" and make a clean device report ROOT_DETECTED. Walking the fd tables
+ * for the inode is the only way to tell a real framework channel from a forged
+ * name, so do it - but only for a name match (rare) and bounded. */
+static long socket_owner_uid(const char *inode, char *how, size_t howsz) {
+  char want[80];
+  snprintf(want, sizeof(want), "socket:[%s]", inode);
+  DIR *pd = opendir("/proc");
+  if (!pd) {
+    snprintf(how, howsz, "owner unknown, /proc not readable");
+    return -1;
+  }
+  struct dirent *e;
+  long uid = -1;
+  int scanned = 0;
+  while (uid < 0 && scanned < 2000 && (e = readdir(pd)) != NULL) {
+    /* Only digit names are pids. Copied by hand into a short buffer so every
+     * path built from it is provably in bounds (a dirent name is up to 255
+     * bytes and -Wformat-truncation rightly complains about the snprintf()s). */
+    char pid[24];
+    size_t pl = 0;
+    for (const char *p = e->d_name; *p; p++) {
+      if (*p < '0' || *p > '9') {
+        pl = 0;
+        break;
+      }
+      if (pl + 1 < sizeof(pid)) pid[pl++] = *p;
+    }
+    if (!pl) continue;
+    pid[pl] = '\0';
+    scanned++;
+    char fddir[48];
+    snprintf(fddir, sizeof(fddir), "/proc/%s/fd", pid);
+    DIR *fd = opendir(fddir);
+    if (!fd) continue; /* another uid's fd table */
+    struct dirent *f;
+    int nf = 0;
+    while (uid < 0 && nf++ < 512 && (f = readdir(fd)) != NULL) {
+      char link[320], tgt[48];
+      snprintf(link, sizeof(link), "%s/%s", fddir, f->d_name);
+      if (rd_read_link(link, tgt, sizeof(tgt)) <= 0) continue;
+      if (strcmp(tgt, want) != 0) continue;
+      char st[4096];
+      snprintf(link, sizeof(link), "/proc/%s/status", pid);
+      if (rd_read_small(link, st, sizeof(st))) {
+        char *u = strstr(st, "Uid:");
+        if (u) {
+          uid = strtol(u + 4, NULL, 10);
+          if (uid >= 0) snprintf(how, howsz, "owner pid %s uid %ld", pid, uid);
+        }
+      }
+    }
+    closedir(fd);
+  }
+  closedir(pd);
+  if (uid < 0) snprintf(how, howsz, "owner unknown");
+  return uid;
+}
 
 /* Root and instrumentation frameworks keep a control channel as an abstract
  * unix socket: Frida's linjector, Zygisk's daemon, Magisk's socket, LSPosed. */
@@ -24,23 +100,47 @@ static void check_unix_sockets(rd_report *rep) {
   }
   char ev[RD_MAXEVID];
   ev[0] = '\0';
-  int hits = 0;
+  int hits = 0, root_owned = 0, nonroot_owned = 0;
   char *save = NULL;
   for (char *line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
     const char *which = NULL;
     if (!rd_has_keyword(line, &which)) continue;
     if (strcmp(which, "busybox") == 0) continue;
     hits++;
-    if (strlen(ev) < sizeof(ev) - 256) rd_appendf(ev, sizeof(ev), "%s\n", line);
+    char how[96] = "owner unknown";
+    long uid = -1;
+    char ino[64];
+    if (unix_row_inode(line, ino, sizeof(ino))) uid = socket_owner_uid(ino, how, sizeof(how));
+    if (uid == 0)
+      root_owned++;
+    else if (uid > 0)
+      nonroot_owned++;
+    if (strlen(ev) < sizeof(ev) - 256) rd_appendf(ev, sizeof(ev), "%s [%s]\n", line, how);
   }
   free(txt);
-  if (hits)
-    rd_add_ev(rep, SEV_HIGH, "unix-socket-roots",
-              "unix socket name references a root/instrumentation framework", ev,
-              "%d socket names matched; these are control channels, not files, so hiding the "
-              "filesystem does not remove them.", hits);
-  else
+  if (!hits) {
     rd_add(rep, SEV_INFO, "unix-sockets", "no suspicious unix socket names", "");
+    return;
+  }
+  /* A bare name match proves nothing: the table has no owner column and any
+   * process may take an abstract name, so one unprivileged bind() was enough to
+   * turn this finding into ROOT_DETECTED (reproduced). Only a socket that can be
+   * attributed to uid 0 earns HIGH. */
+  rd_sev sev = root_owned ? SEV_HIGH : SEV_MEDIUM;
+  rd_add_ev(rep, sev, "unix-socket-roots",
+            "unix socket name references a root/instrumentation framework", ev,
+            root_owned
+                ? "%d socket name(s) matched and at least one is held by uid 0, so it is a control "
+                  "channel of a root process (a socket name, not a file, so hiding the filesystem "
+                  "does not remove it)."
+                : nonroot_owned
+                      ? "%d socket name(s) matched but none are held by uid 0: every match belongs "
+                        "to a non-root process, and any process can bind an abstract name such as "
+                        "\"@magisk\", so this is not proof of root."
+                      : "%d socket name(s) matched but the owning process could not be determined "
+                        "from this domain (no /proc/<pid>/fd access), so the name alone is not "
+                        "proof of root.",
+            hits);
 }
 
 /* ------------------------------------------------------- tracer / environment */
@@ -77,8 +177,12 @@ static void check_tracer_and_env(rd_report *rep) {
 static void check_map_backing(rd_report *rep) {
   char *txt = rd_slurp("/proc/self/maps", NULL);
   if (!txt) return;
-  char ev[RD_MAXEVID];
-  ev[0] = '\0';
+  /* Two separate accumulators: the hidden-mapping and the deleted-mapping
+   * findings are independent, and sharing one buffer mixed their evidence. */
+  char ev_missing[RD_MAXEVID];
+  ev_missing[0] = '\0';
+  char ev_deleted[RD_MAXEVID];
+  ev_deleted[0] = '\0';
   int missing = 0, deleted = 0;
   char *save = NULL;
   for (char *line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
@@ -99,7 +203,11 @@ static void check_map_backing(rd_report *rep) {
         rd_starts_with(f, "/dev/dma_heap") || rd_contains(f, "kgsl"))
       continue;
 
-    char path[512];
+    /* /proc/self/maps pathnames are bounded by PATH_MAX (4096). Probing a
+     * truncation of a longer path would report a real file as hidden, so skip
+     * anything that does not fit instead. */
+    char path[4096];
+    if (strlen(f) >= sizeof(path)) continue;
     snprintf(path, sizeof(path), "%s", f);
     /* Strip only the kernel's " (deleted)" suffix: truncating at the first space
      * made every mapped file whose path contains a space look hidden (review B3). */
@@ -109,26 +217,44 @@ static void check_map_backing(rd_report *rep) {
     if (rd_contains(f, "(deleted)")) {
       if (exec) {
         deleted++;
-        if (strlen(ev) < sizeof(ev) - 256) rd_appendf(ev, sizeof(ev), "%s\n", line);
+        if (strlen(ev_deleted) < sizeof(ev_deleted) - 256)
+          rd_appendf(ev_deleted, sizeof(ev_deleted), "%s\n", line);
       }
       continue;
     }
     rd_probe_row row;
     rd_probe_all(path, &row);
     if (row.stat_r == 1 && row.open_read_r == 1) {
-      missing++;
-      if (strlen(ev) < sizeof(ev) - 256) rd_appendf(ev, sizeof(ev), "%s\n", line);
+      /* Before blaming a hiding layer, look at the directory: when the whole
+       * mount is gone from this mount namespace (a file mapped before /data was
+       * unmounted, a path under a mount that is no longer there) the parent is
+       * missing as well, which is normal and not a hidden path. A per-path
+       * hiding layer leaves the directory in place, so that stays CRITICAL. */
+      char parent[4096];
+      snprintf(parent, sizeof(parent), "%s", path);
+      char *slash = strrchr(parent, '/');
+      struct stat pst;
+      bool parent_gone = false;
+      if (slash && slash != parent) {
+        *slash = '\0';
+        parent_gone = (stat(parent, &pst) != 0);
+      }
+      if (!parent_gone) {
+        missing++;
+        if (strlen(ev_missing) < sizeof(ev_missing) - 256)
+          rd_appendf(ev_missing, sizeof(ev_missing), "%s\n", line);
+      }
     }
   }
   free(txt);
   if (missing)
     rd_add_ev(rep, SEV_CRITICAL, "map-backing-hidden",
-              "mapped file is not visible to stat/open", ev,
+              "mapped file is not visible to stat/open", ev_missing,
               "%d mapped files exist in this address space but are hidden from the filesystem "
               "interfaces - a per-path hiding layer that does not cover the mmap path.", missing);
   if (deleted)
     rd_add_ev(rep, SEV_MEDIUM, "map-deleted-exec",
-              "executable mapping backed by a deleted file", ev,
+              "executable mapping backed by a deleted file", ev_deleted,
               "%d executable regions come from files that were unlinked after mapping.", deleted);
   if (!missing && !deleted)
     rd_add(rep, SEV_INFO, "map-backing", "all mapped files are visible on disk", "");

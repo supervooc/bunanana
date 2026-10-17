@@ -4,19 +4,55 @@ import sys
 import zipfile
 
 apk = sys.argv[1] if len(sys.argv) > 1 else "out/rootdetect.apk"
-with zipfile.ZipFile(apk) as z:
+try:
+    z = zipfile.ZipFile(apk)
+except (OSError, zipfile.BadZipFile) as e:
+    raise SystemExit("not a readable zip: %s (%s)" % (apk, e))
+
+# e_machine values we care about; the label was previously computed and dropped.
+MACHINES = {0xB7: "ARM64", 0x3E: "x86-64", 0x28: "ARM", 0x03: "x86"}
+
+bad = False
+with z:
     names = z.namelist()
     print("== entries ==")
     for n in names:
         print("   " + n)
-    dex = z.read("classes.dex")
-    print("== classes.dex (%d bytes) ==" % len(dex))
-    for s in [b"MainActivity", b"com/rootdetect/app/MainActivity", b"librootdetect.so",
-              b"Run detection", b"nativeLibraryDir"]:
-        print(("   found   " if s in dex else "   MISSING ") + s.decode())
+    try:
+        dex = z.read("classes.dex")
+    except KeyError:
+        dex = b""
+    if dex:
+        print("== classes.dex (%d bytes) ==" % len(dex))
+        # The button label is Chinese now ("开始检测"); the dex string table stores
+        # BMP characters as UTF-8, so match the encoded bytes.
+        for s in [b"MainActivity", b"com/rootdetect/app/MainActivity", b"librootdetect.so",
+                  "开始检测".encode("utf-8"), b"nativeLibraryDir"]:
+            found = s in dex
+            if not found:
+                bad = True
+            print(("   found   " if found else "   MISSING ") + s.decode())
+    else:
+        print("== classes.dex MISSING ==")
+        bad = True
     print("== native libs ==")
+    n_libs = 0
     for n in names:
         if n.startswith("lib/"):
+            n_libs += 1
             data = z.read(n)
-            kind = "ARM64" if b"\xb7" in data[:20] else "?"
-            print("   %-40s %9d bytes  elf_machine=%d" % (n, len(data), int.from_bytes(data[18:20], "little")))
+            if len(data) >= 20 and data[:4] == b"\x7fELF":
+                machine = int.from_bytes(data[18:20], "little")
+                kind = MACHINES.get(machine, "?")
+            else:
+                machine, kind = -1, "not-ELF"
+            print("   %-40s %9d bytes  %-7s elf_machine=%d" % (n, len(data), kind, machine))
+    if n_libs == 0:
+        print("   (no lib/* entry: the scanner was not embedded)")
+        bad = True
+
+# The prints above are the report; the exit status is what makes this a gate. It
+# used to always exit 0, so a missing dex string or a missing scanner passed.
+if bad:
+    raise SystemExit("apk sanity check FAILED")
+print("apk sanity check: OK")
