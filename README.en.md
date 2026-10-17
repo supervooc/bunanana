@@ -35,7 +35,7 @@ android-rootdetect/
 │   ├── rd.h                    # types, interfaces, corpus table declarations
 │   ├── rd_util.c               # IO / exec / getprop / raw syscall probes / report model
 │   ├── rd_checks.c             # environment, paths, package names, mounts, processes
-│   ├── rd_kernel.c             # modules, kallsyms, SuSFS nodes, cross-validation, deep root checks
+│   ├── rd_kernel.c             # modules, kallsyms, SuSFS nodes, cross-validation, deep root checks, susfs_guard_lkm specifics
 │   ├── rd_extra.c              # cheap extra signals: control sockets, ptrace, caller env, orphan mappings
 │   ├── rd_selftest.c           # --selftest: logic unit tests + false-positive guards
 │   └── main.c                  # CLI
@@ -138,6 +138,24 @@ A hiding module must intercept the "read" interfaces, and what it intercepts is 
 
 > On "why not simply grep for keywords": modules such as SuSFS have already hidden their keywords, paths, module names and symbol names. The checks above examine **the contradictions left behind by the act of hiding itself**, not its name.
 
+### D. Specifics: `susfs_guard_lkm` (SUSFS as an LKM, github.com/inforcqb/susfs4ksu-lkm)
+
+This port turns SUSFS into a loadable kernel module (no kernel recompile on GKI devices). Its own sources and docs admit several things, and the checks below are built on those statements instead of on lucky name matching:
+
+| id | Severity | Principle |
+|---|---|---|
+| `susfs-lkm-module-filtered` | **CRITICAL** | **the module's self-filter caught in the act**: `/sys/module/susfs_guard_lkm` (or its `parameters/`, or the kallsyms `[susfs_guard_lkm]` tag) answers, while `/proc/modules` has no matching line. Its load banner says verbatim that the module is filtered out of `/proc/modules` for every caller including root and that `/sys/module/susfs_guard_lkm` is the way to check whether it is loaded — two contradicting views mean the filter is working |
+| `susfs-lkm-module` | HIGH | the module is listed in `/proc/modules` (self-filter off, or its hide list was cleared), or `/proc/modules` is unreadable while sysfs / parameters / kallsyms answer — a hiding-capable LKM is loaded either way |
+| `susfs-lkm-artefact` | HIGH | the on-disk install/loader layout: `/data/adb/modules{,s_update}/susfs_guard_lkm` (with `module.prop`, `lib/susfs_guard_lkm-<kmi>.ko`, `bin/susfs_insmod`, `early_load`), `/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh`, and the README's manual route `/data/adb/loader/susfs_guard_lkm.ko`. The `.ko` has to stay on disk for re-insertion at boot — it cannot be hidden away |
+| `susfs-lkm-artefact-hidden` | **CRITICAL** | those paths answer to some syscalls and ENOENT to others — the per-path hiding rule intercepts only part of the interfaces |
+| `susfs-lkm-node-fingerprint` | **CRITICAL** | the **contents** of the `/proc/susfs_*` nodes match the counter/table shapes documented for this port (`PROC_INTERFACES.md`): `opath/openat nr=`, `maps: armed=`, `stat nr `, `hide_modules:`, `priv_app_sid=`… A merely existing node could be faked; reproducing these readouts means the module's own read handlers ran |
+| `susfs-lkm-usedby` | HIGH | `hide_modules` removes only the module's own line; another module's used-by column still spells its name out |
+| `kernel-module-list-ghost` | MEDIUM | taint bit 12 (OE) is set (an out-of-tree module was loaded) while `/proc/modules` lists nothing at all. Taint is sticky (an rmmod leaves it set), so this is corroboration: either the module was unloaded, or the list was emptied |
+
+Module names are matched by **prefix** (`susfs_guard_lkm`, `susfs_guard_lkm_android13_5_15`…): this module takes its name from the `.ko` file name, and releases ship `susfs_guard_lkm-<kmi>.ko`.
+
+> The non-root blind spot (stated honestly): with hide rules armed, the sysfs directory is invisible to non-root callers and `/proc/susfs_*` answers ENOENT to them — half of the evidence above needs uid 0, consistent with §8's "deep checks need root".
+
 ---
 
 ## 5. `--selftest`
@@ -146,10 +164,11 @@ Runs on the device and verifies two things:
 
 1. **Decision logic**: the verdict the voting table reaches under various combinations, verdict mapping, JSON escaping, buffer bounds, and the flags a verdict implies.
 2. **False-positive guards**: on a "clean device" the two most false-positive-prone items must stay silent — `uname()` must equal `/proc/sys/kernel/osrelease`, and `/proc/mounts` and `/proc/self/mountinfo` must list the same mount targets.
+3. **Specific-check consistency**: the `susfs_guard_lkm` check's conclusion is recomputed here by an independent scan of `/proc/modules`, `/sys/module` and kallsyms and compared — a clean system must stay silent, a present module must yield the matching finding; the node-content fingerprints have pure-logic cases of their own.
 
 ```
 $ adb shell /data/local/rx/rx --selftest
-rootdetect 1.0.0 self-test   uid=2000
+rootdetect 1.0.3 self-test   uid=2000
 -- decision logic --
   PASS  keyword: magisk package name
   ...
@@ -282,6 +301,7 @@ powershell -ExecutionPolicy Bypass -File scripts/inject-root-fixtures.ps1 -Clean
 | a new kind of cross-validation | add a function in `rd_kernel.c` and call it from `rd_check_consistency()` |
 | a new report item id and its contribution to the verdict | the `rd_add*()` call site + the `id_flags()` table in `rd_util.c` (the verdict only consults that table, which keeps it reproducible) |
 | a new deep kernel check | `rd_check_deep()` in `rd_kernel.c` (runs only under uid 0) |
+| `susfs_guard_lkm` (LKM port) specific checks | `rd_check_susfs_lkm()` in `rd_kernel.c`; installer-path corpus `RD_SUSFS_LKM_PATHS` in `rd_checks.c`; node-content fingerprints in `rd_susfs_lkm_node_fingerprint()` |
 
 ---
 

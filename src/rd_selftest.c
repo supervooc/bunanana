@@ -14,6 +14,7 @@
  */
 #include "rd.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -285,6 +286,53 @@ static void test_logic(void) {
   ok(strcmp(rep.verdict, "HIDING_DETECTED") == 0, "verdict: critical -> HIDING_DETECTED", rep.verdict);
   ok((rep.flags & RD_F_HIDE) != 0, "flags: spoof sets RD_F_HIDE", NULL);
   rd_report_free(&rep);
+
+  /* susfs_guard_lkm ids feed the right capabilities: a loaded LKM is a HOOK
+   * artefact, its observed self-filter is HIDING, installer files are ROOT. */
+  rd_report rep2;
+  rd_report_init(&rep2);
+  rd_add(&rep2, SEV_HIGH, "susfs-lkm-module", "lkm", "x");
+  rd_finalize(&rep2);
+  ok((rep2.flags & RD_F_HOOK) != 0 && (rep2.flags & RD_F_HIDE) == 0,
+     "flags: loaded susfs_guard_lkm -> RD_F_HOOK", NULL);
+  rd_add(&rep2, SEV_CRITICAL, "susfs-lkm-module-filtered", "lkm self-filter", "x");
+  rd_finalize(&rep2);
+  ok((rep2.flags & RD_F_HIDE) != 0 && strcmp(rep2.verdict, "HIDING_DETECTED") == 0,
+     "flags: observed /proc/modules self-filter -> HIDING_DETECTED", rep2.verdict);
+  rd_report_free(&rep2);
+  rd_report_init(&rep2);
+  rd_add(&rep2, SEV_HIGH, "susfs-lkm-artefact", "lkm files", "x");
+  rd_finalize(&rep2);
+  ok((rep2.flags & RD_F_ROOT) != 0, "flags: lkm installer files -> RD_F_ROOT", NULL);
+  rd_report_free(&rep2);
+
+  /* node-body fingerprints: match the documented counter shapes, reject
+   * everything else (wrong node, missing counters, plain 0/1 bodies). */
+  ok(rd_susfs_lkm_node_fingerprint(
+         "/proc/susfs_opath",
+         "[1] opath/openat nr=56 nr_compat=0 installed=1 wrapper=ffffffc0 orig=ffffffc0\n"
+         "seen=4940 opath=1078 hidden=5 deny=5 err=0 (opath_test=0 opath_dump=0)") != NULL,
+     "lkm fingerprint: /proc/susfs_opath counter block", NULL);
+  ok(rd_susfs_lkm_node_fingerprint(
+         "/proc/susfs_kstat",
+         "/data/local/tmp/x ino=981881 dev=65099 flags=0xff3\nmaps: armed=1 hits=0 rewrites=0\n"
+         "stat nr newfstatat (79): ok=3 rw=2") != NULL,
+     "lkm fingerprint: /proc/susfs_kstat dispatcher counters", NULL);
+  ok(rd_susfs_lkm_node_fingerprint("/proc/susfs_hide_modules",
+                                   "hide_modules: 1/16 name(s)\nnames: susfs_guard_lkm") != NULL,
+     "lkm fingerprint: /proc/susfs_hide_modules name list", NULL);
+  ok(rd_susfs_lkm_node_fingerprint("/proc/susfs_path", "hide_from_apps=1  enoent: getattr=5") != NULL,
+     "lkm fingerprint: /proc/susfs_path rule table", NULL);
+  ok(rd_susfs_lkm_node_fingerprint("/proc/susfs_opath", "0\n1\n") == NULL,
+     "lkm fingerprint: plain numbers are not a counter block", NULL);
+  ok(rd_susfs_lkm_node_fingerprint("/proc/susfs_uname", "opath/openat nr=56") == NULL,
+     "lkm fingerprint: a match on an unexpected path is rejected", NULL);
+  ok(rd_susfs_lkm_node_fingerprint("/proc/susfs_enable_log", "1") == NULL,
+     "lkm fingerprint: enable_log stays unidentifiable (plain 0/1)", NULL);
+  ok(rd_susfs_lkm_node_fingerprint("/proc/susfs_kstat", "maps: armed=1 hits=0") == NULL,
+     "lkm fingerprint: kstat needs both the maps line and a stat counter", NULL);
+  ok(rd_susfs_lkm_node_fingerprint("/proc/susfs_kstat", "stat nr fstat (80): ok=1") == NULL,
+     "lkm fingerprint: kstat without the maps line is rejected", NULL);
 }
 
 /* --------------------------------------------------------------- live probes */
@@ -574,6 +622,85 @@ static void test_kernel_parsers(void) {
   rd_report_free(&rep);
 }
 
+/* ---------------------------------------- susfs_guard_lkm check e2e */
+
+/* rd_check_susfs_lkm() reads four independent kernel views (/proc/modules,
+ * /sys/module, the module parameters and /proc/kallsyms). The expectation is
+ * recomputed here from the raw sources with an independent scan and compared:
+ *  - module listed in /proc/modules -> the HIGH finding and *not* the
+ *    "self-filtered" claim;
+ *  - a kernel view answering while the list omits it -> the CRITICAL
+ *    self-filter claim (the module's own documented behaviour);
+ *  - nothing anywhere -> the check must stay silent.
+ * On a device that really runs the LKM the same recomputation has to hold, so
+ * this doubles as the field cross-check. */
+static void test_susfs_lkm_e2e(void) {
+  printf("-- susfs_guard_lkm LKM check (end-to-end) --\n");
+  rd_ctx c;
+  memset(&c, 0, sizeof c);
+  c.is_root = (getuid() == 0);
+  rd_report rep;
+  rd_report_init(&rep);
+  rd_check_susfs_lkm(&c, &rep);
+
+  /* independent recomputation straight from the sources */
+  const size_t mlen = strlen(RD_SUSFS_LKM_MODULE);
+  bool mods_readable = false, in_mods = false, sysfs = false, tag = false, params = false;
+  size_t mods_lines = 0;
+  char *raw = rd_slurp("/proc/modules", NULL);
+  if (raw) {
+    mods_readable = true;
+    char *save = NULL;
+    for (char *l = strtok_r(raw, "\n", &save); l; l = strtok_r(NULL, "\n", &save)) {
+      while (*l == ' ' || *l == '\t') l++;
+      if (!*l) continue;
+      mods_lines++;
+      if (strncmp(l, RD_SUSFS_LKM_MODULE, mlen) == 0) {
+        char cc = l[mlen];
+        if (cc == '\0' || cc == ' ' || cc == '\t' || cc == '_' || cc == '-' || cc == '.')
+          in_mods = true;
+      }
+    }
+    free(raw);
+  }
+  DIR *sd = opendir("/sys/module");
+  if (sd) {
+    struct dirent *e;
+    while ((e = readdir(sd))) {
+      if (strncmp(e->d_name, RD_SUSFS_LKM_MODULE, mlen) == 0) {
+        sysfs = true;
+        break;
+      }
+    }
+    closedir(sd);
+  }
+  char *ks = rd_slurp("/proc/kallsyms", NULL);
+  if (ks) {
+    tag = strstr(ks, "[" RD_SUSFS_LKM_MODULE) != NULL;
+    free(ks);
+  }
+  params = rd_path_exists("/sys/module/" RD_SUSFS_LKM_MODULE "/parameters/expose_proc") ||
+           rd_path_exists("/sys/module/" RD_SUSFS_LKM_MODULE "/parameters/fail_layer");
+
+  char d[256];
+  snprintf(d, sizeof d, "list %s (%zu line(s)) in_list=%d sysfs=%d kallsyms=%d params=%d",
+           mods_readable ? "readable" : "unreadable", mods_lines, in_mods, sysfs, tag, params);
+  const rd_finding *ff = find_finding(&rep, "susfs-lkm-module-filtered");
+  const rd_finding *fm = find_finding(&rep, "susfs-lkm-module");
+  if (in_mods) {
+    ok(fm != NULL && fm->sev == SEV_HIGH && ff == NULL,
+       "listed module -> HIGH finding, no self-filter claim", d);
+  } else if ((sysfs || tag || params) && mods_readable) {
+    ok(ff != NULL && ff->sev == SEV_CRITICAL && fm == NULL,
+       "kernel view without the list line -> self-filter CRITICAL", d);
+  } else if ((sysfs || tag || params) && !mods_readable) {
+    ok(fm != NULL && ff == NULL, "unreadable list + kernel view -> loaded HIGH, no filter claim", d);
+  } else {
+    ok(fm == NULL && ff == NULL, "no kernel view shows the LKM -> the check stays silent", d);
+  }
+  rd_report_free(&rep);
+}
+
 /* --------------------------------------------- mount cross-view check e2e */
 
 /* test_mount_parsers() pins rd_collect_mount_targets() with the field index in
@@ -700,6 +827,7 @@ int rd_selftest(void) {
   test_mount_parsers();
   test_mount_check_e2e();
   test_kernel_parsers();
+  test_susfs_lkm_e2e();
   test_live_probes();
   test_false_positive_guards();
   printf("\n%d checks, %d failure(s), %d skipped\n", g_checks, g_fails, g_skips);
