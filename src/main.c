@@ -1,6 +1,7 @@
 /* rootdetect - CLI entry point.
  *
- * Exit status: 0 clean, 1 suspicious, 2 root found, 3 hiding mechanism observed.
+ * Exit status: 0 clean, 1 suspicious, 2 root found, 3 hiding mechanism observed,
+ * 64 usage error (unknown option).
  */
 #include "rd.h"
 
@@ -24,7 +25,7 @@ static void usage(const char *argv0) {
       "      --selftest    verify the decision logic and the false-positive guards\n"
       "  -h, --help        this text\n"
       "\n"
-      "Exit status: 0 clean | 1 suspicious | 2 root detected | 3 hiding detected\n"
+      "Exit status: 0 clean | 1 suspicious | 2 root detected | 3 hiding detected | 64 usage error\n"
       "\n"
       "Run it as the `shell` user for the app-equivalent view, and again through\n"
       "`adb root`/`su` for the deep kernel checks (syscall table via /proc/kcore,\n"

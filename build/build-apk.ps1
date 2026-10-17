@@ -130,10 +130,19 @@ Step "badging" {
 }
 
 Write-Host "`n==> apk contents and embedded binary check"
+# Quote any argument that contains a space: a workspace path like
+# "C:\Users\First Last\..." would otherwise be split by `cmd /c`.
 $listArgs = @("python3", (ToWsl "$apkSrc\list_apk.py"), (ToWsl "$apk")) + $entries
+$listCmd = ($listArgs | ForEach-Object { if ($_ -match ' ') { '"' + $_ + '"' } else { $_ } }) -join ' '
 $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-& cmd /c "wsl -e $($listArgs -join ' ')" 2>&1 | ForEach-Object { Write-Host "    $_" }
+& cmd /c "wsl -e $listCmd" 2>&1 | ForEach-Object { Write-Host "    $_" }
+$listRc = $LASTEXITCODE
 & "$bt\zipalign.exe" -c -v 4 "$apk" 2>&1 |
   Select-String -Pattern 'Verification|OK' | ForEach-Object { Write-Host "    $_" }
+$alignRc = $LASTEXITCODE
 $ErrorActionPreference = $prev
+# These two are the build's only integrity gate; without checking their exit
+# codes a truncated or mismatched scanner shipped with "done: ...".
+if ($listRc -ne 0) { throw "embedded binary verification failed (list_apk.py exit $listRc)" }
+if ($alignRc -ne 0) { throw "zipalign verification failed (exit $alignRc)" }
 Write-Host "`ndone: $apk"
