@@ -133,6 +133,8 @@ int rd_probe_opendir(const char *path); /* getdents64 */
 int rd_probe_readlink(const char *path);
 /* True when `path` is a symlink pointing at a non-existent target. */
 bool rd_is_dangling_symlink(const char *path);
+/* True when the directory holding `path` is group/other writable; fills `dir`. */
+bool rd_dir_writable_by_others(const char *path, char *dir, size_t dirsz);
 
 /* Probe table used by the consistency engine. */
 typedef struct {
