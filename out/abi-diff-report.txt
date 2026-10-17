@@ -1,6 +1,6 @@
 
 ================ environment ================
-date        : 2026-10-17T06:08:27Z
+date        : 2026-10-17T06:15:04Z
 adb         : /opt/rx-android/platform-tools/adb
 adb version : Android Debug Bridge version 1.0.41
 host 64-bit : /mnt/c/Users/86134/Documents/deepseek-harness/default-workspace/android-rootdetect/out/rootdetect-x86_64 (8279392 bytes)
@@ -22,8 +22,8 @@ rootdetect-x86                               class=ELF32 machine=EM_386(3) PT_IN
 rootdetect-x86_64                            class=ELF64 machine=EM_X86_64(62) PT_INTERP=none (static)
 
 ================ push both binaries ================
-/mnt/c/Users/86134/Documents/deepseek-harness/default-workspace/android-rootdetect/out/rootdetect-x86_64: 1 file pushed, 0 skipped. 159.2 MB/s (8279392 bytes in 0.050s)
-/mnt/c/Users/86134/Documents/deepseek-harness/default-workspace/android-rootdetect/out/rootdetect-x86: 1 file pushed, 0 skipped. 147.3 MB/s (6723084 bytes in 0.044s)
+/mnt/c/Users/86134/Documents/deepseek-harness/default-workspace/android-rootdetect/out/rootdetect-x86_64: 1 file pushed, 0 skipped. 133.2 MB/s (8279392 bytes in 0.059s)
+/mnt/c/Users/86134/Documents/deepseek-harness/default-workspace/android-rootdetect/out/rootdetect-x86: 1 file pushed, 0 skipped. 128.1 MB/s (6723084 bytes in 0.050s)
 on device:
 -rwxr-xr-x 1 root root 6723084 2026-10-17 14:07 /data/local/rx/rootdetect-x86
 -rwxr-xr-x 1 root root 8279392 2026-10-17 14:07 /data/local/rx/rootdetect-x86_64
@@ -120,7 +120,7 @@ on device:
 exit status: 0
 
 ================ 2. full output of /data/local/rx/rootdetect-x86_64 -v (64-bit main, 32-bit helper side by side) ================
-rootdetect 1.0.0  -  uid=0(root) abi=x86_64 pid=4978
+rootdetect 1.0.0  -  uid=0(root) abi=x86_64 pid=5097
 --------------------------------------------------------------------------
 [HIGH    ] env-build              debuggable build: `adb root` is available
            ro.debuggable=1
@@ -144,7 +144,7 @@ rootdetect 1.0.0  -  uid=0(root) abi=x86_64 pid=4978
 [INFO    ] env-build              build state ok
            ro.secure=1
 [INFO    ] env-context            execution context
-           uid=0 pid=4978 abi=x86_64 root_mode=yes
+           uid=0 pid=5097 abi=x86_64 root_mode=yes
 [INFO    ] env-selinux            SELinux enforcing
            enforce=1
 [INFO    ] env-uid0               running as uid 0
@@ -194,7 +194,7 @@ rootdetect 1.0.0  -  uid=0(root) abi=x86_64 pid=4978
 [INFO    ] env-build              build state ok
            ro.secure=1
 [INFO    ] env-context            execution context
-           uid=0 pid=4978 abi=x86_64 root_mode=yes
+           uid=0 pid=5097 abi=x86_64 root_mode=yes
 [INFO    ] env-selinux            SELinux enforcing
            enforce=1
 [INFO    ] env-uid0               running as uid 0
@@ -242,7 +242,7 @@ verdict: ROOT_DETECTED
 exit status: 2
 
 ================ 2b. negative control: a lone 64-bit helper next to the 64-bit main ================
-/mnt/c/Users/86134/Documents/deepseek-harness/default-workspace/android-rootdetect/out/rootdetect-x86_64: 1 file pushed, 0 skipped. 148.0 MB/s (8279392 bytes in 0.053s)
+/mnt/c/Users/86134/Documents/deepseek-harness/default-workspace/android-rootdetect/out/rootdetect-x86_64: 1 file pushed, 0 skipped. 137.7 MB/s (8279392 bytes in 0.057s)
 [INFO    ] abi-consistency        both ABIs agree on every probed path
            compared 92 paths between x86_64 and /data/local/rx/rootdetect-x86 (x86).
 --
@@ -251,8 +251,8 @@ exit status: 2
 exit status: 2
 
 ================ 2c. same-revision control: both ABIs built from ONE source snapshot ================
-/mnt/c/Users/86134/Documents/deepseek-harness/default-workspace/android-rootdetect/vendor/tmp/abi-same/out/rootdetect-x86_64: 1 file pushed, 0 skipped. 137.5 MB/s (8273000 bytes in 0.057s)
-/mnt/c/Users/86134/Documents/deepseek-harness/default-workspace/android-rootdetect/vendor/tmp/abi-same/out/rootdetect-x86: 1 file pushed, 0 skipped. 101.7 MB/s (6718340 bytes in 0.063s)
+/mnt/c/Users/86134/Documents/deepseek-harness/default-workspace/android-rootdetect/vendor/tmp/abi-same/out/rootdetect-x86_64: 1 file pushed, 0 skipped. 136.5 MB/s (8273000 bytes in 0.058s)
+/mnt/c/Users/86134/Documents/deepseek-harness/default-workspace/android-rootdetect/vendor/tmp/abi-same/out/rootdetect-x86: 1 file pushed, 0 skipped. 130.2 MB/s (6718340 bytes in 0.049s)
 [INFO    ] abi-consistency        both ABIs agree on every probed path
            compared 92 paths between x86_64 and /data/local/rx/abi-same/rootdetect-x86 (x86).
 --
