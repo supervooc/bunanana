@@ -599,6 +599,22 @@ int rd_probe_opendir(const char *path) {
   return errno == ENOENT ? 1 : -1;
 }
 
+/* True when the directory holding `path` is writable by group or others, i.e.
+ * someone else could replace that file. Fills `dir` with the directory. Used by
+ * both the self-executable check and the ABI helper trust check. */
+bool rd_dir_writable_by_others(const char *path, char *dir, size_t dirsz) {
+  if (dir && dirsz) dir[0] = '\0';
+  char tmp[512];
+  snprintf(tmp, sizeof(tmp), "%s", path);
+  char *slash = strrchr(tmp, '/');
+  if (!slash) return false;
+  *slash = '\0';
+  struct stat ds;
+  if (stat(tmp[0] ? tmp : "/", &ds) != 0) return false;
+  if (dir && dirsz) snprintf(dir, dirsz, "%s", tmp[0] ? tmp : "/");
+  return (ds.st_mode & (S_IWGRP | S_IWOTH)) != 0;
+}
+
 int rd_probe_readlink(const char *path) {
   char buf[8];
   ssize_t r = readlink(path, buf, sizeof(buf));

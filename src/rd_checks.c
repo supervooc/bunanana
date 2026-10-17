@@ -105,7 +105,25 @@ static bool read_first_line(const char *path, char *buf, size_t bufsz) {
 
 /* ------------------------------------------------------------------ context */
 
+/* Running as root from a directory that others can write to means the binary
+ * itself (or anything it loads) could have been replaced before this run, so a
+ * correct report proves nothing. Same trust principle as abi_helper_trusted(). */
+static void check_self_executable(rd_ctx *c, rd_report *rep) {
+  if (!c->is_root) return;
+  char self[512] = "", dir[512] = "";
+  if (rd_read_link("/proc/self/exe", self, sizeof(self)) < 0) return;
+  if (!rd_dir_writable_by_others(self, dir, sizeof(dir))) return;
+  rd_add(rep, SEV_MEDIUM, "self-executable-in-writable-dir",
+         "running as root from a directory that others can write to",
+         "%s lives in %s, which is group/other writable, so another user could replace this "
+         "binary before it runs and any verdict it prints would be meaningless. Run it from a "
+         "root-only directory instead: adb root; mkdir -m 700 /data/local/rx; cp %s "
+         "/data/local/rx/rx; chmod 755 /data/local/rx/rx; /data/local/rx/rx -v",
+         self, dir[0] ? dir : "?", self);
+}
+
 void rd_check_environment(rd_ctx *c, rd_report *rep) {
+  check_self_executable(c, rep);
   char buf[512];
 
   rd_add(rep, SEV_INFO, "env-context", "execution context",
