@@ -22,7 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define RD_VERSION "1.0.0"
+#define RD_VERSION "1.0.1"
 #define RD_MAXEVID 3000
 
 /* ------------------------------------------------------------------ severity */
