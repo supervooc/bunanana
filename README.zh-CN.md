@@ -12,7 +12,6 @@
 | **直接装上用** | 下载 [`out/bunanana.apk`](out/bunanana.apk) 安装到手机（需允许未知来源），打开后点 **RUN DETECTION** |
 | **在电脑上用 adb 跑** | 见 §7：`adb push out/rootdetect-arm64 /data/local/rx/rx` → `adb shell chmod 755 /data/local/rx/rx` → `adb shell /data/local/rx/rx -v` |
 | **只要命令行扫描器** | 自行构建：`powershell -ExecutionPolicy Bypass -File build/build.ps1 -Abi arm64` |
-| **想先看它凭什么能抓到隐藏** | §4 检测矩阵 + §11 实测记录（真 Linux 内核 + API 30 模拟器 + KVM） |
 
 一句话：常规检测项（`su` 文件、Magisk 目录、`ro.debuggable`）现在只能抓到裸奔的 root。真正有价值的是**交叉验证**——隐藏模块必须 hook 内核的读取接口，而它不可能把每个接口都覆盖得一样完美，**没覆盖到的那个接口就是证据**。本工具的核心因此是一个「交叉验证引擎」，而不是一份特征清单。
 

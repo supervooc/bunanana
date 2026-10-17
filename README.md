@@ -12,7 +12,6 @@
 | **Just install and use it** | Download [`out/bunanana.apk`](out/bunanana.apk) and install it on the phone (unknown sources must be allowed), then open it and tap **RUN DETECTION** |
 | **Run it over adb from a PC** | See §7: `adb push out/rootdetect-arm64 /data/local/rx/rx` → `adb shell chmod 755 /data/local/rx/rx` → `adb shell /data/local/rx/rx -v` |
 | **Only the command-line scanner** | Build it yourself: `powershell -ExecutionPolicy Bypass -File build/build.ps1 -Abi arm64` |
-| **See why it can catch hiding** | §4 detection matrix + §11 field results (real Linux kernel + API 30 emulator + KVM) |
 
 In one sentence: conventional checks (`su` files, Magisk directories, `ro.debuggable`) now only catch bare root. The valuable part is **cross-validation** — a hiding module has to hook the kernel's read interfaces, and it cannot cover every interface equally well, so **the interface it missed is the evidence**. The core of this tool is therefore a "cross-validation engine", not a signature list.
 
