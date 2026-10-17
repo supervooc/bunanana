@@ -189,6 +189,17 @@ static void test_logic(void) {
   ok(strcmp(esc, "a\\\"b\\\\c\\nd\\te") == 0, "json escaping of quotes/backslash/control chars", esc);
   rd_json_escape("\x01\x02", esc, sizeof esc);
   ok(strcmp(esc, "\\u0001\\u0002") == 0, "json escaping of raw control bytes", esc);
+  /* -j must stay valid UTF-8 (RFC 8259): a well-formed sequence is kept, and a
+   * malformed byte is replaced with U+FFFD. */
+  rd_json_escape("a\xff b", esc, sizeof esc);
+  ok(strcmp(esc, "a\xef\xbf\xbd b") == 0,
+     "json escaping replaces an invalid UTF-8 byte with U+FFFD", esc);
+  rd_json_escape("\xe4\xbd\xa0\xe5\xa5\xbd", esc, sizeof esc);
+  ok(strcmp(esc, "\xe4\xbd\xa0\xe5\xa5\xbd") == 0,
+     "json escaping keeps a valid multi-byte UTF-8 sequence intact", esc);
+  rd_json_escape("\xe0\x80\x80", esc, sizeof esc); /* overlong NUL */
+  ok(strcmp(esc, "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd") == 0,
+     "json escaping rejects an overlong sequence byte by byte", esc);
 
   char buf[16] = "abc";
   rd_appendf(buf, sizeof buf, "%s", "0123456789abcdefghij");

@@ -177,23 +177,71 @@ void rd_finalize(rd_report *r) {
   r->verdict = xstrdup(verdict);
 }
 
+/* Length of the well-formed UTF-8 sequence starting at p, or 0 when p is not a
+ * valid lead byte (or the sequence is truncated, overlong, or a surrogate).
+ * p is NUL-terminated, so a 0x00 encountered as a continuation byte is rejected
+ * by the (byte & 0xC0) == 0x80 test before any read past the string. */
+static size_t utf8_seq_len(const unsigned char *p) {
+  unsigned char c = p[0];
+  if (c < 0x80) return 1;
+  if (c >= 0xC2 && c <= 0xDF)
+    return (p[1] & 0xC0) == 0x80 ? 2 : 0;
+  if (c >= 0xE0 && c <= 0xEF) {
+    if ((p[1] & 0xC0) != 0x80) return 0;
+    if (c == 0xE0 && p[1] < 0xA0) return 0;   /* overlong encoding */
+    if (c == 0xED && p[1] >= 0xA0) return 0;  /* UTF-16 surrogate half */
+    return (p[2] & 0xC0) == 0x80 ? 3 : 0;
+  }
+  if (c >= 0xF0 && c <= 0xF4) {
+    if ((p[1] & 0xC0) != 0x80) return 0;
+    if (c == 0xF0 && p[1] < 0x90) return 0;   /* overlong encoding */
+    if (c == 0xF4 && p[1] > 0x8F) return 0;   /* above U+10FFFF */
+    if ((p[2] & 0xC0) != 0x80) return 0;
+    return (p[3] & 0xC0) == 0x80 ? 4 : 0;
+  }
+  return 0; /* 0x80-0xC1 and 0xF5-0xFF are never lead bytes */
+}
+
+/* RFC 8259 requires the JSON text to be valid UTF-8, but the strings we escape
+ * come from kernel/proc/socket/environ bytes that need not be: an unprivileged
+ * process can put an arbitrary byte in its own /proc/<pid>/cmdline right next to
+ * a root keyword. The old version copied every byte >= 0x20 through verbatim, so
+ * `-j` produced output that strict parsers and UTF-8 decoders reject. Now a
+ * well-formed sequence is passed through unchanged (so non-ASCII text such as a
+ * Chinese path survives), and each malformed byte becomes U+FFFD. */
 void rd_json_escape(const char *in, char *out, size_t outsz) {
   size_t o = 0;
   if (!outsz) return;
-  for (const unsigned char *p = (const unsigned char *)in; *p && o + 7 < outsz; p++) {
+  const unsigned char *p = (const unsigned char *)in;
+  while (*p && o + 7 < outsz) {
     unsigned char c = *p;
     switch (c) {
-      case '"': out[o++] = '\\'; out[o++] = '"'; break;
-      case '\\': out[o++] = '\\'; out[o++] = '\\'; break;
-      case '\n': out[o++] = '\\'; out[o++] = 'n'; break;
-      case '\r': out[o++] = '\\'; out[o++] = 'r'; break;
-      case '\t': out[o++] = '\\'; out[o++] = 't'; break;
-      default:
-        if (c < 0x20) {
-          o += (size_t)snprintf(out + o, outsz - o, "\\u%04x", c);
-        } else {
-          out[o++] = (char)c;
-        }
+      case '"': out[o++] = '\\'; out[o++] = '"'; p++; continue;
+      case '\\': out[o++] = '\\'; out[o++] = '\\'; p++; continue;
+      case '\n': out[o++] = '\\'; out[o++] = 'n'; p++; continue;
+      case '\r': out[o++] = '\\'; out[o++] = 'r'; p++; continue;
+      case '\t': out[o++] = '\\'; out[o++] = 't'; p++; continue;
+      default: break;
+    }
+    if (c < 0x20) {
+      o += (size_t)snprintf(out + o, outsz - o, "\\u%04x", c);
+      p++;
+      continue;
+    }
+    if (c < 0x80) {
+      out[o++] = (char)c;
+      p++;
+      continue;
+    }
+    size_t len = utf8_seq_len(p);
+    if (len) {
+      for (size_t i = 0; i < len; i++) out[o++] = (char)p[i];
+      p += len;
+    } else {
+      out[o++] = (char)0xEF; /* U+FFFD REPLACEMENT CHARACTER */
+      out[o++] = (char)0xBF;
+      out[o++] = (char)0xBD;
+      p++;
     }
   }
   out[o] = '\0';
