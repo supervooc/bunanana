@@ -17,7 +17,13 @@
 
 一句话：常规检测项（`su` 文件、Magisk 目录、`ro.debuggable`）现在只能抓到裸奔的 root。真正有价值的是**交叉验证**——隐藏模块必须 hook 内核的读取接口，而它不可能把每个接口都覆盖得一样完美，**没覆盖到的那个接口就是证据**。本工具的核心因此是一个「交叉验证引擎」，而不是一份特征清单。
 
-> 仓库里**不含** `vendor/`（那是 20GB 的 SDK/NDK/JDK 工具链，由 `vendor/*.mjs` 按需拉取）与 `out/rootdetect-*`（可复现的构建产物）；`bunanana.apk` 内已内置 **arm64-v8a / armeabi-v7a / x86_64** 三个 ABI 的扫描器。
+> **仓库里有哪些、没有哪些。** 仓库包含 `src/`、`apk/`、`build/`、`out/bunanana.apk` 与两份 README。本文档提到的一些路径**不在**仓库里——它们要么是体积很大的生成产物，要么是与工具本体无关的宿主侧辅助脚本：
+> * `vendor/`：20GB 的 SDK/NDK/JDK 工具链，由 `*.mjs` 下载助手按需拉取（见 §6）；
+> * `out/rootdetect-*` 与生成的报告（`out/*.txt`、`build/t2-out/*`）：可复现的构建/测试产物；
+> * `scripts/`：宿主侧 PowerShell/Node 辅助脚本（建模拟器、adb 包装、注入 root 痕迹、真机验证）；
+> * `review/detection-review.md`：下文引用的红队审查报告。
+>
+> `bunanana.apk` 内已内置 **arm64-v8a / armeabi-v7a / x86_64** 三个 ABI 的扫描器。
 
 ---
 
@@ -30,17 +36,22 @@ android-rootdetect/
 │   ├── rd_util.c               # IO / exec / getprop / 原始 syscall 探针 / 报告模型
 │   ├── rd_checks.c             # 环境、路径、包名、挂载、进程
 │   ├── rd_kernel.c             # 模块、kallsyms、SuSFS 节点、交叉验证、root 深度检查
+│   ├── rd_extra.c              # 低成本额外信号：控制 socket、ptrace、调用方环境、失联映射
 │   ├── rd_selftest.c           # --selftest：逻辑单测 + 误报卫士
 │   └── main.c                  # CLI
-├── build/build.ps1             # NDK 交叉编译（x86_64 / arm64 / arm）
-├── scripts/
+├── apk/                        # Android 应用：MainActivity.java、manifest、资源、图标
+│                               #   以及 Python 组装脚本（assemble.py / check_apk.py / list_apk.py）
+├── build/
+│   ├── build.ps1               # NDK 交叉编译（x86_64 / arm64 / arm）
+│   └── build-apk.ps1           # 组装并签名 APK
+├── out/bunanana.apk            # 预编译应用（out/rootdetect-* 是构建产物，未提交）
+├── scripts/                    # 宿主侧辅助脚本（未提交 —— 见上方说明）
 │   ├── sdkpkg.mjs              # 用 Node 的 TLS 拉 Google SDK 包（见 §6）
 │   ├── setup-emulator.ps1      # 不依赖 avdmanager 手工建 AVD
 │   ├── run-emulator.ps1        # 启动模拟器（含本机必需的修复）
 │   ├── adb.ps1                 # adb 包装（修正 TEMP 权限问题）
 │   └── inject-root-fixtures.ps1# 在干净模拟器上注入 root 痕迹做真阳性测试
-├── out/                        # 产物：rootdetect-x86_64 / rootdetect-arm64
-└── vendor/                     # SDK、NDK、AVD、临时目录（可整目录删除）
+└── vendor/                     # SDK、NDK、AVD、临时目录（未提交；可整目录删除）
 ```
 
 ---

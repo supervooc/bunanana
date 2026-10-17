@@ -17,7 +17,13 @@
 
 In one sentence: conventional checks (`su` files, Magisk directories, `ro.debuggable`) now only catch bare root. The valuable part is **cross-validation** — a hiding module has to hook the kernel's read interfaces, and it cannot cover every interface equally well, so **the interface it missed is the evidence**. The core of this tool is therefore a "cross-validation engine", not a signature list.
 
-> The repository **does not contain** `vendor/` (that is a 20GB SDK/NDK/JDK toolchain, fetched on demand by `vendor/*.mjs`) or `out/rootdetect-*` (reproducible build products); `bunanana.apk` already bundles scanners for three ABIs: **arm64-v8a / armeabi-v7a / x86_64**.
+> **What is (and is not) committed here.** The repository contains `src/`, `apk/`, `build/`, `out/bunanana.apk` and the two READMEs. It **does not contain** several paths that this document refers to, because they are either large generated artifacts or host-side helpers that are not part of the shipped tool:
+> * `vendor/` — a 20GB SDK/NDK/JDK toolchain, fetched on demand by the `*.mjs` download helper (see §6);
+> * `out/rootdetect-*` and the generated reports (`out/*.txt`, `build/t2-out/*`) — reproducible build/test products;
+> * `scripts/` — the host-side PowerShell/Node helpers (emulator setup, adb wrapper, fixture injection, on-device verification);
+> * `review/detection-review.md` — the red-team review linked below.
+>
+> `bunanana.apk` already bundles scanners for three ABIs: **arm64-v8a / armeabi-v7a / x86_64**.
 
 ---
 
@@ -30,17 +36,22 @@ android-rootdetect/
 │   ├── rd_util.c               # IO / exec / getprop / raw syscall probes / report model
 │   ├── rd_checks.c             # environment, paths, package names, mounts, processes
 │   ├── rd_kernel.c             # modules, kallsyms, SuSFS nodes, cross-validation, deep root checks
+│   ├── rd_extra.c              # cheap extra signals: control sockets, ptrace, caller env, orphan mappings
 │   ├── rd_selftest.c           # --selftest: logic unit tests + false-positive guards
 │   └── main.c                  # CLI
-├── build/build.ps1             # NDK cross-compile (x86_64 / arm64 / arm)
-├── scripts/
+├── apk/                        # the Android app: MainActivity.java, manifest, resources, icons,
+│                               #   and the Python assembler (assemble.py / check_apk.py / list_apk.py)
+├── build/
+│   ├── build.ps1               # NDK cross-compile (x86_64 / arm64 / arm)
+│   └── build-apk.ps1           # assemble + sign the APK
+├── out/bunanana.apk            # prebuilt app (out/rootdetect-* are build products, not committed)
+├── scripts/                    # host-side helpers (not committed — see the note above)
 │   ├── sdkpkg.mjs              # fetch Google SDK packages over Node's TLS (see §6)
 │   ├── setup-emulator.ps1      # build an AVD by hand, without avdmanager
 │   ├── run-emulator.ps1        # start the emulator (with the fixes this host needs)
 │   ├── adb.ps1                 # adb wrapper (works around the TEMP permission problem)
 │   └── inject-root-fixtures.ps1# inject root traces on a clean emulator for true-positive tests
-├── out/                        # products: rootdetect-x86_64 / rootdetect-arm64
-└── vendor/                     # SDK, NDK, AVD, temp dirs (the whole directory can be deleted)
+└── vendor/                     # SDK, NDK, AVD, temp dirs (not committed; the whole dir can be deleted)
 ```
 
 ---
