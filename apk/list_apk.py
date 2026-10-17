@@ -27,6 +27,8 @@ def main():
             raise SystemExit("bad spec (want ARCNAME=LOCALPATH): " + s)
         arc, path = s.split("=", 1)
         expect[arc] = path
+    if not expect:
+        raise SystemExit("no ARCNAME=LOCALPATH pairs given: nothing would be verified")
 
     ok = True
     try:
