@@ -135,7 +135,7 @@ Runs on the device and verifies two things:
 
 ```
 $ adb shell /data/local/rx/rx --selftest
-rootdetect 1.0.0 self-test   uid=2000
+rootdetect 1.0.0 self-test   uid=0
 -- decision logic --
   PASS  keyword: magisk package name
   ...
@@ -145,7 +145,7 @@ rootdetect 1.0.0 self-test   uid=2000
   PASS  uname() agrees with /proc/sys/kernel/osrelease
   PASS  mount views list the same targets
 
-all checks passed
+85 checks, 0 failure(s), 0 skipped
 ```
 
 ---
