@@ -466,7 +466,9 @@ static size_t collect_targets(const char *file, int field, char **out, size_t ma
       }
     }
     dec[o] = '\0';
-    out[n++] = strdup(dec);
+    char *dup = strdup(dec);
+    if (!dup) break; /* OOM: a NULL entry would reach set_has()'s strcmp() */
+    out[n++] = dup;
     *end = saved;
   }
   free(txt);
