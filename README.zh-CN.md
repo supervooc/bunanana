@@ -380,6 +380,7 @@ APK 内容（已逐项核验）：
 * **没有任何资源文件**，UI 全部用代码搭建，所以只需要 `aapt2 + javac + d8` 就能构建。
 * 静态可执行文件以 `lib/<abi>/librootdetect.so` 随包分发，安装时被解压到应用的 native library 目录（该目录可执行），Activity 用 `ProcessBuilder` 运行它并把输出显示出来。
 * `targetSdkVersion=28` 是刻意的：Android 10+ 对 targetSdk≥29 的应用禁止从自身数据目录 `exec`，而本工具需要在无 root 的情况下运行设备上的原生代码；万一 native lib 目录也被 OEM 拦截，会退化成"复制到 `filesDir` 再执行"，仍失败则显示 adb 命令行用法。
+* **结论区与日志导出**：报告顶部新增一块结论横幅——直接给出"是否 root / 是否存在隐藏"以及风险计数，并列出每条 MEDIUM 及以上问题**出现在哪些具体路径**（从证据行里解析出的绝对路径，例如 `package-hidden -> /data/data/com.topjohnwu.magisk`）；`Export log` 按钮把整份日志（设备头 + 结论 + 完整报告）写到应用外部目录 `Android/data/com.rootdetect.app/files/bunanana-report-<时间戳>.txt`，然后打开系统分享面板（纯文本分享，不需要任何存储权限；外部目录不可用时退回应用私有目录）。
 * **已在模拟器上完成装机实测**：`adb install` 成功 → Activity 正常显示 → 按下 "RUN DETECTION" → 包内的静态扫描器被成功执行并在界面渲染出完整报告（截图：[apk-screenshot.png](out/apk-screenshot.png)、[apk-screenshot-after.png](out/apk-screenshot-after.png)）。应用域（`untrusted_app_27`）里没有任何 `avc: denied` 阻断执行；唯一被 SELinux 挡住的是 `/sys/fs/selinux/enforce`、`/proc/sys/kernel/tainted` 和 `/system/xbin/su` 的 `stat`（`su_exec` 类型），工具对此如实降级成 INFO，并且**没有**因为"部分接口被挡住"而误判成隐藏——被 SELinux 拒绝的探针不参与投票。
 * 构建流水线的两个坑（都会让"看起来已经修好了"变成假的）：① `build/apk-work` 每次构建被清空，连带删掉 debug keystore，重新生成的密钥让新包**无法覆盖安装**、`adb install` 静默失败并继续跑旧版本（keystore 现已移到持久的 `build/debug.keystore`，安装脚本也加了"签名不符先卸载"的兜底）；② 测试脚本按小写匹配按钮文字，而 Android 的 `Button` 会把标签转成大写。
 
