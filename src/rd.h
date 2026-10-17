@@ -135,6 +135,10 @@ int rd_probe_readlink(const char *path);
 bool rd_is_dangling_symlink(const char *path);
 /* True when the directory holding `path` is group/other writable; fills `dir`. */
 bool rd_dir_writable_by_others(const char *path, char *dir, size_t dirsz);
+/* Parsers (exposed for --selftest): one /proc/kallsyms line and one /proc/modules line. */
+bool rd_parse_kallsyms_line(const char *line, unsigned long long *addr, char *name, size_t namesz,
+                            char *mod, size_t modsz);
+bool rd_parse_proc_modules_line(const char *line, char *name, size_t sz);
 
 /* Probe table used by the consistency engine. */
 typedef struct {

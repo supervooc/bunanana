@@ -323,9 +323,47 @@ void rd_check_packages(rd_ctx *c, rd_report *rep) {
     }
   }
   if (rc != 0 || !strstr(out, "package:")) {
-    rd_add(rep, SEV_INFO, "package-enum", "package manager enumeration unavailable",
-           "`cmd package list packages` failed (rc=%d); falling back to filesystem probes only.",
-           rc);
+    /* Enumeration failed. Returning with an INFO was a real detection hole: a root
+     * manager hides its package by making `cmd package`/`pm` return nothing, so
+     * exactly when the check mattered most it silently disappeared - and the
+     * message promised a filesystem fallback that did not exist. Do the filesystem
+     * half of the check anyway and report the failure itself. */
+    rd_props props;
+    rd_props_load(&props);
+    const char *sdk = rd_prop(&props, "ro.build.version.sdk");
+    bool is_android = sdk && *sdk;
+    rd_props_free(&props);
+    if (!is_android) {
+      rd_add(rep, SEV_INFO, "package-enum", "package manager enumeration not applicable",
+             "this is not an Android system (no ro.build.version.sdk), so the package-manager "
+             "check cannot run here; the artefact probes cover the same filesystem paths.");
+      free(out);
+      return;
+    }
+    int data_dirs = 0;
+    for (size_t i = 0; i < RD_ROOT_PACKAGE_COUNT; i++) {
+      char dp[256], du[256];
+      snprintf(dp, sizeof(dp), "/data/data/%s", RD_ROOT_PACKAGES[i]);
+      snprintf(du, sizeof(du), "/data/user/0/%s", RD_ROOT_PACKAGES[i]);
+      if (!rd_path_exists(dp) && !rd_path_exists(du)) continue;
+      data_dirs++;
+      rd_add(rep, SEV_CRITICAL, "package-hidden",
+             "root manager data dir exists while the package list is unavailable",
+             "%s exists while `cmd package list packages` failed (rc=%d). A root manager that "
+             "hides its own package commonly makes enumeration fail or return nothing, so the "
+             "data directory is the evidence.", dp, rc);
+    }
+    if (data_dirs)
+      rd_add(rep, SEV_HIGH, "package-enum-blocked",
+             "package enumeration failed while root artefacts are visible",
+             "`cmd package list packages` failed (rc=%d) and %d known root manager data dir(s) "
+             "exist. Blocking enumeration is itself a hiding technique, so this is reported "
+             "instead of silently degrading.", rc, data_dirs);
+    else
+      rd_add(rep, SEV_MEDIUM, "package-enum-blocked", "package enumeration failed",
+             "`cmd package list packages` and `pm list packages` both failed (rc=%d), so the "
+             "package check could not run. Not proof of hiding, but a tampered package manager "
+             "is one cause - cross-check with `pm list packages | wc -l`.", rc);
     free(out);
     return;
   }

@@ -64,21 +64,60 @@ static unsigned long long ksym_find(const ksym_tab *t, const char *name) {
 
 /* Parse /proc/kallsyms into a table of the symbols we care about + every module
  * tag we see. `want` is a NULL terminated list of names. */
+/* Parses one /proc/kallsyms line: "<addr> <type> <name> [module]". Returns false
+ * when the line carries no address, type and name. The module tag is optional;
+ * an unterminated "[" keeps the name and drops the module. Exposed so --selftest
+ * can pin the malformed cases that used to be skipped. */
+bool rd_parse_kallsyms_line(const char *line, unsigned long long *addr, char *name, size_t namesz,
+                            char *mod, size_t modsz) {
+  char addr_s[32] = "", type = '?', nm[256] = "", md[64] = "";
+  if (!line || !*line) return false;
+  if (sscanf(line, "%31s %c %255s %63s", addr_s, &type, nm, md) < 3) return false;
+  /* The address must really be hex: "not a kallsyms line" would otherwise be
+   * accepted with strtoull() returning 0. */
+  if (!addr_s[0] || strspn(addr_s, "0123456789abcdefABCDEF") != strlen(addr_s)) return false;
+  if (addr) *addr = strtoull(addr_s, NULL, 16);
+  if (name && namesz) snprintf(name, namesz, "%s", nm);
+  if (mod && modsz) {
+    mod[0] = '\0';
+    /* Only a closed "[module]" tag counts: an unterminated bracket is a
+     * malformed line, not a module named "unterminated". */
+    if (md[0] == '[') {
+      char *e = strchr(md, ']');
+      if (e) {
+        *e = '\0';
+        snprintf(mod, modsz, "%s", md + 1);
+      }
+    }
+  }
+  return true;
+}
+
+/* Parses the first field of a /proc/modules line ("<name> <size> <refcnt> ...").
+ * Returns false for empty or blank lines and copies at most sz-1 bytes. Exposed
+ * for the same reason as rd_parse_kallsyms_line(). */
+bool rd_parse_proc_modules_line(const char *line, char *name, size_t sz) {
+  if (!line) return false;
+  const char *p = line;
+  while (*p == ' ' || *p == '\t') p++;
+  if (!*p) return false;
+  size_t n = 0;
+  while (p[n] && p[n] != ' ' && p[n] != '\t' && n + 1 < sz) n++;
+  if (n == 0) return false;
+  if (name && sz) { memcpy(name, p, n); name[n] = '\0'; }
+  return true;
+}
+
 static ksym_tab *kallsyms_parse(const char *txt, const char *const *want) {
   ksym_tab *t = (ksym_tab *)calloc(1, sizeof(ksym_tab));
   char *copy = strdup(txt);
   if (!copy) { free(t); return NULL; }
   char *save = NULL;
   for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-    char addr_s[32] = "", type = '?', name[256] = "", mod[64] = "";
-    if (sscanf(line, "%31s %c %255s %63s", addr_s, &type, name, mod) < 3) continue;
-    unsigned long long addr = strtoull(addr_s, NULL, 16);
-    const char *modname = NULL;
-    if (mod[0] == '[') {
-      char *e = strchr(mod, ']');
-      if (e) *e = '\0';
-      modname = mod + 1;
-    }
+    char name[256] = "", mod[64] = "";
+    unsigned long long addr = 0;
+    if (!rd_parse_kallsyms_line(line, &addr, name, sizeof(name), mod, sizeof(mod))) continue;
+    const char *modname = mod[0] ? mod : NULL;
     /* always record module tags once */
     if (modname) {
       bool seen = false;
@@ -173,7 +212,7 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
     char *save = NULL;
     for (char *line = strtok_r(mods, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
       char name[128] = "";
-      if (sscanf(line, "%127s", name) != 1) continue;
+      if (!rd_parse_proc_modules_line(line, name, sizeof(name))) continue;
       mod_count++;
       if (n_mod_names < 512) mod_names[n_mod_names++] = strdup(name);
       const char *which = NULL;
