@@ -515,6 +515,13 @@ static void test_kernel_parsers(void) {
       skip("kallsyms tags vs /proc/modules", "/proc/modules unreadable");
     } else if (missing == 0) {
       ok(fh == NULL, "kallsyms tags all present in /proc/modules -> no hidden-module finding", dk);
+    } else if (nn == 0) {
+      /* /proc/modules is readable but lists nothing. The detector deliberately
+       * reports that as kernel-modules-crosscheck-skipped instead of
+       * kernel-module-hidden, because an emptied module list cannot be told
+       * apart from a filtered one without a second source. Asserting fh != NULL
+       * here contradicted the implementation. */
+      ok(fh == NULL, "empty /proc/modules -> cross-check skipped, no hidden-module finding", dk);
     } else {
       ok(fh != NULL, "kallsyms tags missing from /proc/modules are reported", dk);
     }
@@ -617,6 +624,25 @@ static void test_mount_check_e2e(void) {
 /* Every mount view must describe the same mount table. This guard exists
  * because a wrong field index in one of the four formats once turned a clean
  * system into HIDING_DETECTED. */
+
+/* Bounded append that keeps *off inside dsz. The naive
+ * `off += snprintf(dst + off, dsz - off, ...)` is unsafe: snprintf() returns the
+ * length it *would* have written, so as soon as off exceeds dsz the next
+ * `dsz - off` underflows to SIZE_MAX and the write runs far past the buffer. It
+ * tripped glibc's fortify ("buffer overflow detected") and ASan
+ * (stack-buffer-overflow) once the disagreement evidence exceeded dsz. */
+static void appends(char *dst, size_t dsz, size_t *off, const char *fmt, ...) {
+  if (!dsz || *off >= dsz - 1) return;
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(dst + *off, dsz - *off, fmt, ap);
+  va_end(ap);
+  if (n > 0) {
+    *off += (size_t)n;
+    if (*off > dsz - 1) *off = dsz - 1;
+  }
+}
+
 static int mount_views_agree(char *detail, size_t dsz) {
   static char *base[512], *other[512];
   size_t nb = rd_collect_mount_targets("/proc/mounts", 1, base, 512);
@@ -626,7 +652,7 @@ static int mount_views_agree(char *detail, size_t dsz) {
   }
   int all_same = 1;
   size_t off = 0;
-  off += (size_t)snprintf(detail + off, dsz - off, "/proc/mounts=%zu", nb);
+  appends(detail, dsz, &off, "/proc/mounts=%zu", nb);
   const char *files[3] = {"/proc/self/mountinfo", "/proc/1/mountinfo", "/proc/self/mountstats"};
   const int fields[3] = {4, 4, 4};
   for (int f = 0; f < 3; f++) {
@@ -645,13 +671,13 @@ static int mount_views_agree(char *detail, size_t dsz) {
         for (size_t k = 0; k < no; k++)
           if (strcmp(base[i], other[k]) == 0) { found = 1; break; }
         if (!found) {
-          off += (size_t)snprintf(detail + off, dsz - off, "; absent from %s: %s", files[f], base[i]);
+          appends(detail, dsz, &off, "; absent from %s: %s", files[f], base[i]);
           shown++;
         }
       }
       all_same = 0;
     }
-    off += (size_t)snprintf(detail + off, dsz - off, " %s=%zu%s", files[f], no, same ? "" : " MISMATCH");
+    appends(detail, dsz, &off, " %s=%zu%s", files[f], no, same ? "" : " MISMATCH");
     for (size_t k = 0; k < no; k++) free(other[k]);
   }
   for (size_t k = 0; k < nb; k++) free(base[k]);

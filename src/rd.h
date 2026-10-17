@@ -58,7 +58,6 @@ typedef struct {
 #define RD_F_ROOT (1u << 0)   /* something established root access exists */
 #define RD_F_HIDE (1u << 1)   /* a hiding/spoofing mechanism was observed */
 #define RD_F_HOOK (1u << 2)   /* kernel or libc hooking artefacts observed */
-#define RD_F_ADBROOT (1u << 3) /* process runs as uid 0 (adb root / su) */
 
 void rd_add(rd_report *r, rd_sev sev, const char *id, const char *title,
             const char *fmt, ...);
@@ -182,7 +181,7 @@ void rd_check_consistency(rd_ctx *c, rd_report *rep);   /* spoofing engine */
 void rd_check_deep(rd_ctx *c, rd_report *rep);          /* needs uid 0 */
 
 /* Mount target parsing shared by the mount check and the self-test.
- * field: 1 = /proc/mounts layout, 4 = mountinfo layout, 3 = mountstats. */
+ * field: 1 = /proc/mounts layout; 4 = mountinfo and 4 = mountstats layout. */
 size_t rd_collect_mount_targets(const char *file, int field, char **out, size_t max);
 
 /* Deterministic self-test of the detector's decision logic plus live

@@ -229,7 +229,10 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
       char name[128] = "";
       if (!rd_parse_proc_modules_line(line, name, sizeof(name))) continue;
       mod_count++;
-      if (n_mod_names < 512) mod_names[n_mod_names++] = strdup(name);
+      if (n_mod_names < 512) {
+        char *dup = strdup(name);
+        if (dup) mod_names[n_mod_names++] = dup;
+      }
       const char *which = NULL;
       if (has_kw(name, &which)) {
         mod_hits++;
@@ -251,13 +254,10 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
   sys_ev[0] = '\0';
   int sys_hits = 0;
   DIR *d = opendir("/sys/module");
-  char *sys_names[1024];
-  size_t n_sys = 0;
   if (d) {
     struct dirent *e;
     while ((e = readdir(d))) {
       if (e->d_name[0] == '.') continue;
-      if (n_sys < 1024) sys_names[n_sys++] = strdup(e->d_name);
       const char *which = NULL;
       if (has_kw(e->d_name, &which)) {
         sys_hits++;
@@ -411,7 +411,6 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
   ksym_free(ktab);
   if (mods) free(mods);
   for (size_t i = 0; i < n_mod_names; i++) free(mod_names[i]);
-  for (size_t i = 0; i < n_sys; i++) free(sys_names[i]);
 
   if (read_first_line_public("/proc/sys/kernel/kptr_restrict", buf, sizeof(buf)))
     rd_add(rep, SEV_INFO, "kernel-kptr", "kptr_restrict", "%s", buf);

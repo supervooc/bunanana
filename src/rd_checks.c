@@ -131,7 +131,6 @@ void rd_check_environment(rd_ctx *c, rd_report *rep) {
          c->is_root ? "yes" : "no");
 
   if (c->is_root) {
-    rep->flags |= RD_F_ADBROOT;
     rd_add(rep, SEV_INFO, "env-uid0", "running as uid 0",
            "An adb-root/su shell can see the raw kernel state; deep checks are enabled. "
            "Re-run as the `shell` user for the app-equivalent view.");
@@ -212,7 +211,7 @@ void rd_check_environment(rd_ctx *c, rd_report *rep) {
 /* ------------------------------------------------------------------- paths */
 
 void rd_check_paths(rd_ctx *c, rd_report *rep) {
-  int found = 0, inconsistent = 0;
+  int found = 0, inconsistent = 0, dangling = 0;
   rd_sev worst = SEV_LOW;
   char ev[RD_MAXEVID];
   ev[0] = '\0';
@@ -239,6 +238,7 @@ void rd_check_paths(rd_ctx *c, rd_report *rep) {
                "root artefact path is a symlink to a missing target",
                "%s is a dangling symlink; the nofollow probes see it and the follow probes do "
                "not, which is not by itself evidence of hiding.", p);
+        dangling++;
         continue;
       }
       inconsistent++;
@@ -296,10 +296,18 @@ void rd_check_paths(rd_ctx *c, rd_report *rep) {
     rd_add_ev(rep, SEV_HIGH, "artefact-listing", "root framework files visible in directories",
               list_ev, "%d entries matching root-framework names were listed.", list_hits);
 
-  if (inconsistent == 0)
+  if (inconsistent == 0 && dangling == 0)
     rd_add(rep, SEV_INFO, "path-consistency", "artefact probes are self-consistent",
            "stat/statx/fstatat/access/open/openat/getdents agreed for all %zu artefacts.",
            RD_ROOT_PATH_COUNT);
+  else if (inconsistent == 0)
+    /* Do not claim agreement for paths that were deliberately excluded: a
+     * dangling symlink made the probes disagree, so it must not be counted as
+     * "self-consistent". */
+    rd_add(rep, SEV_INFO, "path-consistency", "artefact probes agreed on the remaining paths",
+           "%zu artefact path(s) were excluded as dangling symlinks (reported above); the other "
+           "%zu agreed across stat/statx/fstatat/access/open/openat/getdents.",
+           (size_t)dangling, RD_ROOT_PATH_COUNT - (size_t)dangling);
 }
 
 /* ---------------------------------------------------------------- packages */

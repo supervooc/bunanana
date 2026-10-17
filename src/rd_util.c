@@ -265,7 +265,10 @@ void rd_print_text(const rd_report *r, int use_color, int verbose) {
 }
 
 void rd_print_json(const rd_report *r) {
-  char esc[RD_MAXEVID * 2];
+  /* Worst case is six output bytes per input byte ("\u00xx"), and fields can be
+   * a full RD_MAXEVID; RD_MAXEVID*2 silently dropped ~2/3 of an escape-heavy
+   * field (a 2900-byte LD_PRELOAD of control bytes came out as 1008 chars). */
+  char esc[RD_MAXEVID * 6 + 8];
   printf("{\n  \"tool\": \"rootdetect\",\n  \"version\": \"%s\",\n", RD_VERSION);
   printf("  \"verdict\": \"%s\",\n", r->verdict ? r->verdict : "?");
   printf("  \"summary\": {\"critical\": %d, \"high\": %d, \"medium\": %d, \"low\": %d, \"info\": %d},\n",
@@ -330,7 +333,13 @@ char *rd_slurp(const char *path, size_t *len_out) {
 
 bool rd_read_small(const char *path, char *buf, size_t bufsz) {
   if (!bufsz) return false;
-  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  /* O_NONBLOCK: this is also used to read the SuSFS control nodes under
+   * /data/adb/susfs/ and /proc/susfs_*. rd_probe_open_read() already opens with
+   * O_NONBLOCK, but the re-open here did not, so a FIFO (or an LKM node whose
+   * read blocks) made the whole scan hang forever even though the non-blocking
+   * probe had just classified it as "present". Regular and procfs files ignore
+   * O_NONBLOCK, so this only changes the behaviour for special files. */
+  int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
   if (fd < 0) return false;
   ssize_t r = read(fd, buf, bufsz - 1);
   close(fd);
@@ -395,8 +404,9 @@ int rd_run(const char *const argv[], char *out, size_t outsz) {
   close(pfd[1]);
   size_t n = 0;
   if (out && outsz) {
+    int full = 0;
     for (;;) {
-      if (n + 1 >= outsz) break;
+      if (n + 1 >= outsz) { full = 1; break; }
       ssize_t r = read(pfd[0], out + n, outsz - 1 - n);
       if (r < 0) {
         if (errno == EINTR) continue;
@@ -406,6 +416,16 @@ int rd_run(const char *const argv[], char *out, size_t outsz) {
       n += (size_t)r;
     }
     out[n] = '\0';
+    /* The child may still be writing when the buffer is full. Closing the pipe
+     * now delivers SIGPIPE to it, so waitpid() reports "killed by signal" and
+     * rd_run() returns -1 - i.e. a merely large output (a big dmesg or
+     * `getprop`) is misread as "the command could not run" and the caller drops
+     * the whole result. Drain the remaining bytes (discarding them) so the child
+     * exits normally and the truncation is reported as a normal exit. */
+    if (full) {
+      char sink[4096];
+      while (read(pfd[0], sink, sizeof(sink)) > 0) {}
+    }
   } else {
     char sink[4096];
     while (read(pfd[0], sink, sizeof(sink)) > 0) {}
@@ -630,7 +650,16 @@ bool rd_dir_writable_by_others(const char *path, char *dir, size_t dirsz) {
   char tmp[512];
   snprintf(tmp, sizeof(tmp), "%s", path);
   char *slash = strrchr(tmp, '/');
-  if (!slash) return false;
+  if (!slash) {
+    /* A bare filename is relative to the current directory, not to "/".
+     * Returning false here skipped the guard entirely, so pointing
+     * ROOTDETECT_ABI_HELPER at ./helper in a world-writable cwd bypassed the
+     * "parent directory is not group/other writable" check. */
+    if (dir && dirsz) snprintf(dir, dirsz, ".");
+    struct stat cwd;
+    if (stat(".", &cwd) != 0) return false;
+    return (cwd.st_mode & (S_IWGRP | S_IWOTH)) != 0;
+  }
   *slash = '\0';
   struct stat ds;
   if (stat(tmp[0] ? tmp : "/", &ds) != 0) return false;
