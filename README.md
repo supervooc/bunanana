@@ -209,7 +209,7 @@ If you have a **clean** device, an injection script can create detectable traces
 * The mount-view comparison produces differences when **mount namespaces differ**: running as `shell` shares init's namespace and should agree exactly; if you enter a separate namespace with `su --mount-master` or the like, that verdict needs manual review.
 * Not implemented: protocol-level evidence (Play Integrity / key attestation), hardware-breakpoint / performance-counter level hook detection.
 * The cross-ABI diff (§10) is implemented but **has not yet been field-tested on a device with 32/64-bit mixed support**: it only activates when both ABI products are pushed to `/data/local/tmp`, otherwise it degrades to INFO.
-* **End-to-end testing has been done on a real kernel and on real Android**: the WSL2 Linux kernel (self-test, a clean baseline, and positive results from faking `/proc/version` and `/proc/1/mountinfo`) and a KVM-accelerated emulator inside WSL (API 30 x86_64: self-test, injected fixtures, and the APK installed with the button pressed to produce a report) - see §11. **It has still not been verified on a physical device** (an unlocked or rooted phone), and the cross-ABI differential has only run on the emulator.
+* **End-to-end testing has been done on a real kernel and on real Android**: the WSL2 Linux kernel (self-test, a clean baseline, and positive results from faking `/proc/version` and `/proc/1/mountinfo`) and a KVM-accelerated emulator inside WSL (API 30 x86_64: self-test, injected fixtures, and the APK installed with the button pressed to produce a report). **It has still not been verified on a physical device** (an unlocked or rooted phone), and the cross-ABI differential has only run on the emulator.
 
 ---
 

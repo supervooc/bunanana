@@ -209,7 +209,7 @@ adb shell /data/local/rx/rx -v
 * mount 视图对比在**挂载命名空间不同**的情况下会产生差异：以 `shell` 身份运行时与 init 同一个 namespace，正常应完全一致；如果你用 `su --mount-master` 之类进入独立 namespace，该判定需要人工复核。
 * 未实现：协议层证据（Play Integrity / key attestation）、硬件断点/性能计数器层面的 hook 检测。
 * 跨 ABI 差分（§10）已实现但**尚未在有 32/64 位混合支持的设备上实测过**：需要把两个 ABI 的产物都推进 `/data/local/tmp` 才会启用，缺一个就自动降级为 INFO。
-* **已在真实内核与真 Android 上完成端到端实测**：WSL2 的真 Linux 内核（自检、干净基线，以及伪造 `/proc/version` 与 `/proc/1/mountinfo` 得到的正阳性）与 WSL 内 KVM 加速的模拟器（API 30 x86_64：自检、注入 fixtures、APK 装机后按下按钮跑出报告），详见 §11。**仍然没有在物理真机上验证**（未解锁或已 root 的手机），跨 ABI 差分也只在模拟器上跑过。
+* **已在真实内核与真 Android 上完成端到端实测**：WSL2 的真 Linux 内核（自检、干净基线，以及伪造 `/proc/version` 与 `/proc/1/mountinfo` 得到的正阳性）与 WSL 内 KVM 加速的模拟器（API 30 x86_64：自检、注入 fixtures、APK 装机后按下按钮跑出报告）。**仍然没有在物理真机上验证**（未解锁或已 root 的手机），跨 ABI 差分也只在模拟器上跑过。
 
 ---
 
