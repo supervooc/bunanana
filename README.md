@@ -1,140 +1,151 @@
-> **English version**: this file is the complete English version — the complete Chinese version is [`README.zh-CN.md`](README.zh-CN.md).
-> **中文版**：中文完整版见 [`README.zh-CN.md`](README.zh-CN.md)。
+> **中文版**：本文件是完整中文版，也是仓库的默认 README（首页显示这一份）。
+> **English version**: the complete English version is [`README.en.md`](README.en.md).
 
-# bunanana — Android root / root-hiding detection tool
+# bunanana — Android root / root 隐藏检测工具
 
-**bunanana** detects root and root hiding on Android. The APK is only a shell; the actual detection engine is the **statically linked native program `rootdetect`** (C11, no third-party dependencies, four architecture builds).
+**bunanana** 是一个 Android 上的 root 与「root 隐藏」检测工具。APK 只是外壳，真正的检测引擎是**静态链接的原生程序 `rootdetect`**（C11，无第三方依赖，四个架构产物）。
 
-## 0. Quick start
+## 0. 快速开始
 
-| I want to… | How |
+| 我想…… | 怎么做 |
 |---|---|
-| **Just install and use it** | Download [`out/bunanana.apk`](out/bunanana.apk) and install it on the phone (unknown sources must be allowed), then open it and tap **RUN DETECTION** |
-| **Run it over adb from a PC** | See §7: `adb push out/rootdetect-arm64 /data/local/rx/rx` → `adb shell chmod 755 /data/local/rx/rx` → `adb shell /data/local/rx/rx -v` |
-| **Only the command-line scanner** | Build it yourself: `powershell -ExecutionPolicy Bypass -File build/build.ps1 -Abi arm64` |
-| **See why it can catch hiding** | §4 detection matrix + §11 field results (real Linux kernel + API 30 emulator + KVM) |
-| **Know which blind spots it admits to** | [review/detection-review.md](review/detection-review.md): a red-team view - 15-layer coverage matrix, false-positive and poisoning surfaces, **15 source-code bugs** (16 code changes applied this round) |
+| **直接装上用** | 下载 [`out/bunanana.apk`](out/bunanana.apk) 安装到手机（需允许未知来源），打开后点 **RUN DETECTION** |
+| **在电脑上用 adb 跑** | 见 §7：`adb push out/rootdetect-arm64 /data/local/rx/rx` → `adb shell chmod 755 /data/local/rx/rx` → `adb shell /data/local/rx/rx -v` |
+| **只要命令行扫描器** | 自行构建：`powershell -ExecutionPolicy Bypass -File build/build.ps1 -Abi arm64` |
+| **想先看它凭什么能抓到隐藏** | §4 检测矩阵 + §11 实测记录（真 Linux 内核 + API 30 模拟器 + KVM） |
+| **想知道它自己有哪些已知盲区** | [review/detection-review.md](review/detection-review.md)：红队视角的 15 层覆盖矩阵、误报与投毒面、**15 条源码 bug**（本轮已修 16 处） |
 
-In one sentence: conventional checks (`su` files, Magisk directories, `ro.debuggable`) now only catch bare root. The valuable part is **cross-validation** — a hiding module has to hook the kernel's read interfaces, and it cannot cover every interface equally well, so **the interface it missed is the evidence**. The core of this tool is therefore a "cross-validation engine", not a signature list.
+一句话：常规检测项（`su` 文件、Magisk 目录、`ro.debuggable`）现在只能抓到裸奔的 root。真正有价值的是**交叉验证**——隐藏模块必须 hook 内核的读取接口，而它不可能把每个接口都覆盖得一样完美，**没覆盖到的那个接口就是证据**。本工具的核心因此是一个「交叉验证引擎」，而不是一份特征清单。
 
-> The repository **does not contain** `vendor/` (that is a 20GB SDK/NDK/JDK toolchain, fetched on demand by `vendor/*.mjs`) or `out/rootdetect-*` (reproducible build products); `bunanana.apk` already bundles scanners for three ABIs: **arm64-v8a / armeabi-v7a / x86_64**.
+> **仓库里有哪些、没有哪些。** 仓库包含 `src/`、`apk/`、`build/`、`out/bunanana.apk` 与两份 README。本文档提到的一些路径**不在**仓库里——它们要么是体积很大的生成产物，要么是与工具本体无关的宿主侧辅助脚本：
+> * `vendor/`：20GB 的 SDK/NDK/JDK 工具链，由 `*.mjs` 下载助手按需拉取（见 §6）；
+> * `out/rootdetect-*` 与生成的报告（`out/*.txt`、`build/t2-out/*`）：可复现的构建/测试产物；
+> * `scripts/`：宿主侧 PowerShell/Node 辅助脚本（建模拟器、adb 包装、注入 root 痕迹、真机验证）；
+> * `review/detection-review.md`：下文引用的红队审查报告。
+>
+> `bunanana.apk` 内已内置 **arm64-v8a / armeabi-v7a / x86_64** 三个 ABI 的扫描器。
 
 ---
 
-## 1. Directory layout
+## 1. 目录结构
 
 ```
 android-rootdetect/
-├── src/                        # the tool itself (C11, no third-party deps)
-│   ├── rd.h                    # types, interfaces, corpus table declarations
-│   ├── rd_util.c               # IO / exec / getprop / raw syscall probes / report model
-│   ├── rd_checks.c             # environment, paths, package names, mounts, processes
-│   ├── rd_kernel.c             # modules, kallsyms, SuSFS nodes, cross-validation, deep root checks
-│   ├── rd_selftest.c           # --selftest: logic unit tests + false-positive guards
+├── src/                        # 工具本体（C11，无第三方依赖）
+│   ├── rd.h                    # 类型、接口、语料表声明
+│   ├── rd_util.c               # IO / exec / getprop / 原始 syscall 探针 / 报告模型
+│   ├── rd_checks.c             # 环境、路径、包名、挂载、进程
+│   ├── rd_kernel.c             # 模块、kallsyms、SuSFS 节点、交叉验证、root 深度检查
+│   ├── rd_extra.c              # 低成本额外信号：控制 socket、ptrace、调用方环境、失联映射
+│   ├── rd_selftest.c           # --selftest：逻辑单测 + 误报卫士
 │   └── main.c                  # CLI
-├── build/build.ps1             # NDK cross-compile (x86_64 / arm64 / arm)
-├── scripts/
-│   ├── sdkpkg.mjs              # fetch Google SDK packages over Node's TLS (see §6)
-│   ├── setup-emulator.ps1      # build an AVD by hand, without avdmanager
-│   ├── run-emulator.ps1        # start the emulator (with the fixes this host needs)
-│   ├── adb.ps1                 # adb wrapper (works around the TEMP permission problem)
-│   └── inject-root-fixtures.ps1# inject root traces on a clean emulator for true-positive tests
-├── out/                        # products: rootdetect-x86_64 / rootdetect-arm64
-└── vendor/                     # SDK, NDK, AVD, temp dirs (the whole directory can be deleted)
+├── apk/                        # Android 应用：MainActivity.java、manifest、资源、图标
+│                               #   以及 Python 组装脚本（assemble.py / check_apk.py / list_apk.py）
+├── build/
+│   ├── build.ps1               # NDK 交叉编译（x86_64 / arm64 / arm）
+│   └── build-apk.ps1           # 组装并签名 APK
+├── out/bunanana.apk            # 预编译应用（out/rootdetect-* 是构建产物，未提交）
+├── scripts/                    # 宿主侧辅助脚本（未提交 —— 见上方说明）
+│   ├── sdkpkg.mjs              # 用 Node 的 TLS 拉 Google SDK 包（见 §6）
+│   ├── setup-emulator.ps1      # 不依赖 avdmanager 手工建 AVD
+│   ├── run-emulator.ps1        # 启动模拟器（含本机必需的修复）
+│   ├── adb.ps1                 # adb 包装（修正 TEMP 权限问题）
+│   └── inject-root-fixtures.ps1# 在干净模拟器上注入 root 痕迹做真阳性测试
+└── vendor/                     # SDK、NDK、AVD、临时目录（未提交；可整目录删除）
 ```
 
 ---
 
-## 2. Build
+## 2. 构建
 
-An Android NDK is required (the script finds `vendor/sdk/android-ndk-*` automatically, or you can point `ANDROID_NDK_HOME` at one):
+需要 Android NDK（脚本会自动找 `vendor/sdk/android-ndk-*`，也可用 `ANDROID_NDK_HOME` 指定）：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build/build.ps1                      # x86_64 + arm64
-powershell -ExecutionPolicy Bypass -File build/build.ps1 -Abi arm64           # arm64 only (real device)
+powershell -ExecutionPolicy Bypass -File build/build.ps1 -Abi arm64           # 只出 arm64（真机）
 powershell -ExecutionPolicy Bypass -File build/build.ps1 -Abi x86_64 -DebugBuild
 ```
 
-* `-static` is a deliberate choice: the binary carries its own libc, so it **does not depend on the linker and is not affected by `LD_PRELOAD`, GOT rewriting or post-`ptrace` injection** — a tool whose job is to find userland tampering must not itself be a hijackable dynamic program.
-* The product is ~8.2 MB, API 24+ (Android 7.0 and up).
+* `-static` 是刻意选择：二进制自带 libc，**不依赖 linker、不受 `LD_PRELOAD`、GOT 改写、`ptrace` 后注入的影响**——一个负责发现「用户态被动过手脚」的工具，自己不能是可被劫持的动态程序。
+* 产物 ~8.2 MB，API 24+（Android 7.0 起）。
 
-## 3. Usage
+## 3. 使用
 
 ```bash
-# push to the device (shell identity: the app's point of view)
+# 推送到设备（shell 身份：应用视角）
 adb push out/rootdetect-arm64 /data/local/rx/rx && adb shell chmod 755 /data/local/rx/rx
-adb shell /data/local/rx/rx                 # human-readable report
-adb shell /data/local/rx/rx --json          # machine-readable
-adb shell /data/local/rx/rx -v              # include INFO-level context
-adb shell /data/local/rx/rx --selftest      # self-test: logic + false-positive guards
-adb root && adb shell /data/local/rx/rx     # uid 0: enables the deep kernel checks
+adb shell /data/local/rx/rx                 # 人类可读报告
+adb shell /data/local/rx/rx --json          # 机器可读
+adb shell /data/local/rx/rx -v              # 附带 INFO 级上下文
+adb shell /data/local/rx/rx --selftest      # 自检：逻辑 + 误报卫士
+adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 ```
 
-| Exit code | Meaning |
+| 退出码 | 含义 |
 |---|---|
 | 0 | CLEAN |
 | 1 | SUSPICIOUS |
 | 2 | ROOT_DETECTED |
-| 3 | HIDING_DETECTED (a hiding/spoofing mechanism was observed at work) |
+| 3 | HIDING_DETECTED（观测到隐藏/伪造机制在工作） |
 
-> Run it **once under each identity**: the `shell` identity shows the app's point of view; `adb root`/`su` can see `/proc/kcore`, the kprobe list and the kernel log, covering the `deep-*` checks.
+> 建议**两种身份各跑一次**：`shell` 身份看到的是应用视角；`adb root`/`su` 身份能看到 `/proc/kcore`、kprobe 列表、内核日志，覆盖 `deep-*` 系列检查。
 
 ---
 
-## 4. Detection matrix
+## 4. 检测矩阵
 
-### A. Conventional root traces
+### A. 常规 root 痕迹
 
-| id | Severity | Method |
+| id | 级别 | 手段 |
 |---|---|---|
-| `artefact-present` | LOW~HIGH | a corpus of 50+ paths (`su`, `/data/adb/magisk`, `ksud`, `/debug_ramdisk`, `daemonsu`…); every path is probed through **seven interfaces at once: stat / statx / fstatat / access / open(O_PATH) / open(O_RDONLY) / opendir(getdents64)** |
-| `artefact-listing` | HIGH | walks `/sbin`, `/system/xbin`, `/system/bin`, `/cache`, `/data/adb` to catch file names nobody guessed |
-| `package-roots` | HIGH | compares the full `cmd package list packages` output against 30+ known root manager package names |
-| `package-hidden` | **CRITICAL** | `/data/data/<pkg>` exists but the package manager **does not list it** — the deterministic signature of a KernelSU "hidden app" / DenyList rename |
-| `env-build` | LOW~HIGH | `ro.debuggable=1`, `ro.secure=0`, `service.adb.root=1`, `verifiedbootstate≠green`, `veritymode≠enforcing`, test-keys |
-| `env-prop-identity` | HIGH | full property-table scan: any property name containing magisk/kernelsu/susfs/zygisk/lsposed/riru/apatch/integrityfix… |
+| `artefact-present` | LOW~HIGH | 50+ 条路径语料（`su`、`/data/adb/magisk`、`ksud`、`/debug_ramdisk`、`daemonsu`…），每条路径同时用 **stat / statx / fstatat / access / open(O_PATH) / open(O_RDONLY) / opendir(getdents64)** 七种接口探一次 |
+| `artefact-listing` | HIGH | 遍历 `/sbin`、`/system/xbin`、`/system/bin`、`/cache`、`/data/adb`，抓没猜到的文件名 |
+| `package-roots` | HIGH | `cmd package list packages` 全量比对 30+ 个已知 root 管理器包名 |
+| `package-hidden` | **CRITICAL** | `/data/data/<pkg>` 存在但包管理器**不列出**——KernelSU「隐藏应用」/ DenyList 改名的确定性特征 |
+| `env-build` | LOW~HIGH | `ro.debuggable=1`、`ro.secure=0`、`service.adb.root=1`、`verifiedbootstate≠green`、`veritymode≠enforcing`、test-keys |
+| `env-prop-identity` | HIGH | 全属性表扫描：任何属性名含 magisk/kernelsu/susfs/zygisk/lsposed/riru/apatch/integrityfix… |
 | `env-selinux-permissive` | HIGH | `/sys/fs/selinux/enforce=0` |
-| `env-selinux-domain` | HIGH | `/proc/self/attr/current` lands in a `:su:` / magisk domain |
-| `mount-roots` / `mount-overlay` | HIGH | a mount target name contains framework keywords; system/vendor is overlaid by overlay/tmpfs |
-| `proc-cmdline` / `proc-injected-lib` | MEDIUM~HIGH | walks `/proc/*/cmdline` and `/proc/*/maps` looking for ksud/zygiskd/shamiko/frida/xposed/lsposed and friends |
+| `env-selinux-domain` | HIGH | `/proc/self/attr/current` 落在 `:su:` / magisk 域 |
+| `mount-roots` / `mount-overlay` | HIGH | 挂载目标名含框架关键字；system/vendor 被 overlay/tmpfs 覆盖 |
+| `proc-cmdline` / `proc-injected-lib` | MEDIUM~HIGH | 遍历 `/proc/*/cmdline`、`/proc/*/maps`，找 ksud/zygiskd/shamiko/frida/xposed/lsposed 等 |
 
-### B. Kernel / module layer
+### B. 内核 / 模块层
 
-| id | Severity | Method |
+| id | 级别 | 手段 |
 |---|---|---|
-| `kernel-taint-oe` | HIGH | **bit 12 (OE)** of `/proc/sys/kernel/tainted`: an out-of-tree module was insmod'ed — the unavoidable trace of a hiding LKM (stock devices usually only carry bit 0 for vendor modules) |
-| `kernel-module` / `kernel-sysmodule` | HIGH | names in `/proc/modules` and `/sys/module/*` match framework keywords |
-| `kernel-module-hidden` | HIGH | **kallsyms tags `[module]` for a module that `/proc/modules` does not list** — the two tables were filtered separately |
-| `kernel-kallsyms-symbol` | HIGH | `susfs_` / `ksu_` symbols are still left in `/proc/kallsyms` (SuSFS's `hide_syms` exists precisely for this, and it shows the filter did not take effect) |
-| `kernel-syscall-table-patched` | **CRITICAL** | uid 0 only: parse the ELF program headers of `/proc/kcore` to map virtual addresses to file offsets, read `sys_call_table[openat]` and compare it with the kallsyms address of `__x64_sys_openat` — **a rewritten table entry is hard evidence** (SuSFS `susfs_fp_hook` patches exactly this) |
-| `hook-kprobe` | **CRITICAL** | read `/sys/kernel/debug/kprobes/list` and tracefs's `kprobe_events`; hits `s_show` / `m_show` / `slow_avc_audit` / `*newuname` / `kallsyms*` and other SuSFS hook points |
-| `deep-dmesg-hits` | **CRITICAL** | a framework name appears in the kernel log |
+| `kernel-taint-oe` | HIGH | `/proc/sys/kernel/tainted` 的 **bit 12 (OE)**：有 out-of-tree 模块被 insmod——隐藏 LKM 的必然痕迹（stock 设备通常只有 bit 0 的厂商专有模块） |
+| `kernel-module` / `kernel-sysmodule` | HIGH | `/proc/modules` 与 `/sys/module/*` 名称匹配框架关键字 |
+| `kernel-module-hidden` | HIGH | **kallsyms 里出现 `[模块名]` 标注，但 `/proc/modules` 里没有该模块**——两张表被分别过滤了 |
+| `kernel-kallsyms-symbol` | HIGH | `/proc/kallsyms` 里仍然残留 `susfs_` / `ksu_` 符号（SuSFS 的 `hide_syms` 就是干这个的，它在说明过滤器没生效） |
+| `kernel-syscall-table-patched` | **CRITICAL** | 只要 uid 0：解析 `/proc/kcore` 的 ELF program header 做虚拟地址→文件偏移映射，读出 `sys_call_table[openat]` 并与 kallsyms 里 `__x64_sys_openat` 的地址比对——**表项被改写就是铁证**（SuSFS `susfs_fp_hook` 正是改这里） |
+| `hook-kprobe` | **CRITICAL** | 读 `/sys/kernel/debug/kprobes/list`、tracefs 的 `kprobe_events`，命中 `s_show` / `m_show` / `slow_avc_audit` / `*newuname` / `kallsyms*` 等 SuSFS 的挂载点 |
+| `deep-dmesg-hits` | **CRITICAL** | 内核日志里出现框架名 |
 
-### C. Adversarial: the cross-validation engine (the real focus of this project)
+### C. 对抗：交叉验证引擎（本项目真正的重点）
 
-A hiding module must intercept the "read" interfaces, and what it intercepts is a set of **discrete** hooks; an interface it misses contradicts the rest. The tool probes every suspicious path through 7 syscalls at once and compares 4 independent kernel views:
+隐藏模块必须拦截「读」的接口，而它拦截的是一组**离散**的钩子，漏掉的接口会自相矛盾。工具对每个可疑路径同时用 7 个 syscall 探，并比对 4 个独立的内核视图：
 
-| id | Severity | Principle |
+| id | 级别 | 原理 |
 |---|---|---|
-| `path-consistency-mismatch` | **CRITICAL** | the same path: `stat` says ENOENT while `open` can see it (or vice versa). SuSFS's kstat layer is a patch dispatched **by syscall number** (`newfstatat`/`fstat`/`statx`); it does not change the VFS itself — as soon as it misses one entry point, the vote splits |
-| `path-consistency-control` | **CRITICAL** | the same vote runs on paths that **certainly exist** (`/system/bin/sh`, `/proc/version`…); if even these disagree, the filtering is no longer path-specific |
-| `spoof-uname` | **CRITICAL** | the result of `uname(2)` disagrees with `/proc/version`, `/proc/sys/kernel/osrelease` and `/proc/sys/kernel/version`. SuSFS's uname layer is a **kretprobe** on `__arm64_sys_newuname` that only changes the syscall return value, while those `/proc` files print `init_uts_ns` directly — **a mismatch means a kernel-level spoofer is at work** |
-| `spoof-cmdline` | HIGH | `/proc/cmdline` disagrees with the `ro.boot.*` properties init derived from it (SuSFS's cmdline layer only changes `/proc/cmdline`; init already copied the properties away) |
-| `spoof-open-redirect` | **CRITICAL** | for the same path, `stat()` and `open()+fstat()` report **different dev/ino** — `susfs_opath` only redirects `openat/openat2`, leaving the stat family untouched, so the path points at two different inodes |
-| `mount-view-inconsistency` | **CRITICAL** | the mount target sets of `/proc/mounts`(show_vfsmnt) vs `/proc/self/mountinfo`(show_mountinfo) vs `/proc/1/mountinfo` vs `/proc/self/mountstats`(show_vfsstat) must be exactly identical. Four views come from four different functions, so mount hiding exposes itself if any one of them is not covered |
-| `spoof-property` | HIGH | compares `/system/build.prop` (the world-readable on-disk truth) with the live `getprop` values — `resetprop`-style tampering shows up here |
-| `susfs-node-*` | **CRITICAL** | 8 `/proc/susfs_*` control nodes + `/sys/module/susfs*`, using a vote to distinguish "really absent" from "hidden"; under uid 0 the contents are read directly |
+| `path-consistency-mismatch` | **CRITICAL** | 同一路径：`stat` 说 ENOENT 而 `open` 看得见（或反之）。SuSFS 的 kstat 层是按 **syscall 号**分发的补丁（`newfstatat`/`fstat`/`statx`），它不改变 VFS 本身——只要它漏了一个入口，投票结果就分裂 |
+| `path-consistency-control` | **CRITICAL** | 同样的投票跑在**肯定存在**的普通路径上（`/system/bin/sh`、`/proc/version`…）；如果连这些都不一致，说明过滤已经不分路径了 |
+| `spoof-uname` | **CRITICAL** | `uname(2)` 的结果与 `/proc/version`、`/proc/sys/kernel/osrelease`、`/proc/sys/kernel/version` 对不上。SuSFS 的 uname 层是挂在 `__arm64_sys_newuname` 上的 **kretprobe**，只改 syscall 返回值；而 `/proc` 那几个文件直接打印 `init_uts_ns`——**对不上就是内核级伪造器在工作** |
+| `spoof-cmdline` | HIGH | `/proc/cmdline` 与 init 从它派生出来的 `ro.boot.*` 属性对不上（SuSFS cmdline 层只改 `/proc/cmdline`，属性早已被 init 抄走） |
+| `spoof-open-redirect` | **CRITICAL** | 同一路径 `stat()` 与 `open()+fstat()` 给出**不同的 dev/ino**——`susfs_opath` 只重定向 `openat/openat2`，stat 家族没动，于是路径指向了两个不同的 inode |
+| `mount-view-inconsistency` | **CRITICAL** | `/proc/mounts`(show_vfsmnt) vs `/proc/self/mountinfo`(show_mountinfo) vs `/proc/1/mountinfo` vs `/proc/self/mountstats`(show_vfsstat) 的挂载目标集合必须完全一致。四个视图由四个不同函数产出，挂载隐藏只要有任何一个没覆盖就露馅 |
+| `spoof-property` | HIGH | `/system/build.prop`（世界可读的磁盘真值）与 `getprop` 的实时值比对——`resetprop` 类篡改会在这里露头 |
+| `susfs-node-*` | **CRITICAL** | 8 个 `/proc/susfs_*` 控制节点 + `/sys/module/susfs*`，用投票法区分「真不存在」与「被隐藏」；uid 0 下直接读内容 |
 
-> On "why not simply grep for keywords": modules such as SuSFS have already hidden their keywords, paths, module names and symbol names. The checks above examine **the contradictions left behind by the act of hiding itself**, not its name.
+> 关于「为什么不是简单 grep 关键字」：SuSFS 这类模块已经把关键字、路径、模块名、符号名都藏干净了。上面这些项检查的是**它藏东西这个行为本身留下的矛盾**，而不是它的名字。
 
 ---
 
 ## 5. `--selftest`
 
-Runs on the device and verifies two things:
+在设备上跑，验证两件事：
 
-1. **Decision logic**: the verdict the voting table reaches under various combinations, verdict mapping, JSON escaping, buffer bounds, and the flags a verdict implies.
-2. **False-positive guards**: on a "clean device" the two most false-positive-prone items must stay silent — `uname()` must equal `/proc/sys/kernel/osrelease`, and `/proc/mounts` and `/proc/self/mountinfo` must list the same mount targets.
+1. **决策逻辑**：投票表在各种组合下的判定、verdict 映射、JSON 转义、缓冲区边界、verdict 对应的 flag。
+2. **误报卫士**：在「干净设备」上，最容易误报的两项必须保持沉默——`uname()` 必须等于 `/proc/sys/kernel/osrelease`，`/proc/mounts` 与 `/proc/self/mountinfo` 的挂载目标集合必须相等。
 
 ```
 $ adb shell /data/local/rx/rx --selftest
@@ -153,75 +164,75 @@ all checks passed
 
 ---
 
-## 6. Local environment setup notes (conclusions and troubleshooting)
+## 6. 本机环境搭建记录（含结论与排错）
 
-### 6.1 How the SDK / NDK / emulator were installed (no administrator rights anywhere)
+### 6.1 SDK / NDK / 模拟器是怎么装上的（全程无管理员）
 
-* On this machine **all of PowerShell's HTTPS is blocked by the environment** (schannel `SEC_E_NO_CREDENTIALS`), while DNS / plaintext HTTP / **Node.js TLS work fine**. So every download goes through `vendor/sdkpkg.mjs` (Node, with its own OpenSSL), and it parses Google's `repository2-3.xml` / `sys-img2-3.xml` directly, with SHA-1 verification:
+* 本机 **PowerShell 的 HTTPS 全部被环境挡掉**（schannel `SEC_E_NO_CREDENTIALS`），但 DNS / 明文 HTTP / **Node.js 的 TLS 正常**。因此所有下载走 `vendor/sdkpkg.mjs`（Node，自带 OpenSSL），并且它直接解析 Google 的 `repository2-3.xml` / `sys-img2-3.xml`，带 SHA-1 校验：
 
   ```powershell
-  node vendor/sdkpkg.mjs list "emulator|platform-tools"     # query packages
+  node vendor/sdkpkg.mjs list "emulator|platform-tools"     # 查包
   node vendor/sdkpkg.mjs getall platform-tools emulator "system-images;android-30;default;x86_64"
   node vendor/sdkpkg.mjs getall "ndk;30.0.16248370"
   ```
 
-* **No JDK needed**: `avdmanager`/`sdkmanager` are Java programs, so the AVD is created by writing `config.ini` + `.ini` by hand instead (`scripts/setup-emulator.ps1`).
-* Under `vendor/` are the SDK (~1.1GB) + NDK (~4GB extracted) + images + AVD, all inside the workspace; deleting the directory uninstalls everything.
+* **不需要 JDK**：`avdmanager`/`sdkmanager` 是 Java 程序，这里改为手工写 `config.ini` + `.ini` 建 AVD（`scripts/setup-emulator.ps1`）。
+* `vendor/` 下面是 SDK(约 1.1GB) + NDK(解压约 4GB) + 镜像 + AVD，全部在 workspace 内，删目录即卸载。
 
-### 6.2 Pitfalls hit (all reproducible, all fixed in the scripts)
+### 6.2 踩到的坑（都可复现，已修在脚本里）
 
-| Symptom | Cause | Fix |
+| 现象 | 原因 | 处理 |
 |---|---|---|
-| `qemu-system-x86_64-headless.exe` exits with code `0xC0000135` (STATUS_DLL_NOT_FOUND) | the launcher does not effectively extend the child process's DLL search path | `run-emulator.ps1` explicitly adds `emulator`, `lib64`, `lib64\gles_swiftshader`, `lib64\vulkan` to `PATH` |
-| the emulator silently exits right after initializing | the system image's `advancedFeatures.ini` says `Vulkan = on`, which overrides the emulator default `off`, and the Vulkan ICD fails to initialize on this host (`VK_ERROR_INITIALIZATION_FAILED`) | change it to `Vulkan = off` inside the image, and use `-gpu off` (guest-side rendering) |
-| `adb`: `cannot open %TEMP%\adb.log: Permission denied` | adb 1.0.41 hardcodes `$TEMP\adb.log`, and the shared TEMP is not writable | `scripts/adb.ps1` / `run-emulator.ps1` point `TEMP`/`TMP` at `vendor\tmp` |
-| clang: `unable to make temporary file: Permission denied` | same as above, clang's temp directory | `build/build.ps1` points `TMP` at `vendor\tmp` |
+| `qemu-system-x86_64-headless.exe` 退出码 `0xC0000135`（STATUS_DLL_NOT_FOUND） | 启动器没有有效地给子进程扩展 DLL 搜索路径 | `run-emulator.ps1` 里显式把 `emulator`、`lib64`、`lib64\gles_swiftshader`、`lib64\vulkan` 加到 `PATH` |
+| 模拟器初始化完立刻静默退出 | 系统镜像里的 `advancedFeatures.ini` 写着 `Vulkan = on`，覆盖了模拟器默认的 `off`，而本机 Vulkan ICD 初始化失败（`VK_ERROR_INITIALIZATION_FAILED`） | 镜像内改成 `Vulkan = off`，并用 `-gpu off`（guest 侧渲染） |
+| `adb`：`cannot open %TEMP%\adb.log: Permission denied` | adb 1.0.41 硬编码写 `$TEMP\adb.log`，共享 TEMP 不可写 | `scripts/adb.ps1` / `run-emulator.ps1` 把 `TEMP`/`TMP` 指到 `vendor\tmp` |
+| clang：`unable to make temporary file: Permission denied` | 同上，clang 的临时目录 | `build/build.ps1` 里把 `TMP` 指到 `vendor\tmp` |
 
-### 6.3 Conclusion: on this machine **the emulator currently cannot run**, blocked on hardware acceleration (needs an administrator)
+### 6.3 结论：本机**当前跑不起模拟器**，卡在硬件加速（需要管理员）
 
-After the four pitfalls above were fixed, the emulator still could not start a VM. The full chain of evidence:
+上面四个坑修完后，模拟器仍然启动不了虚拟机。完整证据链：
 
-* `emulator -accel-check` reports `WHPX(10.0.22631) is installed and usable`, but when the VM is actually started the process exits immediately:
-  * running the qemu backend directly (full `-verbose` log, 707 lines) the last line is `Windows Hypervisor Platform accelerator is operational`, with no output after it;
-  * the process exit code is `0xFFFF7001` (in another combination it is `0x40000015` = `STATUS_FATAL_APP_EXIT`);
-  * forcing TCG (`ANDROID_I_WANT_MY_TCG=yes -accel off`) exits at the same point;
-  * in the only combination that keeps the process alive (`-gpu off`), qemu shows **0 seconds of CPU time and a working set of only 139MB** — guest RAM was never touched, which means the vCPU never started executing.
-* Host-side evidence: `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\HypervisorLaunchType` is **not set** (i.e. the hypervisor is not configured to launch), `Get-WindowsOptionalFeature` for `HypervisorPlatform` returns *requires elevation*, and `bcdedit` also fails without administrator rights.
-* The host CPU is a real `i5-1155G7` (no nested virtualization), 17GB of memory, plenty of disk — ruling out resource problems.
-* **The arm64 fallback was pushed to the end as well**: `emulator.exe` refuses outright (`FATAL | Avd's CPU Architecture 'arm64' is not supported by the QEMU2 emulator on x86_64 host`), but that check lives only in the launcher — calling the backend directly, `qemu\windows-x86_64\qemu-system-aarch64-headless.exe -avd rootdetect-arm`, bypasses it, and it really does get as far as the arm64 boot arguments (`androidboot.boot_devices=a003600.virtio_mmio`), after which it **still aborts at the moment the VM starts** (`0x40000015` = `STATUS_FATAL_APP_EXIT`).
-* Six combinations have now aborted at the same point: x86_64/arm64 backend × WHPX/forced TCG (`ANDROID_I_WANT_MY_TCG=yes -accel off`) × gfxstream / `-gpu off` / Vulkan disabled (both images' `advancedFeatures.ini` were changed to `Vulkan = off`) × 512/1024/2048MB of memory. **It has nothing to do with architecture, accelerator, Vulkan or memory**; it points at a host-level hypervisor being unavailable. The emulator deletes crash dumps when reporting unauthorized, so `vendor/tmp/AndroidEmulator/emu-crash-37.3.4.db` is empty and no finer stack trace can be obtained.
-* In the only combination that keeps the process alive (x86_64 + `-gpu off`), qemu shows **0 seconds of CPU time and a working set of only 139MB**: guest RAM was never touched and the vCPU never ran once.
+* `emulator -accel-check` 报 `WHPX(10.0.22631) is installed and usable`，但实际启动虚拟机时进程立刻退出：
+  * 直接跑 qemu 后端（`-verbose` 全量日志 707 行）最后一行停在 `Windows Hypervisor Platform accelerator is operational`，之后无任何输出；
+  * 进程退出码 `0xFFFF7001`（另一个组合下是 `0x40000015` = `STATUS_FATAL_APP_EXIT`）；
+  * 强制 TCG（`ANDROID_I_WANT_MY_TCG=yes -accel off`）同样在该点退出；
+  * 唯一让进程存活下来的组合（`-gpu off`）里，qemu **CPU 时间 0 秒、工作集只有 139MB**——guest RAM 从未被触碰，说明 vCPU 根本没开始执行。
+* 宿主机侧证据：`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\HypervisorLaunchType` **未设置**（即 hypervisor 没有配置为启动），`Get-WindowsOptionalFeature` 查询 `HypervisorPlatform` 返回 *requires elevation*，`bcdedit` 亦因非管理员失败。
+* 本机 CPU 为真机 `i5-1155G7`（非嵌套虚拟化），内存 17GB，磁盘充足——排除了资源问题。
+* **arm64 这条退路也走到底了**：`emulator.exe` 会直接拒绝（`FATAL | Avd's CPU Architecture 'arm64' is not supported by the QEMU2 emulator on x86_64 host`），但那个检查只存在于启动器里——直接调用后端 `qemu\windows-x86_64\qemu-system-aarch64-headless.exe -avd rootdetect-arm` 可以绕过去，它确实继续走到了 arm64 的启动参数（`androidboot.boot_devices=a003600.virtio_mmio`），随后**仍然在启动虚拟机的那一刻 abort**（`0x40000015` = `STATUS_FATAL_APP_EXIT`）。
+* 在同一个位置 abort 过的组合已经有 6 种：x86_64/arm64 后端 × WHPX/强制 TCG（`ANDROID_I_WANT_MY_TCG=yes -accel off`）× gfxstream / `-gpu off` / 关闭 Vulkan（两个镜像的 `advancedFeatures.ini` 都已改 `Vulkan = off`）× 512/1024/2048MB 内存。**与架构、加速器、Vulkan、内存都无关**，指向宿主层面的 hypervisor 不可用；emulator 在未授权上报时会删掉崩溃转储，所以 `vendor/tmp/AndroidEmulator/emu-crash-37.3.4.db` 是空的，拿不到更细的调用栈。
+* 唯一让进程活下来的组合（x86_64 + `-gpu off`）里 qemu **CPU 时间 0 秒、工作集仅 139MB**：guest RAM 从未被触碰，vCPU 一次都没跑。
 
-**Conclusion (superseded by §11.4)**: the Windows path really is a dead end — it depends on Windows' hardware accelerator, which cannot be enabled under the current privileges; Google's QEMU fork does not execute guest instructions even with forced TCG (as the `-d in_asm` log proves). But **WSL2 has a working `/dev/kvm`**, and putting the Linux emulator + the same AOSP image in WSL boots normally under KVM (33 seconds); all field results were produced there, see §11.4.
+**结论（已被 §11.4 取代）**：Windows 侧这条路确实走不通——它依赖 Windows 的硬件加速器，而当前权限下无法启用；Google 的 QEMU 分支连强制 TCG 都不执行 guest 指令（`-d in_asm` 记录证实）。但 **WSL2 里带着可用的 `/dev/kvm`**，把 Linux 版模拟器 + 同一份 AOSP 镜像放进 WSL 即可用 KVM 正常开机（33 秒），全部实测都在那里完成，见 §11.4。
 
-### 6.4 With administrator rights, one line fixes it
+### 6.4 你有管理员权限时，一行命令即可修好
 
-Pick one route, then re-run `powershell -ExecutionPolicy Bypass -File scripts/run-emulator.ps1`:
+任选一条路线，然后重新执行 `powershell -ExecutionPolicy Bypass -File scripts/run-emulator.ps1`：
 
 ```powershell
-# Route A (recommended): enable Windows Hypervisor Platform + launch the hypervisor, requires a reboot
+# 路线 A（推荐）：开启 Windows Hypervisor Platform + 启动 hypervisor，需重启
 dism /online /enable-feature /featurename:HypervisorPlatform /all /norestart
 bcdedit /set hypervisorlaunchtype auto
 shutdown /r /t 0
 
-# Route B: keep Hyper-V off and install Google's AEHD driver instead (also needs an administrator)
-#   download and run silent_install.bat from extras;google;Android_Emulator_Hypervisor_Driver
+# 路线 B：不启用 Hyper-V，改装 Google 的 AEHD 驱动（也需要管理员）
+#   下载并安装 extras;google;Android_Emulator_Hypervisor_Driver 里的 silent_install.bat
 ```
 
-After the reboot, self-check:
+重启后自检：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/setup-emulator.ps1                 # x86_64 AVD (instant if it already exists)
-powershell -ExecutionPolicy Bypass -File scripts/run-emulator.ps1                   # start in window mode
+powershell -ExecutionPolicy Bypass -File scripts/setup-emulator.ps1                 # x86_64 AVD（已建好则秒过）
+powershell -ExecutionPolicy Bypass -File scripts/run-emulator.ps1                   # 窗口模式启动
 powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 wait-for-device
-powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell getprop sys.boot_completed   # expect 1
+powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell getprop sys.boot_completed   # 期望 1
 ```
 
-> Also: `-Arch arm64-v8a` (arm64 image + AVD `rootdetect-arm`) is already downloaded and created on this machine, but **it cannot start on an x86_64 host** (QEMU2 requires guest and host to share an architecture, see §6.3). It is only usable on an ARM host; it is kept for a future machine change or for product compatibility checks.
+> 另：`-Arch arm64-v8a`（arm64 镜像 + AVD `rootdetect-arm`）在本机已下载建好，但**在 x86_64 宿主上无法启动**（QEMU2 强制 guest 与宿主同架构，见 §6.3）。它只在 ARM 宿主机上可用；保留它是为了将来换机器或做产物兼容性检查。
 
 ---
 
-## 7. Verifying on a real device (no emulator needed)
+## 7. 在真机上验证（不依赖模拟器）
 
 ```powershell
 # Root-only deployment: when the scanner runs as root it must not be executed from
@@ -232,251 +243,252 @@ powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell "mkdir -p /data/l
 powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 push out/rootdetect-arm64 /data/local/rx/rx
 powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell chmod 755 /data/local/rx/rx
 
-# 1) Baseline: shell identity, expect no HIGH/CRITICAL (a userdebug device will show the env-build MEDIUM)
+# 1) 基线：shell 身份，期望没有 HIGH/CRITICAL（userdebug 设备会有 env-build 的 MEDIUM）
 powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/rx/rx
 
-# 2) Self-test: logic + false-positive guards
+# 2) 自检：逻辑 + 误报卫士
 powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/rx/rx --selftest
 
-# 3) True positive: run on a rooted device (one with su / Magisk / KernelSU)
+# 3) 真阳性：在 root 设备上跑（有 su / Magisk / KernelSU 的设备）
 powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 root
 powershell -ExecutionPolicy Bypass -File scripts/adb.ps1 shell /data/local/rx/rx -v
 ```
 
-If you have a **clean** device, an injection script can create detectable traces (emulator / non-production only):
+如果手上是**干净**的设备，可以用注入脚本造出可检出的痕迹（仅模拟器/non-production）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/inject-root-fixtures.ps1          # create su / magisk dirs / a hidden package
-powershell -ExecutionPolicy Bypass -File scripts/inject-root-fixtures.ps1 -Clean    # clean up
+powershell -ExecutionPolicy Bypass -File scripts/inject-root-fixtures.ps1          # 造 su / magisk 目录 / 隐藏包
+powershell -ExecutionPolicy Bypass -File scripts/inject-root-fixtures.ps1 -Clean    # 清理
 ```
 
 ---
 
-## 8. Known limitations (stated honestly)
+## 8. 已知局限（诚实说明）
 
-* **Without root, SuSFS's path hiding itself cannot be observed directly**: its `/proc/susfs_*` nodes return `-ENOENT` to anyone but uid 0, which is indistinguishable from "really absent" at the errno level. The non-root verdict therefore relies on the contradiction checks in §4C (this is a design necessity, not implementation laziness). Under uid 0 the node contents can be read directly.
-* The §4B items that depend on `/proc/kallsyms`, `/proc/kcore` and debugfs are blocked by SELinux on some devices (the tool prints an INFO for `kernel-kallsyms` / `kernel-kcore` saying "could not check", and never treats "could not check" as "clean" or "rooted").
-* The mount-view comparison produces differences when **mount namespaces differ**: running as `shell` shares init's namespace and should agree exactly; if you enter a separate namespace with `su --mount-master` or the like, that verdict needs manual review.
-* Not implemented: protocol-level evidence (Play Integrity / key attestation), hardware-breakpoint / performance-counter level hook detection.
-* The cross-ABI diff (§10) is implemented but **has not yet been field-tested on a device with 32/64-bit mixed support**: it only activates when both ABI products are pushed to `/data/local/tmp`, otherwise it degrades to INFO.
-* **End-to-end testing has been done on a real kernel and on real Android**: the WSL2 Linux kernel (self-test, a clean baseline, and positive results from faking `/proc/version` and `/proc/1/mountinfo`) and a KVM-accelerated emulator inside WSL (API 30 x86_64: self-test, injected fixtures, and the APK installed with the button pressed to produce a report) - see §11. **It has still not been verified on a physical device** (an unlocked or rooted phone), and the cross-ABI differential has only run on the emulator.
+* **非 root 身份下，SuSFS 的路径隐藏本身不可直接观测**：它的 `/proc/susfs_*` 节点对非 uid 0 返回 `-ENOENT`，与「真的不存在」在 errno 上无法区分。所以非 root 时的判定依赖 §4C 的矛盾检测（这是设计上的必然，不是实现偷懒）。uid 0 下则可以直接读到节点内容。
+* §4B 里依赖 `/proc/kallsyms`、`/proc/kcore`、debugfs 的项在部分设备上会被 SELinux 挡住（工具会打印 `kernel-kallsyms` / `kernel-kcore` 的 INFO 说明「没查成」，不会把「查不到」当成「干净」或「有 root」）。
+* mount 视图对比在**挂载命名空间不同**的情况下会产生差异：以 `shell` 身份运行时与 init 同一个 namespace，正常应完全一致；如果你用 `su --mount-master` 之类进入独立 namespace，该判定需要人工复核。
+* 未实现：协议层证据（Play Integrity / key attestation）、硬件断点/性能计数器层面的 hook 检测。
+* 跨 ABI 差分（§10）已实现但**尚未在有 32/64 位混合支持的设备上实测过**：需要把两个 ABI 的产物都推进 `/data/local/tmp` 才会启用，缺一个就自动降级为 INFO。
+* **已在真实内核与真 Android 上完成端到端实测**：WSL2 的真 Linux 内核（自检、干净基线，以及伪造 `/proc/version` 与 `/proc/1/mountinfo` 得到的正阳性）与 WSL 内 KVM 加速的模拟器（API 30 x86_64：自检、注入 fixtures、APK 装机后按下按钮跑出报告），详见 §11。**仍然没有在物理真机上验证**（未解锁或已 root 的手机），跨 ABI 差分也只在模拟器上跑过。
 
 ---
 
-## 9. Code map (where to start when adding a check)
+## 9. 代码地图（想改检测项从哪里下手）
 
-| Want to add | Where to change |
+| 想加什么 | 改哪里 |
 |---|---|
-| a new suspicious path / package name / keyword | `RD_ROOT_PATHS`, `RD_ROOT_PACKAGES`, `RD_KEYWORDS` at the top of `rd_checks.c` |
-| a new kind of cross-validation | add a function in `rd_kernel.c` and call it from `rd_check_consistency()` |
-| a new report item id and its contribution to the verdict | the `rd_add*()` call site + the `id_flags()` table in `rd_util.c` (the verdict only consults that table, which keeps it reproducible) |
-| a new deep kernel check | `rd_check_deep()` in `rd_kernel.c` (runs only under uid 0) |
+| 新的可疑路径 / 包名 / 关键字 | `rd_checks.c` 顶部 `RD_ROOT_PATHS`、`RD_ROOT_PACKAGES`、`RD_KEYWORDS` |
+| 新的一类交叉验证 | 在 `rd_kernel.c` 加函数并在 `rd_check_consistency()` 里调用 |
+| 新的报告项 id 与它对 verdict 的贡献 | `rd_add*()` 调用处 + `rd_util.c` 的 `id_flags()` 表（verdict 只认这张表，保证可复现） |
+| 新的内核深度检查 | `rd_kernel.c` 的 `rd_check_deep()`（仅在 uid 0 下运行） |
 
 ---
 
-## 10. Cross-ABI diff and one-command on-device verification
+## 10. 跨 ABI 差分与一键真机验证
 
-### 10.1 Principle
+### 10.1 原理
 
-A hiding module installs its syscall table patches **per table**: inside SuSFS's `susfs_fp_hook` the native table and the compat table each hold their own wrapper and orig slots, and the entry points of the stat family and getdents are numbered per ABI as well (arm64's `newfstatat`/`fstat`/`statx` vs AArch32's `fstatat64`/`fstat64`). Making every ABI behave exactly the same is where hiding schemes most easily spring a leak.
+隐藏模块的 syscall 表补丁是**按表**安装的：SuSFS 的 `susfs_fp_hook` 里 native 表与 compat 表各持一份 wrapper 和 orig 槽，stat 家族与 getdents 的入口点也按 ABI 分开编号（arm64 的 `newfstatat`/`fstat`/`statx` vs AArch32 的 `fstatat64`/`fstat64`）。要让每个 ABI 的行为完全一致，是隐藏方案里最容易出漏洞的地方。
 
-Hence: **a 64-bit process runs the 32-bit sibling product with `--probe-dump` and compares the seven interfaces item by item for the same batch of paths.**
+于是：**64 位进程把 32 位兄弟产物用 `--probe-dump` 跑一遍，对同一批路径逐项比对 7 个接口的结果。**
 
 ```bash
-adb push out/rootdetect-arm64 /data/local/rx/rx                # main program
+adb push out/rootdetect-arm64 /data/local/rx/rx                # 主程序
 adb shell "mkdir -p /data/local/rx && chmod 700 /data/local/rx"   # root-only: helpers are never exec'd from /data/local/tmp as root
 adb push out/rootdetect-arm   /data/local/rx/rootdetect-arm       # 32-bit helper
 adb shell chmod 755 /data/local/rx/rx /data/local/rx/rootdetect-arm
-adb shell /data/local/rx/rx        # auto-discovers the helper and enables the diff
+adb shell /data/local/rx/rx        # 自动发现助手并启用差分
 ```
 
-* helper found → `abi-consistency` (agree, INFO) or `abi-consistency-mismatch` (disagree, **CRITICAL**, listing the seven probe results of both ABIs per path).
-* not found → `abi-diff-skipped` (INFO, with the reason), and it is **not** treated as "clean" or "rooted".
-* `ROOTDETECT_ABI_HELPER=/path/to/helper` sets the path explicitly, or `--fast` disables all cross-checks.
+* 找到助手 → `abi-consistency`（一致，INFO）或 `abi-consistency-mismatch`（不一致，**CRITICAL**，逐路径列出两个 ABI 的七个探针结果）。
+* 没找到 → `abi-diff-skipped`（INFO，并说明原因），**不会**被当成"干净"或"有 root"。
+* 可用 `ROOTDETECT_ABI_HELPER=/path/to/helper` 指定路径，或 `--fast` 关掉全部交叉校验。
 
-### 10.2 Additional lightweight checks (`src/rd_extra.c`)
+### 10.2 追加的轻量检查（`src/rd_extra.c`）
 
-| id | Severity | What it checks |
+| id | 级别 | 内容 |
 |---|---|---|
-| `unix-socket-roots` | HIGH | control-channel names in `/proc/net/unix` (Frida linjector / Zygisk / Magisk / LSPosed). They are sockets, not files, so file-system hiding does not make them disappear |
-| `self-traced` | HIGH | `TracerPid != 0` in `/proc/self/status`: this process is being ptraced |
-| `map-backing-hidden` | **CRITICAL** | a file mmap'ed into this process's own address space cannot be `stat`ed/`open`ed — path hiding did not cover the mmap path |
-| `map-deleted-exec` | MEDIUM | the backing file of an executable mapping has been unlinked |
-| `env-preload` / `env-ldpath` | MEDIUM / LOW | `LD_PRELOAD` / `LD_LIBRARY_PATH`: the statically linked main binary does not fear preloading, but it shows the caller's environment was injected |
+| `unix-socket-roots` | HIGH | `/proc/net/unix` 里的控制通道名（Frida linjector / Zygisk / Magisk / LSPosed）。它们是 socket 不是文件，藏文件系统不会让它们消失 |
+| `self-traced` | HIGH | `/proc/self/status` 的 `TracerPid != 0`：本进程正被 ptrace 附加 |
+| `map-backing-hidden` | **CRITICAL** | 自己地址空间里 mmap 进来的文件却 `stat`/`open` 不到——路径隐藏没覆盖 mmap 这条路径 |
+| `map-deleted-exec` | MEDIUM | 可执行映射的宿主文件已被 unlink |
+| `env-preload` / `env-ldpath` | MEDIUM / LOW | `LD_PRELOAD` / `LD_LIBRARY_PATH`：静态链接的本体不怕预加载，但说明调用方环境被注入 |
 
-### 10.3 One-command on-device verification
+### 10.3 一键真机验证
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/verify-on-device.ps1            # or -Serial <serial>
+powershell -ExecutionPolicy Bypass -File scripts/verify-on-device.ps1            # 或 -Serial <序列号>
 ```
 
-The script will: pick the product per device ABI → push the main program and a helper for the other ABI together → run `--selftest` → run once as `shell` and save `out/report-shell.json` → `adb root` and run again, saving `out/report-root.json` → print the two verdicts side by side and list the findings **visible only to uid 0**. This is the shortest path from "is there root / is there hiding at all" to reviewable evidence.
+脚本会：按设备 ABI 挑产物 → 主程序 + 另一个 ABI 的助手一起推 → 跑 `--selftest` → 以 `shell` 身份跑一遍存 `out/report-shell.json` → `adb root` 后再跑一遍存 `out/report-root.json` → 打印两次 verdict 对比，并列出**只有 uid 0 才看得到**的发现。这是把"到底有没有 root / 有没有隐藏"落到可复核证据上的最短路径。
 
 ---
 
-## 11. Field results and false-positive validation (WSL real kernel + APK)
+## 11. 实测与误报率验证（WSL 真实内核 + APK）
 
-### 11.1 Execution on a real Linux kernel (WSL2, kernel 5.10.16.3)
+### 11.1 在真实 Linux 内核上执行（WSL2, kernel 5.10.16.3）
 
-The Android emulator cannot start on this machine (see §6), but WSL2 provides a **real Linux kernel**, and since the tool is statically linked it can simply be dropped into WSL: path corpora that do not match Android degrade to INFO as they should, while the detection engine itself runs end to end.
+Android 模拟器在这台机器上起不来（见 §6），但 WSL2 提供的是**真 Linux 内核**，而这个工具是静态链接的，可以直接丢进 WSL 执行：不匹配 Android 的路径语料会如实降级成 INFO，检测引擎本身则完整跑通。
 
 ```bash
 wsl -e      bash android-rootdetect/scripts/wsl-verify.sh baseline    # uid 1000
-wsl -u root -e bash android-rootdetect/scripts/wsl-verify.sh fixtures # inject + spoof
+wsl -u root -e bash android-rootdetect/scripts/wsl-verify.sh fixtures # 注入 + 伪造
 ```
 
-| Scenario | Measured result |
+| 场景 | 实测结果 |
 |---|---|
-| `--selftest` | **75 checks, 0 failure(s), 6 skipped** (current binary; the extra skips are the kernel module-list assertions, this WSL kernel exposes no loadable module tags) |
-| clean-system baseline (false-positive rate) | **verdict: CLEAN** — 0 critical / 0 high / 0 medium / 0 low (19 INFO items) |
-| injected root traces (`/system/xbin/su`, `/system/bin/ksud`, `/data/adb/magisk`) | `artefact-present` + `artefact-listing` = **HIGH**, verdict: ROOT_DETECTED (exit 2) |
-| `tmpfs` over `/system` | `mount-overlay` = **HIGH** |
-| bind-mounting a fake `/proc/version` (replicating SuSFS's uname layer: the syscall is changed while `/proc` keeps the truth) | `spoof-uname` = **CRITICAL**, verdict: HIDING_DETECTED |
-| bind-mounting a fake `/proc/1/mountinfo` (changing only one of the four mount views) | `mount-view-inconsistency` = **CRITICAL** (`/proc/mounts` 33 entries vs `/proc/1/mountinfo` 1 entry), verdict: HIDING_DETECTED |
+| `--selftest` | **75 checks, 0 failure(s), 6 skipped**（当前二进制；多出的 SKIP 是内核模块列表相关的结构性断言，本机 WSL 内核无可加载模块标签） |
+| 干净系统基线（误报率） | **verdict: CLEAN** —— 0 critical / 0 high / 0 medium / 0 low（19 条 INFO） |
+| 注入 root 痕迹（`/system/xbin/su`、`/system/bin/ksud`、`/data/adb/magisk`） | `artefact-present` + `artefact-listing` = **HIGH**，verdict: ROOT_DETECTED（exit 2） |
+| `tmpfs` 覆盖 `/system` | `mount-overlay` = **HIGH** |
+| bind-mount 伪造 `/proc/version`（复刻 SuSFS uname 层：syscall 被改而 `/proc` 保持真值） | `spoof-uname` = **CRITICAL**，verdict: HIDING_DETECTED |
+| bind-mount 伪造 `/proc/1/mountinfo`（只改掉四个挂载视图中的一个） | `mount-view-inconsistency` = **CRITICAL**（`/proc/mounts` 33 条 vs `/proc/1/mountinfo` 1 条），verdict: HIDING_DETECTED |
 
-The last two are the key ones: they prove that **the positive path of the adversarial detection really can be triggered on a real kernel**, not merely that it "should work by design". Full record in [out/wsl-fixtures-report.txt](out/wsl-fixtures-report.txt).
+后两项是关键：它们证明**对抗检测器的正阳性路径在真实内核上确实能被触发**，而不只是"设计上应该能行"。完整记录见 [out/wsl-fixtures-report.txt](out/wsl-fixtures-report.txt)。
 
-### 11.2 Bugs caught by real execution (all fixed)
+### 11.2 真实执行抓出来的 bug（均已修复）
 
-| # | Problem | Consequence | Fix |
+| # | 问题 | 后果 | 修复 |
 |---|---|---|---|
-| 1 | `/proc/self/mountstats` uses a sentence format (`device X mounted on Y with fstype Z`), but I took the mount point from field 3, which yielded the literal `on` | a clean system suddenly gained 31 mount points → **false-positive CRITICAL / HIDING_DETECTED** | field index changed to 4, plus a `--selftest` regression guard that "all four mount views must agree" |
-| 2 | `--selftest` hardcoded Android-only paths (`/system/bin/sh`) and `getprop` | the self-test necessarily FAILs on any Linux | switched to `/proc/version`; Android-only items became SKIP |
-| 3 | with no `CONFIG_KALLSYMS_ALL` in the kernel, `sys_call_table` cannot be resolved and the code was **completely silent** | users would assume "the strongest check already ran" | print `kernel-syscall-table-skipped` with the reason |
+| 1 | `/proc/self/mountstats` 是句子式格式（`device X mounted on Y with fstype Z`），我却按第 3 列取挂载点，取到的是字面量 `on` | 干净系统凭空多出 31 个挂载点 → **误报 CRITICAL / HIDING_DETECTED** | 字段索引改为 4，并在 `--selftest` 增加"四个挂载视图必须一致"的回归守卫 |
+| 2 | `--selftest` 硬编码了 Android 专属路径（`/system/bin/sh`）和 `getprop` | 在任何 Linux 上自检必然 FAIL | 改用 `/proc/version`；Android 专属项改为 SKIP |
+| 3 | 内核未开 `CONFIG_KALLSYMS_ALL` 时 `sys_call_table` 解析不到，代码**完全静默** | 使用者会误以为"最强检查已经跑过" | 输出 `kernel-syscall-table-skipped` 并说明原因 |
 
-Item 1 above is especially telling: it was found by **execution validation** (not code review), and it happens to be the one mistake this class of tool must never make — declaring a clean device hidden.
+第 1 条尤其说明问题：它是**执行验证**（而非代码审查）发现的，而且恰好是这类工具最不能犯的错误——把干净设备判成隐藏。
 
-### 11.3 The APK (`out/bunanana.apk`)
+### 11.3 APK（`out/bunanana.apk`）
 
-App name **bunanana**, icon `apk/icon-source.jpg` (a full set of multi-density resources generated by `apk/make-icons.py`); the detection engine is still called `rootdetect`, shown as a subtitle in the main screen, and the CLI product names are unchanged (`rootdetect-{arm64,arm,x86_64}`).
+应用名 **bunanana**，图标是 `apk/icon-source.jpg`（由 `apk/make-icons.py` 生成全套多密度资源）；检测引擎仍叫 `rootdetect`，在主界面里作为副标题标注，CLI 产物名也不变（`rootdetect-{arm64,arm,x86_64}`）。
 
 ```powershell
-python3 apk/make-icons.py        # only needed after changing the image (WSL / any environment with Pillow)
-powershell -ExecutionPolicy Bypass -File build/build-apk.ps1   # produces out/bunanana.apk
+python3 apk/make-icons.py        # 只在换了图之后需要（WSL/任意有 Pillow 的环境）
+powershell -ExecutionPolicy Bypass -File build/build-apk.ps1   # 产出 out/bunanana.apk
 ```
 
-No Gradle / Android Studio needed: `aapt2 compile res` → `aapt2 link` (manifest + compiled resources) → `javac` → `d8` → assemble the zip (using python3 in WSL, because this machine has no zip tool) → `zipalign` → `apksigner` (the debug keystore is generated on the spot by keytool and **kept persistently** in `build/debug.keystore`). The required JDK is a portable Temurin 17 (`vendor/jdk`).
+不需要 Gradle / Android Studio：`aapt2 compile res` → `aapt2 link`（manifest + 编译好的资源）→ `javac` → `d8` → 组装 zip（用 WSL 里的 python3，因为本机没有 zip 工具）→ `zipalign` → `apksigner`（debug keystore 由 keytool 现场生成并**持久保留**在 `build/debug.keystore`）。所需 JDK 是便携版 Temurin 17（`vendor/jdk`）。
 
-APK contents (verified item by item):
+APK 内容（已逐项核验）：
 
-| Entry | Description |
+| 条目 | 说明 |
 |---|---|
-| `classes.dex` | `com.rootdetect.app.MainActivity` (the dex string table was confirmed to contain the class name) |
-| `res/mipmap-*/ic_launcher.png` | 48/72/96/144/192 px legacy icons |
-| `res/mipmap-*/ic_launcher_foreground.png` | 108/162/216/324/432 px adaptive-icon foreground (circular mask, background colour `#D3C9C6` sampled from the source image's edge) |
-| `res/mipmap-anydpi-v26/ic_launcher.xml` | adaptive icon declaration |
-| `lib/arm64-v8a/librootdetect.so` | this is `out/rootdetect-arm64`, and its sha256 **matches item by item** |
-| `lib/armeabi-v7a/librootdetect.so` | `out/rootdetect-arm`, same as above |
-| `lib/x86_64/librootdetect.so` | `out/rootdetect-x86_64`, same as above |
-| Signature | signed with both v1+v2, `zipalign -c` passes; `aapt2 dump badging` shows `application-label:'bunanana'`, `application-icon-*: res/mipmap-anydpi-v26/ic_launcher.xml` |
+| `classes.dex` | `com.rootdetect.app.MainActivity`（dex 字符串表已确认含类名） |
+| `res/mipmap-*/ic_launcher.png` | 48/72/96/144/192 px 传统图标 |
+| `res/mipmap-*/ic_launcher_foreground.png` | 108/162/216/324/432 px 自适应图标前景（圆形遮罩，背景色 `#D3C9C6` 从原图边缘采样） |
+| `res/mipmap-anydpi-v26/ic_launcher.xml` | 自适应图标声明 |
+| `lib/arm64-v8a/librootdetect.so` | 就是 `out/rootdetect-arm64`，sha256 **逐一比对一致** |
+| `lib/armeabi-v7a/librootdetect.so` | `out/rootdetect-arm`，同上 |
+| `lib/x86_64/librootdetect.so` | `out/rootdetect-x86_64`，同上 |
+| 签名 | v1+v2 均已签名，`zipalign -c` 通过；`aapt2 dump badging` 显示 `application-label:'bunanana'`、`application-icon-*: res/mipmap-anydpi-v26/ic_launcher.xml` |
 
-Product (verified):
+产物（已核验）：
 
-- Product: `out/bunanana.apk`, **7,218,732 bytes**, `sha256=c78d49584ddca3719b82dad0be7fc56fd4f806dfe08c21eac39d2089f2cec59b`
-- Direct download: https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
+- 产物：`out/bunanana.apk`，**7,218,732 字节**，`sha256=c78d49584ddca3719b82dad0be7fc56fd4f806dfe08c21eac39d2089f2cec59b`
+- 下载直链：https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
 
-Design points:
+设计要点：
 
-* **No resource files at all**; the UI is built entirely in code, so `aapt2 + javac + d8` is all a build needs.
-* The static executable ships as `lib/<abi>/librootdetect.so` and is extracted into the app's native library directory on install (that directory is executable); the Activity runs it with `ProcessBuilder` and displays its output.
-* `targetSdkVersion=28` is deliberate: Android 10+ forbids apps with targetSdk≥29 from `exec`ing out of their own data directory, and this tool needs to run native code on the device without root; should an OEM also block the native library directory, it degrades to "copy into `filesDir` and execute", and if that fails too it shows the adb command line.
-* **Installation was field-tested on an emulator**: `adb install` succeeded → the Activity displayed normally → pressing "RUN DETECTION" successfully executed the bundled static scanner and rendered the full report in the UI (screenshots: [apk-screenshot.png](out/apk-screenshot.png), [apk-screenshot-after.png](out/apk-screenshot-after.png)). No `avc: denied` blocked execution in the app domain (`untrusted_app_27`); the only things SELinux blocked were `stat` on `/sys/fs/selinux/enforce`, `/proc/sys/kernel/tainted` and `/system/xbin/su` (type `su_exec`), and the tool honestly degrades those to INFO and does **not** misjudge "some interfaces blocked" as hiding — probes rejected by SELinux do not take part in the vote.
-* Two build-pipeline pitfalls (both of which turn "looks fixed" into a lie): ① `build/apk-work` is wiped on every build, which used to delete the debug keystore along with it, so the regenerated key made the new package **unable to overwrite-install**, and `adb install` failed silently while the old version kept running (the keystore now lives persistently in `build/debug.keystore`, and the install script has an "uninstall first if the signature differs" fallback); ② the test script matched the button text in lowercase, while Android's `Button` uppercases its label.
+* **没有任何资源文件**，UI 全部用代码搭建，所以只需要 `aapt2 + javac + d8` 就能构建。
+* 静态可执行文件以 `lib/<abi>/librootdetect.so` 随包分发，安装时被解压到应用的 native library 目录（该目录可执行），Activity 用 `ProcessBuilder` 运行它并把输出显示出来。
+* `targetSdkVersion=28` 是刻意的：Android 10+ 对 targetSdk≥29 的应用禁止从自身数据目录 `exec`，而本工具需要在无 root 的情况下运行设备上的原生代码；万一 native lib 目录也被 OEM 拦截，会退化成"复制到 `filesDir` 再执行"，仍失败则显示 adb 命令行用法。
+* **结论区与日志导出**：报告顶部新增一块结论横幅——直接给出"是否 root / 是否存在隐藏"以及风险计数，并列出每条 MEDIUM 及以上问题**出现在哪些具体路径**（从证据行里解析出的绝对路径，例如 `package-hidden -> /data/data/com.topjohnwu.magisk`）；`Export log` 按钮把整份日志（设备头 + 结论 + 完整报告）写到应用外部目录 `Android/data/com.rootdetect.app/files/bunanana-report-<时间戳>.txt`，然后打开系统分享面板（纯文本分享，不需要任何存储权限；外部目录不可用时退回应用私有目录）。
+* **已在模拟器上完成装机实测**：`adb install` 成功 → Activity 正常显示 → 按下 "RUN DETECTION" → 包内的静态扫描器被成功执行并在界面渲染出完整报告（截图：[apk-screenshot.png](out/apk-screenshot.png)、[apk-screenshot-after.png](out/apk-screenshot-after.png)）。应用域（`untrusted_app_27`）里没有任何 `avc: denied` 阻断执行；唯一被 SELinux 挡住的是 `/sys/fs/selinux/enforce`、`/proc/sys/kernel/tainted` 和 `/system/xbin/su` 的 `stat`（`su_exec` 类型），工具对此如实降级成 INFO，并且**没有**因为"部分接口被挡住"而误判成隐藏——被 SELinux 拒绝的探针不参与投票。
+* 构建流水线的两个坑（都会让"看起来已经修好了"变成假的）：① `build/apk-work` 每次构建被清空，连带删掉 debug keystore，重新生成的密钥让新包**无法覆盖安装**、`adb install` 静默失败并继续跑旧版本（keystore 现已移到持久的 `build/debug.keystore`，安装脚本也加了"签名不符先卸载"的兜底）；② 测试脚本按小写匹配按钮文字，而 Android 的 `Button` 会把标签转成大写。
 
 ---
 
-## 11.4 Real Android emulator field test (WSL + KVM)
+## 11.4 真 Android 模拟器实测（WSL + KVM）
 
-The conclusion of §6 **has been superseded by this section**: the Windows-side SDK emulator still cannot start, but **WSL2 has `/dev/kvm`** (`nested=Y`, vmx exposed), so the **Linux emulator + the same AOSP x86_64 image** were installed inside WSL and actually booted under KVM:
+§6 的结论**已被本节取代**：Windows 侧的 SDK 模拟器依然起不来，但 **WSL2 里存在 `/dev/kvm`**（`nested=Y`，vmx 已暴露），于是把 **Linux 版模拟器 + 同一份 AOSP x86_64 镜像**装进 WSL，用 KVM 真正跑起来了：
 
 ```
-INFO | Boot completed in 32689 ms                      <- 33-second boot (KVM accelerated)
+INFO | Boot completed in 32689 ms                      <- 33 秒开机（KVM 加速）
 $ adb devices -l
 emulator-5554  device product:sdk_phone_x86_64 model:Android_SDK_built_for_x86_64 device:generic_x86_64
 $ adb shell getprop sys.boot_completed ; getprop ro.build.version.release ; getprop ro.build.type
 1  ;  11  ;  userdebug
 ```
 
-Reproduction commands (already scripted):
+复现命令（脚本已固化）：
 
 ```bash
-wsl -u root -e bash scripts/wsl-emulator.sh setup   # extract + copy the image (Linux emulator)
-wsl -u root -e bash scripts/wsl-emulator.sh avd     # create the AVD
+wsl -u root -e bash scripts/wsl-emulator.sh setup   # 解压 + 复制镜像（Linux 版模拟器）
+wsl -u root -e bash scripts/wsl-emulator.sh avd     # 建 AVD
 wsl -u root -e bash scripts/wsl-emulator.sh boot    # -accel on -no-window -gpu off
-wsl -u root -e bash scripts/wsl-android-verify.sh   # push + full verification
+wsl -u root -e bash scripts/wsl-android-verify.sh   # 推送 + 全量验证
 ```
 
-| Scenario | Measured result |
+| 场景 | 实测结果 |
 |---|---|
-| `--selftest` (real Android, shell identity) | **77 checks, 0 failure(s), 2 skipped** (as the `shell` user - `/proc/sys/kernel/osrelease` and `version` are unreadable to that domain; as uid 0 the same build reports 0 skips and the same 77 checks) |
-| clean emulator baseline (`shell` view) | verdict **ROOT_DETECTED**, exactly 3 HIGH: `ro.debuggable=1`, `service.adb.root=1`, SELinux domain `su`; plus 3 MEDIUM (userdebug build, the `/system/xbin/su` that ships with userdebug, OE taint). **All true positives** — a userdebug image + `adb root` is root-equivalent in itself, and there is no spoofed CRITICAL |
-| injecting `/data/data/com.topjohnwu.magisk` (not in the package manager list) | `package-hidden` = **CRITICAL** (the deterministic signature of KernelSU's "hidden app") |
-| injecting `/data/adb/magisk`, `/data/local/tmp/su` | `artefact-present` + `artefact-listing` = **HIGH**, verdict **HIDING_DETECTED** |
+| `--selftest`（真 Android，shell 身份） | **77 checks, 0 failure(s), 2 skipped**（以 `shell` 身份运行时，缺的 2 项是 `/proc/sys/kernel/osrelease` 与 `version` 不可读；以 uid 0 运行时 0 skipped，检查数同为 77） |
+| 干净模拟器基线（`shell` 视角） | verdict **ROOT_DETECTED**，恰好 3 条 HIGH：`ro.debuggable=1`、`service.adb.root=1`、SELinux 域为 `su`；另有 3 条 MEDIUM（userdebug 构建、userdebug 自带的 `/system/xbin/su`、OE taint）。**全部为真阳性**——userdebug 镜像 + `adb root` 本身就是 root 等价权限，不含任何伪造的 CRITICAL |
+| 注入 `/data/data/com.topjohnwu.magisk`（不在包管理器列表中） | `package-hidden` = **CRITICAL**（KernelSU「隐藏应用」的确定性特征） |
+| 注入 `/data/adb/magisk`、`/data/local/tmp/su` | `artefact-present` + `artefact-listing` = **HIGH**，verdict **HIDING_DETECTED** |
 
-## 11.5 False positives caught by real execution and fixed (10 in total)
+## 11.5 真实执行抓出并修掉的误报（共 10 处）
 
-| Environment | Problem | Fix |
+| 环境 | 问题 | 修复 |
 |---|---|---|
-| WSL | `/proc/self/mountstats` field index error → 31 phantom mount points, **false-positive CRITICAL** | index changed to 4, plus a self-test regression guard |
-| WSL | the self-test hardcoded Android paths and `getprop` → necessarily FAILs on Linux | switched to `/proc/version`; Android-only items became SKIP |
-| WSL | silent when `sys_call_table` cannot be resolved | print `kernel-syscall-table-skipped` with the reason |
-| Android | `stat` can see a path but `open` is denied by SELinux, which was taken as an open-redirect → **false-positive CRITICAL** | only a dev/ino mismatch counts as a redirect |
-| Android | the `ro.secure` / `ro.debuggable` comparison was inverted → **false-positive HIGH** | the table now distinguishes `CMP_EQUAL` / `CMP_NOT_EQUAL` explicitly |
-| Android | `/debug_ramdisk` is a standard directory on Android 11+ | removed from the corpus |
-| Android | `/system/xbin/su` is a build artefact on userdebug | userdebug + `/system/*` downgraded to MEDIUM |
-| Android | `kernel-taint-oe` was rated too high (measured `tainted=4096`, caused by a vendor module) | downgraded to MEDIUM with an explanation |
-| Android | `kernel-module-hidden` treated the kernel pseudo-module `bpf` as a hidden module → **false-positive HIGH** | the allow-list skips `bpf` |
-| Android | `spoof-cmdline` reported HIGH because 3/10 properties never came from cmdline in the first place | switched to a majority rule (report only above 50%) |
+| WSL | `/proc/self/mountstats` 字段索引错 → 凭空多出 31 个挂载点，**CRITICAL 误报** | 索引改为 4，并加自检回归守卫 |
+| WSL | 自检硬编码 Android 路径与 `getprop` → Linux 上必然 FAIL | 改用 `/proc/version`；Android 专属项改 SKIP |
+| WSL | `sys_call_table` 解析不到时**静默** | 输出 `kernel-syscall-table-skipped` 说明原因 |
+| Android | `stat` 可见但 `open` 被 SELinux 拒绝，被当成 open-redirect → **CRITICAL 误报** | 只有 dev/ino 不一致才算重定向 |
+| Android | `ro.secure` / `ro.debuggable` 比较方向写反 → **HIGH 误报** | 表中显式区分 `CMP_EQUAL` / `CMP_NOT_EQUAL` |
+| Android | `/debug_ramdisk` 在 Android 11+ 是标准目录 | 从语料中移除 |
+| Android | `/system/xbin/su` 在 userdebug 上属构建产物 | userdebug + `/system/*` 降为 MEDIUM |
+| Android | `kernel-taint-oe` 定级过高（实测 `tainted=4096` 由厂商模块造成） | 降为 MEDIUM 并说明 |
+| Android | `kernel-module-hidden` 把内核伪模块 `bpf` 当成被隐藏模块 → **HIGH 误报** | 允许列表跳过 `bpf` |
+| Android | `spoof-cmdline` 因 3/10 个属性本就不来自 cmdline 而报 HIGH | 改为多数规则（>50% 才报） |
 
-This table is the best proof of "why you must actually run it": **4 of these would have declared a clean device HIDING_DETECTED**, and all of them were found by execution validation (not code review).
+这张表是"为什么必须真跑一遍"最好的证明：其中 **4 处会直接把干净设备判成 HIDING_DETECTED**，而它们全部是执行验证（而非代码审查）发现的。
 
 ---
 
-## 11.6 Parallel hardening (Agent Teams) and final acceptance
+## 11.6 并行加固（Agent Teams）与最终验收
 
-This round split three non-overlapping workstreams across three teammates, each committing its evidence to a file:
+这一轮把三块互不重叠的工作并行派给三个队友，各自把证据落成文件：
 
-| Role | Task | Result |
+| 角色 | 任务 | 结果 |
 |---|---|---|
-| **t-abi** | field verification of the cross-ABI diff | added the `i686-linux-android` target → `out/rootdetect-x86` (ELF32 / EM_386 / static). The 32-bit helper **really does execute** on an API 30 x86_64 emulator (the device has `abilist32=x86`, `zygote64_32` and `/system/bin/linker`; `--selftest` → 76 checks / 0 failures / 2 skipped). Official result: `[INFO] abi-consistency — both ABIs agree on every probed path`, **compared 92 paths between x86_64 and /data/local/tmp/rootdetect-x86 (x86)**. Also a negative control (swapping in a same-ABI helper → `abi-diff-skipped`), a same-snapshot comparison (a build in another directory was **byte-for-byte identical**), and a `-Abi x86_64,arm64,arm` regression (0 warnings, existing products' mtimes unchanged). Evidence: [abi-diff-report.txt](out/abi-diff-report.txt), [wsl-abi-diff.sh](scripts/wsl-abi-diff.sh) |
-| **t-selftest** | hardening the `--selftest` parser boundaries | added 39 cases (voting combinations, JSON escaping boundaries, trim/appendf sentinel bytes, mount parsing including `\040` escapes, **mount checks end to end**, kernel lists end to end), **75 checks / 0 failures / 6 skipped** on WSL. Mutation testing proves the new cases catch the old field-index bug (changing `field` to `{1,3,3,3}` → the new cases FAIL while the old guard still PASSes) — closing a real blind spot. Output: [selftest-final.txt](build/t2-out/selftest-final.txt) |
-| **t-review** | red-team review | [detection-review.md](review/detection-review.md) (460 lines): a 15-layer coverage matrix (4 layers not covered at all, 5 partially), stock/custom-ROM false-positive tables + the **unprivileged poisoning surface**, 3 implementation drafts, **15 source-code bugs** (each with `file:line` + a minimal reproduction), and a separate list of what README §11.5 already fixed so they are not double-counted |
+| **t-abi** | 跨 ABI 差分真机验证 | 新增 `i686-linux-android` 目标 → `out/rootdetect-x86`（ELF32 / EM_386 / 静态）。32 位助手在 API 30 x86_64 模拟器上**确实可执行**（设备 `abilist32=x86`、`zygote64_32`、`/system/bin/linker` 都在；`--selftest` → 76 checks / 0 failures / 2 skipped）。正式结果：`[INFO] abi-consistency — both ABIs agree on every probed path`，**compared 92 paths between x86_64 and /data/local/tmp/rootdetect-x86 (x86)**。另做了负控（换同 ABI 助手 → `abi-diff-skipped`）、同快照对照（另一目录构建**逐字节相同**）、以及 `-Abi x86_64,arm64,arm` 回归（0 warning、既有产物 mtime 未变）。证据：[abi-diff-report.txt](out/abi-diff-report.txt)、[wsl-abi-diff.sh](scripts/wsl-abi-diff.sh) |
+| **t-selftest** | `--selftest` 解析器边界加固 | 新增 39 项用例（投票组合、JSON 转义边界、trim/appendf 哨兵字节、挂载解析含 `\040` 转义、**挂载检查端到端**、内核列表端到端），WSL 上 **75 checks / 0 failures / 6 skipped**。并用**变异测试**证明新用例能抓到旧的字段索引错误（把 `field` 改成 `{1,3,3,3}` → 新用例 FAIL，而旧守卫仍 PASS）——补掉了一个真实盲区。输出：[selftest-final.txt](build/t2-out/selftest-final.txt) |
+| **t-review** | 红队审查 | [detection-review.md](review/detection-review.md)（460 行）：15 层覆盖矩阵（4 层完全没覆盖、5 层部分）、stock/定制 ROM 误报表 + **非特权方投毒面**、3 份实现草案、**15 条源码 bug**（每条 `file:line` + 最小复现），并单列了 README §11.5 已修复项以免重复计数 |
 
-### Red-team case #1: reproduced on a real device and fixed
+### 红队 #1：在真机上复现并修复
 
 ```
-Before: adb shell 'ln -sf /nonexistent /data/local/tmp/su; /data/local/rx/rx -q'
+修复前：adb shell 'ln -sf /nonexistent /data/local/tmp/su; /data/local/rx/rx -q'
         [CRITICAL] path-consistency-mismatch ...  →  HIDING_DETECTED (exit 3)
-After:  ROOT_DETECTED (exit 2) + [MEDIUM] artefact-dangling-symlink
+修复后：ROOT_DETECTED (exit 2) + [MEDIUM] artefact-dangling-symlink
 ```
 
-Root cause: the voting engine threw `fstatat(AT_SYMLINK_NOFOLLOW)` / `statx(NOFOLLOW)` and the following-semantics `stat/access/open` into **the same vote bucket**, so **any dangling symlink looked like "the kstat layer only patched some interfaces"**; and `/data/local/tmp/su` is in the corpus while that directory is writable by `shell` — effectively handing unprivileged processes a poisoning switch.
+根因：投票引擎把 `fstatat(AT_SYMLINK_NOFOLLOW)` / `statx(NOFOLLOW)` 与跟随语义的 `stat/access/open` 扔进**同一个票箱**，于是**任何悬空符号链接都长得像"kstat 层只改了部分接口"**；而 `/data/local/tmp/su` 就在语料里、该目录 `shell` 可写——等于给了非特权进程一个投毒开关。
 
-### 16 code changes applied this round (the table below groups them into 12 issues)
+### 本轮应用的 16 处代码修正（下表按问题归为 12 类）
 
-Every replacement is forced to match **exactly once** (to avoid silent mis-edits), and after a zero-warning rebuild of all four ABIs it was re-verified on a real device:
+每处替换都强制校验"恰好命中一次"（避免静默误改），四个 ABI 零警告重建后在真机复验：
 
-| Fix | How it was verified / consequence |
+| 修复 | 验证方式 / 后果 |
 |---|---|
-| B1 dangling symlinks no longer rate CRITICAL (including the control path `/sdcard`) | real-device reproduction command, after the fix exit 2 + MEDIUM (see above) |
-| B2 32-bit builds no longer index the native `sys_call_table` incorrectly | a new `sizeof(void*)!=8` branch reports INFO on its own; otherwise a 32-bit run as root would fake a `kernel-syscall-table-patched` CRITICAL |
-| B3 map paths containing spaces are no longer truncated | previously any mapped file with a space in its path would blow up `map-backing-hidden` CRITICAL |
-| B4 `spoof-cmdline` tolerates `/proc/bootconfig` | on Android 12+/GKI androidboot.* lives only in bootconfig → on a real device `spoof-cmdline` is back to INFO "agree" |
-| B5 the `gadget` keyword in `inj[]` was matching the USB gadget HAL by mistake | changed to `frida-gadget` / `gum-js-loop` |
-| B6 `mount-overlay` requires the mount point to really be the system partition | overlayfs's device name is always `overlay`, so arbitrary overlay mounts no longer match |
-| B8 the process scan now really reads all of argv | the old loop stopped at the first NUL (it only ever saw argv[0]), so `ksud`/`zygiskd` in argv[1..] were invisible |
-| B10 out-of-bounds write on OOM in `find_push` | `cap` is only advanced after a successful `realloc` |
-| B11 `deep-dmesg` no longer treats `busybox` as a framework | consistent with the other keyword scans |
-| B12 the ABI diff no longer counts `blocked(-1)` as a difference | unified with the voting engine's rule (otherwise a SELinux denial masquerades as an ABI divergence) |
-| B15 the userdebug downgrade now also covers `/sbin/`, `/vendor/bin/su` | previously it matched only `/system/` |
-| UB reported by t-selftest: `rd_row_inconsistent(.., NULL, 0)` | early return; the original pointer arithmetic was `cons_out + SIZE_MAX` |
+| B1 悬空符号链接不再判 CRITICAL（含控制路径 `/sdcard`） | 真机复现命令，修复后 exit 2 + MEDIUM（见上） |
+| B2 32 位构建不再错误索引 native `sys_call_table` | 新增 `sizeof(void*)!=8` 分支单独报 INFO；否则 32 位以 root 运行会伪造 `kernel-syscall-table-patched` CRITICAL |
+| B3 maps 路径含空格不再被截断 | 之前任何含空格的映射文件都会自爆 `map-backing-hidden` CRITICAL |
+| B4 `spoof-cmdline` 兼容 `/proc/bootconfig` | Android 12+/GKI 上 androidboot.* 只在 bootconfig → 真机 `spoof-cmdline` 回到 INFO "agree" |
+| B5 `inj[]` 的 `gadget` 误命中 USB gadget HAL | 改为 `frida-gadget` / `gum-js-loop` |
+| B6 `mount-overlay` 要求挂载点确为 system 分区 | overlayfs 的设备名恒为 `overlay`，不再命中任意 overlay 挂载 |
+| B8 进程扫描真正读取全部 argv | 原循环在第一个 NUL 处停止（只看得到 argv[0]），`ksud`/`zygiskd` 在 argv[1..] 时不可见 |
+| B10 `find_push` 的 OOM 越界写 | `cap` 仅在 `realloc` 成功后推进 |
+| B11 `deep-dmesg` 不再把 `busybox` 当框架 | 与其它关键字扫描一致 |
+| B12 ABI 差分不再把 `blocked(-1)` 当差异 | 与投票引擎规则统一（否则 SELinux 拒绝会伪装成 ABI 分歧） |
+| B15 userdebug 降级覆盖 `/sbin/`、`/vendor/bin/su` | 之前只匹配 `/system/` |
+| t-selftest 报告的 UB：`rd_row_inconsistent(.., NULL, 0)` | 提前返回；原指针运算为 `cons_out + SIZE_MAX` |
 
-### Final acceptance (one command)
+### 最终验收（一条命令）
 
 ```bash
 wsl -u root -e bash android-rootdetect/scripts/verify-all.sh
 ```
 
-Most recent run: **PASS=18 FAIL=0 SKIP=0** (Linux real-kernel self-test + clean baseline; emulator self-test + shell/root dual view; injected fixtures hitting `package-hidden` CRITICAL; cross-ABI diff; APK structure and three-ABI binary hashes). Raw output is in `/tmp/verify-all/`.
+最近一次：**PASS=18 FAIL=0 SKIP=0**（Linux 真内核自检 + 干净基线；模拟器自检 + shell/root 双视角；注入 fixtures 命中 `package-hidden` CRITICAL；跨 ABI 差分；APK 结构与三 ABI 二进制哈希）。原始输出在 `/tmp/verify-all/`。
 
-> This machine has no PowerShell 7 (`pwsh`), so all `.ps1` files must be invoked as `powershell -ExecutionPolicy Bypass -File` — the examples in this README were corrected accordingly (a documentation problem found by t-abi).
+> 本机没有 PowerShell 7（`pwsh`），所有 `.ps1` 请用 `powershell -ExecutionPolicy Bypass -File` 调用——README 里的示例已按此修正（这是 t-abi 发现的文档问题）。
