@@ -149,7 +149,7 @@ adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 
 ```
 $ adb shell /data/local/rx/rx --selftest
-rootdetect 1.0.0 self-test   uid=2000
+rootdetect 1.0.1 self-test   uid=2000
 -- decision logic --
   PASS  keyword: magisk package name
   ...
@@ -383,7 +383,7 @@ APK 内容（已逐项核验）：
 
 产物（已核验）：
 
-- 产物：`out/bunanana.apk`，**7,218,732 字节**，`sha256=c78d49584ddca3719b82dad0be7fc56fd4f806dfe08c21eac39d2089f2cec59b`
+- 产物：`out/bunanana.apk`，**2,885,164 字节**，`sha256=8318e0348d12ba509ac8204b67e13a4809a7edbd55f7789ece668d60b8545998`
 - 下载直链：https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
 
 设计要点：
