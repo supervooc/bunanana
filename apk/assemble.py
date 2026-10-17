@@ -25,7 +25,11 @@ def main():
             for info in b.infolist():
                 z.writestr(info, b.read(info.filename))
         for spec in entries:
+            if "=" not in spec:
+                raise SystemExit("bad entry (want ARCNAME=PATH): " + spec)
             arc, path = spec.split("=", 1)
+            if not arc or arc.startswith("/") or "\\" in arc or ":" in arc:
+                raise SystemExit("bad archive name: " + arc)
             if not os.path.exists(path):
                 raise SystemExit("missing input: " + path)
             z.write(path, arc)

@@ -65,6 +65,7 @@ public class MainActivity extends Activity {
 
     /** Full text of the last scan (header + summary + raw report): what we export. */
     private String lastLog = "";
+    private static final String STATE_LOG = "lastLog";
 
     /* The scanner's finding header line looks like
      *   [HIGH    ] artefact-present       root artefacts present on the filesystem
@@ -153,6 +154,28 @@ public class MainActivity extends Activity {
         summary.setText("Result: not scanned yet\nPress \"Run detection\" to check this device.");
         output.setText(header() + "\nPress \"Run detection\" to scan this device.\n\n"
                 + "Exit codes: 0 clean | 1 suspicious | 2 root detected | 3 hiding detected\n");
+
+        /* A rotation (or any configuration change) recreates the Activity. Without
+         * this the report and the export button were lost and the user had to
+         * rescan just to export. */
+        if (savedInstanceState != null) {
+            String saved = savedInstanceState.getString(STATE_LOG);
+            if (saved != null && !saved.isEmpty()) {
+                lastLog = saved;
+                String verdict = verdictOf(saved);
+                summary.setText(buildSummary(verdict, parseFindings(saved)));
+                summary.setBackgroundColor(colorFor(verdict));
+                output.setText(saved);
+                runButton.setText("Run detection again");
+                exportButton.setEnabled(true);
+            }
+        }
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putString(STATE_LOG, lastLog);
     }
 
     private String header() {
@@ -246,9 +269,13 @@ public class MainActivity extends Activity {
             pb.redirectErrorStream(true);
             p = pb.start();
             BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line;
-            while ((line = r.readLine()) != null) {
-                sb.append(line).append('\n');
+            try {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    sb.append(line).append('\n');
+                }
+            } finally {
+                r.close();
             }
             int rc = p.waitFor();
             sb.append("\n[exit code ").append(rc).append("] ");
@@ -328,6 +355,17 @@ public class MainActivity extends Activity {
 
     /** The banner text: verdict + root/hiding booleans + where the problems are. */
     private static String buildSummary(String verdict, List<Finding> findings) {
+        if ("SCAN_ERROR".equals(verdict)) {
+            /* No "verdict:" line: the scanner could not be staged or it refused
+             * to run. That is not a clean device, so the clean banner must not
+             * be printed - on a security tool it is the worst possible false
+             * negative. */
+            return "Result        : SCAN_ERROR\n"
+                    + "Device rooted : unknown\n"
+                    + "Root hiding   : unknown\n"
+                    + "The scanner produced no verdict (it could not be staged or executed).\n"
+                    + "See the log below and the manual instructions.\n";
+        }
         boolean rooted = "ROOT_DETECTED".equals(verdict) || "HIDING_DETECTED".equals(verdict);
         boolean hiding = "HIDING_DETECTED".equals(verdict);
         String rootText = rooted ? "YES" : ("SUSPICIOUS".equals(verdict) ? "maybe" : "no");
@@ -422,9 +460,12 @@ public class MainActivity extends Activity {
     private String fallbackInstructions() {
         return "\nThis build could not run the bundled scanner in-process. The same\n"
                 + "binary is also shipped as a plain command line tool:\n\n"
-                + "  adb push out/rootdetect-arm64 /data/local/tmp/rx\n"
-                + "  adb shell chmod 755 /data/local/tmp/rx\n"
-                + "  adb shell /data/local/tmp/rx -v        # shell view\n"
-                + "  adb root && adb shell /data/local/tmp/rx -v   # deep kernel view\n";
+                + "  adb push out/rootdetect-arm64 /data/local/rx\n"
+                + "  adb shell chmod 700 /data/local/rx\n"
+                + "  adb shell /data/local/rx -v        # shell view\n"
+                + "  adb root && adb shell /data/local/rx -v   # deep kernel view\n"
+                + "\n(/data/local, not /data/local/tmp: the latter is group- and\n"
+                + "other-writable by the `shell` user, so a root-run binary there can be\n"
+                + "swapped out between the push and the exec.)\n";
     }
 }
