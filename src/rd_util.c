@@ -45,6 +45,10 @@ void rd_report_init(rd_report *r) {
   memset(r, 0, sizeof(*r));
   r->cap = 16;
   r->items = (rd_finding *)calloc(r->cap, sizeof(rd_finding));
+  /* If the initial calloc fails, leaving cap=16 with items==NULL makes the first
+   * find_push() skip its grow branch (0 < 16) and dereference items[0]. cap=0
+   * forces it onto the realloc path instead. */
+  if (!r->items) r->cap = 0;
 }
 
 void rd_report_free(rd_report *r) {
@@ -70,11 +74,20 @@ static rd_finding *find_push(rd_report *r, rd_sev sev, const char *id, const cha
     r->items = ni;
     r->cap = ncap;
   }
-  rd_finding *f = &r->items[r->n++];
+  rd_finding *f = &r->items[r->n];
   memset(f, 0, sizeof(*f));
-  f->sev = sev;
   f->id = xstrdup(id ? id : "unnamed");
   f->title = xstrdup(title ? title : "");
+  if (!f->id || !f->title) {
+    /* OOM: drop the finding rather than publish NULLs that rd_json_escape(),
+     * the text printer and rd_report_free() would all dereference. */
+    free(f->id);
+    free(f->title);
+    memset(f, 0, sizeof(*f));
+    return NULL;
+  }
+  f->sev = sev;
+  r->n++;
   r->counts[sev]++;
   return f;
 }
@@ -500,8 +513,15 @@ static void props_push(rd_props *p, const char *k, const char *v) {
     p->vals = nv;
     p->cap = ncap;
   }
-  p->keys[p->n] = xstrdup(k);
-  p->vals[p->n] = xstrdup(v);
+  char *nk = xstrdup(k), *nv = xstrdup(v);
+  if (!nk || !nv) {
+    /* OOM: a NULL key would reach rd_prop()'s strcmp(p->keys[i], key). */
+    free(nk);
+    free(nv);
+    return;
+  }
+  p->keys[p->n] = nk;
+  p->vals[p->n] = nv;
   p->n++;
 }
 
