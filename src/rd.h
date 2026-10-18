@@ -144,6 +144,24 @@ int rd_probe_open_o_path(const char *path);
 int rd_probe_open_read(const char *path);
 int rd_probe_opendir(const char *path); /* getdents64 */
 int rd_probe_readlink(const char *path);
+/* Existence probes whose answer comes from a syscall class the discrete hook
+ * sets of SuSFS-lineage hiders do NOT cover - the basis of the
+ * syscall-coverage oracle (rd_susfs_lkm_oracle_tell below). Same 0/1/-1
+ * convention as the probes above.
+ *   mkdir(2):  EEXIST is produced by the filename_create() lookup, before any
+ *     permission or LSM decision runs, so no LSM hook can suppress it. The
+ *     probe never creates anything: it refuses when the parent is writable by
+ *     this caller (root with CAP_DAC_OVERRIDE included), and if a writable
+ *     parent races it away the fresh directory is removed before returning.
+ *   statfs(2): resolves the path first and only then asks the superblock; a
+ *     resolving statfs() while stat() says ENOENT is a coverage hole of an
+ *     inode-hook-only hiding layer (this LKM grew its sb_statfs hook later).
+ *   readlink(2): on a resolved non-symlink answers EINVAL ("the path is
+ *     there"). Unlike rd_probe_readlink(), which reports that as "blocked"
+ *     because its callers use it as a link probe, EINVAL votes "exists" here. */
+int rd_probe_mkdir_exists(const char *path);
+int rd_probe_statfs_exists(const char *path);
+int rd_probe_readlink_exists(const char *path);
 /* True when `path` is a symlink pointing at a non-existent target. */
 bool rd_is_dangling_symlink(const char *path);
 /* True when the directory holding `path` is group/other writable; fills `dir`. */
@@ -157,6 +175,19 @@ bool rd_parse_proc_modules_line(const char *line, char *name, size_t sz);
  * format documented for the susfs_guard_lkm LKM, returns a short description of
  * what matched; NULL otherwise. Exposed for --selftest. */
 const char *rd_susfs_lkm_node_fingerprint(const char *path, const char *content);
+
+/* Syscall-coverage oracle for the self-hidden susfs_guard_lkm paths: given the
+ * probe results for one path (0 exists / 1 ENOENT / -1 blocked), returns a
+ * bitmask naming the syscalls that resolved the path while stat() answered
+ * ENOENT. stat() and those calls read the same dentry tree, so a clean kernel
+ * cannot produce that split - it is what a per-caller filter answering stat()
+ * looks like. 0 = no contradiction. Pure, exposed for --selftest. */
+#define RD_TELL_MKDIR (1u << 0)
+#define RD_TELL_READLINK (1u << 1)
+#define RD_TELL_STATFS (1u << 2)
+#define RD_TELL_OPATH (1u << 3)
+unsigned rd_susfs_lkm_oracle_tell(int stat_r, int mkdir_r, int readlink_r, int statfs_r,
+                                  int opath_r);
 
 /* Probe table used by the consistency engine. */
 typedef struct {
@@ -230,6 +261,11 @@ extern const size_t RD_HIDING_PATH_COUNT;
  * (github.com/inforcqb/susfs4ksu-lkm); see rd_checks.c for the sources. */
 extern const char *const RD_SUSFS_LKM_PATHS[];
 extern const size_t RD_SUSFS_LKM_PATH_COUNT;
+/* Paths that LKM hides from every non-root caller by design (its sysfs
+ * directory plus susfs_main.c's susfs_self_hide_paths[]); the oracle probes
+ * these to tell "really absent" from "filtered from this uid". */
+extern const char *const RD_SUSFS_LKM_SELF_HIDDEN[];
+extern const size_t RD_SUSFS_LKM_SELF_HIDDEN_COUNT;
 extern const char *const RD_ROOT_PACKAGES[];
 extern const size_t RD_ROOT_PACKAGE_COUNT;
 

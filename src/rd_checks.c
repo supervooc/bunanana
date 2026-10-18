@@ -49,6 +49,31 @@ const char *const RD_HIDING_PATHS[] = {
 };
 const size_t RD_HIDING_PATH_COUNT = sizeof(RD_HIDING_PATHS) / sizeof(RD_HIDING_PATHS[0]);
 
+/* Paths susfs_guard_lkm answers ENOENT for to EVERY non-root caller by design:
+ * its /sys/module directory (hide_module registers it through
+ * sus_path_add_self_hidden(), gate: current_uid().val != 0) and the control
+ * nodes in susfs_main.c's susfs_self_hide_paths[]. Their stat() ENOENT is the
+ * module working as intended, not a clean device - the syscall-coverage oracle
+ * in rd_kernel.c resolves the two by asking syscalls the module's discrete
+ * hook set does not cover. Version tolerance: a node an older build never
+ * registered simply answers ENOENT everywhere and votes nothing, so this list
+ * can safely carry the union across releases (r16..r18.3; /proc/susfs_uname is
+ * kept for builds that do register it). */
+const char *const RD_SUSFS_LKM_SELF_HIDDEN[] = {
+    "/sys/module/susfs_guard_lkm",
+    "/proc/susfs_kstat",
+    "/proc/susfs_open_redirect",
+    "/proc/susfs_enable_log",
+    "/proc/susfs_avc_spoof",
+    "/proc/susfs_hide_modules",
+    "/proc/susfs_hide_mounts",
+    "/proc/susfs_path",
+    "/proc/susfs_opath",
+    "/proc/susfs_uname",
+};
+const size_t RD_SUSFS_LKM_SELF_HIDDEN_COUNT =
+    sizeof(RD_SUSFS_LKM_SELF_HIDDEN) / sizeof(RD_SUSFS_LKM_SELF_HIDDEN[0]);
+
 /* Installer/loader layout of the susfs_guard_lkm LKM
  * (github.com/inforcqb/susfs4ksu-lkm). Kept out of the generic corpora so that
  * "a su binary exists" (which may predate rooting) and "this exact hiding LKM
