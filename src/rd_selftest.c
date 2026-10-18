@@ -368,6 +368,13 @@ static void test_logic(void) {
   rd_finalize(&rep2);
   ok((rep2.flags & RD_F_ROOT) != 0, "flags: lkm installer files -> RD_F_ROOT", NULL);
   rd_report_free(&rep2);
+  rd_report_init(&rep2);
+  rd_add(&rep2, SEV_CRITICAL, "susfs-lkm-node-oracle", "syscall split", "x");
+  rd_finalize(&rep2);
+  ok((rep2.flags & RD_F_HIDE) != 0 && (rep2.flags & RD_F_HOOK) != 0 &&
+         strcmp(rep2.verdict, "HIDING_DETECTED") == 0,
+     "flags: non-root oracle tell -> HIDING_DETECTED", rep2.verdict);
+  rd_report_free(&rep2);
 
   /* node-body fingerprints: match the documented counter shapes, reject
    * everything else (wrong node, missing counters, plain 0/1 bodies). */
@@ -396,6 +403,43 @@ static void test_logic(void) {
      "lkm fingerprint: kstat needs both the maps line and a stat counter", NULL);
   ok(rd_susfs_lkm_node_fingerprint("/proc/susfs_kstat", "stat nr fstat (80): ok=1") == NULL,
      "lkm fingerprint: kstat without the maps line is rejected", NULL);
+  /* v2.3.0-r18 bodies, verbatim from its PROC_INTERFACES.md sample output. */
+  ok(rd_susfs_lkm_node_fingerprint(
+         "/proc/susfs_hide_modules",
+         "hide_modules: 1/16 name(s), /sys/module rules=1 (failed=0), /proc/modules lines removed=0, "
+         "kallsyms lines removed=0\nnames: susfs_guard_lkm") != NULL,
+     "lkm fingerprint: hide_modules body with the r18 counters", NULL);
+  ok(rd_susfs_lkm_node_fingerprint(
+         "/proc/susfs_hide_mounts",
+         "mount prefixes: 2/64, rescans=1, recorded=0, hidden_by_identity=0, learned_ids=0\n"
+         "prefixes: /data/adb/ /data/local/tmp/") != NULL,
+     "lkm fingerprint: /proc/susfs_hide_mounts prefix table", NULL);
+  ok(rd_susfs_lkm_node_fingerprint(
+         "/proc/susfs_open_redirect",
+         "(empty)\nhooks: forward=0 dpath=0 statfs=0 maps=0 fdinfo=0 | rev hits: dpath=0 statfs=0 "
+         "maps=0/0/0 fdinfo=0/0 | su_sid=2907") != NULL,
+     "lkm fingerprint: /proc/susfs_open_redirect hook counters", NULL);
+
+  /* syscall-coverage oracle: a tell exists only when stat() denies a path and
+   * another syscall resolves the SAME entry; -1 ("blocked") never votes, and a
+   * reachable path is never a tell even when the other probes see it too. */
+  ok(rd_susfs_lkm_oracle_tell(1, -1, 1, 1, 1) == 0,
+     "oracle: all probes agree on ENOENT -> no tell", NULL);
+  ok(rd_susfs_lkm_oracle_tell(0, 0, 0, 0, 0) == 0,
+     "oracle: a reachable path is never a tell", NULL);
+  ok(rd_susfs_lkm_oracle_tell(-1, 0, 0, 0, 0) == 0,
+     "oracle: a blocked stat() cannot raise a tell", NULL);
+  ok(rd_susfs_lkm_oracle_tell(1, 0, 1, 1, 1) == RD_TELL_MKDIR,
+     "oracle: mkdir(2) EEXIST while stat() says ENOENT -> mkdir tell", NULL);
+  ok(rd_susfs_lkm_oracle_tell(1, -1, 0, 1, 1) == RD_TELL_READLINK,
+     "oracle: readlink(2) resolves while stat() says ENOENT -> readlink tell", NULL);
+  ok(rd_susfs_lkm_oracle_tell(1, -1, 1, 0, 1) == RD_TELL_STATFS,
+     "oracle: statfs(2) resolves while stat() says ENOENT -> statfs tell", NULL);
+  ok(rd_susfs_lkm_oracle_tell(1, -1, 1, 1, 0) == RD_TELL_OPATH,
+     "oracle: open(O_PATH) resolves while stat() says ENOENT -> O_PATH tell", NULL);
+  ok(rd_susfs_lkm_oracle_tell(1, 0, 0, 0, 0) ==
+         (RD_TELL_MKDIR | RD_TELL_READLINK | RD_TELL_STATFS | RD_TELL_OPATH),
+     "oracle: several resolving syscalls -> combined bitmask", NULL);
 }
 
 /* --------------------------------------------------------------- live probes */
@@ -443,6 +487,21 @@ static void test_live_probes(void) {
   char link[64];
   long lr = rd_read_link("/proc/self/exe", link, sizeof link);
   ok(lr >= 0, "readlink(/proc/self/exe) works", lr < 0 ? strerror(errno) : link);
+
+  /* Oracle probe plumbing: an absent path must never be reported as existing,
+   * and the create-family probe must never leave anything behind. */
+  const char *absent = "/sys/module/rootdetect-selftest-absent";
+  int mk = rd_probe_mkdir_exists(absent);
+  ok(mk != 0, "oracle probe: an absent /sys/module entry never answers EEXIST",
+     mk == -1 ? "probe refused (parent writable by this caller)" : "ENOENT/EACCES path");
+  ok(rd_probe_lstat(absent) == 1, "oracle probe: the mkdir probe created nothing", NULL);
+  ok(rd_probe_statfs_exists("/proc") == 0, "oracle probe: statfs resolves an existing directory", NULL);
+  ok(rd_probe_statfs_exists("/proc/rootdetect-selftest-absent") == 1,
+     "oracle probe: statfs on an absent /proc name votes ENOENT", NULL);
+  ok(rd_probe_readlink_exists("/proc/self/exe") == 0,
+     "oracle probe: readlink resolves the /proc/self/exe symlink", NULL);
+  ok(rd_probe_readlink_exists("/proc/rootdetect-selftest-absent") == 1,
+     "oracle probe: readlink on an absent /proc name votes ENOENT", NULL);
 }
 
 /* ---------------------------------------------------- mount parser bounds */
@@ -778,6 +837,23 @@ static void test_susfs_lkm_e2e(void) {
   } else {
     ok(fm == NULL && ff == NULL, "no kernel view shows the LKM -> the check stays silent", d);
   }
+
+  /* Oracle wiring: recompute the probes straight from the corpus and demand
+   * the report agree - a contradiction must be reported, and any reported one
+   * must reproduce. Holds on a clean system and on an infected one alike. */
+  int tell_paths = 0;
+  for (size_t i = 0; i < RD_SUSFS_LKM_SELF_HIDDEN_COUNT; i++) {
+    const char *p = RD_SUSFS_LKM_SELF_HIDDEN[i];
+    if (rd_probe_lstat(p) != 1) continue;
+    int mk2 = rd_probe_mkdir_exists(p);
+    int rl2 = rd_probe_readlink_exists(p);
+    int fs2 = rd_probe_statfs_exists(p);
+    int op2 = rd_probe_open_o_path(p);
+    if (rd_susfs_lkm_oracle_tell(1, mk2, rl2, fs2, op2) && rd_probe_lstat(p) == 1) tell_paths++;
+  }
+  const rd_finding *fo = find_finding(&rep, "susfs-lkm-node-oracle");
+  ok((tell_paths > 0) == (fo != NULL && fo->sev == SEV_CRITICAL),
+     "oracle: report matches an independent probe pass", d);
   rd_report_free(&rep);
 }
 

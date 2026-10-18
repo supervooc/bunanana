@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/vfs.h> /* statfs(2), for the syscall-coverage oracle */
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -150,6 +151,7 @@ static unsigned id_flags(const char *id) {
       {"susfs-lkm-artefact", RD_F_ROOT},
       {"susfs-lkm-artefact-hidden", RD_F_HIDE},
       {"susfs-lkm-node-fingerprint", RD_F_HIDE},
+      {"susfs-lkm-node-oracle", RD_F_HOOK | RD_F_HIDE},
       {"kernel-sysmodule", RD_F_HOOK},
       {"kernel-kallsyms-symbol", RD_F_HOOK},
       {"kernel-syscall-table-patched", RD_F_HOOK | RD_F_HIDE},
@@ -813,6 +815,61 @@ int rd_probe_readlink(const char *path) {
   char buf[8];
   ssize_t r = readlink(path, buf, sizeof(buf));
   if (r >= 0) return 0;
+  return errno == ENOENT || errno == ENOTDIR ? 1 : -1;
+}
+
+/* ------------------------------------------ syscall-coverage oracle probes */
+
+/* Parent directory of `path`; "." for a bare name, "/" for a top-level one. */
+static void probe_parent(const char *path, char *out, size_t outsz) {
+  snprintf(out, outsz, "%s", path);
+  char *slash = strrchr(out, '/');
+  if (!slash) {
+    snprintf(out, outsz, ".");
+  } else if (slash == out) {
+    slash[1] = '\0';
+  } else {
+    *slash = '\0';
+  }
+}
+
+int rd_probe_mkdir_exists(const char *path) {
+  char parent[512];
+  probe_parent(path, parent, sizeof(parent));
+  /* Never create: mkdir would succeed - and leave a directory behind - exactly
+   * when the parent is writable by this caller. That never happens for /sys
+   * and /proc as non-root, but a root run carries CAP_DAC_OVERRIDE and a weird
+   * system may mount these elsewhere; refusing outright keeps the probe
+   * side-effect free in every case. */
+  if (access(parent, W_OK) == 0) return -1;
+  if (mkdir(path, 0755) == 0) {
+    /* The parent was writable in a way access() did not report: the entry
+     * really was absent. Take our directory back and vote "absent". */
+    rmdir(path);
+    return 1;
+  }
+  if (errno == EEXIST) return 0;
+  /* ENOENT here also covers procfs, whose lookup of an unregistered top-level
+   * name returns the error directly instead of planting a negative dentry. */
+  return errno == ENOENT || errno == ENOTDIR ? 1 : -1;
+}
+
+int rd_probe_statfs_exists(const char *path) {
+  struct statfs sf;
+  if (statfs(path, &sf) == 0) return 0;
+  /* -ENOSYS from statfs_by_dentry(): the path resolved, the filesystem just
+   * has no statfs operation - still proof that the entry exists. */
+  if (errno == ENOSYS) return 0;
+  return errno == ENOENT || errno == ENOTDIR ? 1 : -1;
+}
+
+int rd_probe_readlink_exists(const char *path) {
+  char buf[8];
+  if (readlink(path, buf, sizeof(buf)) >= 0) return 0;
+  /* EINVAL is the answer a resolved non-symlink gets ("not a link"), i.e.
+   * proof of existence for the oracle - unlike rd_probe_readlink(), which
+   * calls the same answer "blocked" because it is used as a link probe. */
+  if (errno == EINVAL) return 0;
   return errno == ENOENT || errno == ENOTDIR ? 1 : -1;
 }
 

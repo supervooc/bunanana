@@ -144,17 +144,20 @@ adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 
 | id | 级别 | 原理 |
 |---|---|---|
-| `susfs-lkm-module-filtered` | **CRITICAL** | **模块自过滤被抓现行**：`/sys/module/susfs_guard_lkm`（或其 `parameters/`、kallsyms 的 `[susfs_guard_lkm]` 标签）在内核里可见，而 `/proc/modules` 没有对应行。它的加载横幅原文写着「本模块会被从 `/proc/modules` 中滤除，对包括 root 在内的所有调用者生效，请改用 `/sys/module/susfs_guard_lkm` 判断是否已加载」——两个视图互相矛盾，就是过滤器正在工作 |
-| `susfs-lkm-module` | HIGH | 模块被 `/proc/modules` 列出（自过滤未启用或 hide 列表被 `clear`），或 `/proc/modules` 不可读但 sysfs / 参数 / kallsyms 任一可见——隐藏能力本身已就位 |
-| `susfs-lkm-artefact` | HIGH | 磁盘上的安装/加载布局：`/data/adb/modules{,s_update}/susfs_guard_lkm`（含 `module.prop`、`lib/susfs_guard_lkm-<kmi>.ko`、`bin/susfs_insmod`、`early_load`）、`/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh`、README 手动路线的 `/data/adb/loader/susfs_guard_lkm.ko`。`.ko` 必须留盘以便开机重插，藏不掉 |
+| `susfs-lkm-module-filtered` | **CRITICAL** | **模块自过滤被抓现行**：`/sys/module/susfs_guard_lkm` 及其 `parameters/` 对 root 仍然可见，而 `/proc/modules` 没有对应行。它的加载横幅原文写着「本模块会被从 `/proc/modules` 中滤除，对包括 root 在内的所有调用者生效，请改用 `/sys/module/susfs_guard_lkm` 判断是否已加载」——两个视图互相矛盾，就是过滤器正在工作（`/proc/kallsyms` 的模块标签对包括 root 在内的所有读者过滤、`/sys/module` 目录对**所有非 root 调用者**应答 ENOENT——前者让「kallsyms 标签」这条旁证失效，后者不影响 root 视角下这组 sysfs/参数矛盾；两处行为至少自 r16 起就是这样，非 r18 新增） |
+| `susfs-lkm-module` | HIGH | 模块被 `/proc/modules` 列出（自过滤未启用或 hide 列表被 `clear`），或 `/proc/modules` 不可读但 sysfs / 参数任一可见——隐藏能力本身已就位 |
+| `susfs-lkm-artefact` | HIGH | 磁盘上的安装/加载布局：`/data/adb/modules{,s_update}/susfs_guard_lkm`（含 `module.prop`、`lib/susfs_guard_lkm-<kmi>.ko`、`bin/susfs_insmod`、`early_load`、`early-dispatch.sh`）、`/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh`、README 手动路线的 `/data/adb/loader/susfs_guard_lkm.ko`。`.ko` 必须留盘以便开机重插，藏不掉 |
 | `susfs-lkm-artefact-hidden` | **CRITICAL** | 上述路径对部分 syscall 可见、对另一部分 ENOENT——按路径的隐藏规则只拦截了一部分接口 |
-| `susfs-lkm-node-fingerprint` | **CRITICAL** | `/proc/susfs_*` 节点**内容**与该移植版文档（`PROC_INTERFACES.md`）记载的计数器/表格格式吻合：`opath/openat nr=`、`maps: armed=`、`stat nr `、`hide_modules:`、`priv_app_sid=`…。光「节点存在」可能被伪造，能复现这些读数说明是模块自己的 read handler 在响应 |
+| `susfs-lkm-node-fingerprint` | **CRITICAL** | `/proc/susfs_*` 节点**内容**与该移植版文档（`PROC_INTERFACES.md`）记载的计数器/表格格式吻合：`opath/openat nr=`、`maps: armed=`、`stat nr `、`hide_modules:`、`priv_app_sid=`…；其中 `hide_modules` 节默认还会列出 `names: susfs_guard_lkm`——等于把自己的名字写进了隐藏名单。光「节点存在」可能被伪造，能复现这些读数说明是模块自己的 read handler 在响应 |
+| `susfs-lkm-node-oracle` | **CRITICAL** | **非 root 也能抓现行**（syscall 覆盖缺口预言机）：自隐藏是一组**离散**入口——LSM hooks（getattr/permission/setattr/statfs/xattr/unlink/rename/getdents…）加上自 r18.3 起的 `sys_call_table` 包装（stat 家族/getdents/openat+O_PATH）。覆盖不到的系统调用照样解析同一条 dentry，于是对 sysfs 目录 + `susfs_main.c` 的 `susfs_self_hide_paths[]`（9 条；另含供注册版本使用的 `/proc/susfs_uname`，共 10 条路径）出现「`stat` 说 ENOENT、另一调用解析成功」的分裂。最硬的一条是 `mkdir(2)`→**EEXIST**：`filename_create()` 的存在性判定先于任何权限/LSM 检查，任何 LSM 钩子都拦不住，且 r16..main 没有任何版本包装 mkdir/mknod/symlink 族；其余按版本分层——`readlink(2)`→EINVAL（路径在、非符号链接；上游源码自称这组分歧为 "the tell"，main 的 `sus_path_iop_arm` 才关闭它）、`open(O_PATH)` 可解析（r16–r18；r18.3 起被 opath 包装关闭）、`statfs(2)`（仅 sb_statfs 钩子安装前的旧版或安装失败）。干净内核里 stat 与这些调用读同一棵 dentry 树，分裂不可能自然出现；探测无副作用（父目录对当前调用者可写即拒跑，root 自动豁免；万一种出目录立即 rmdir 并判为"不存在"） |
 | `susfs-lkm-usedby` | HIGH | `hide_modules` 只删模块自己那一行；其他模块的 used-by 列仍会写出它的名字 |
 | `kernel-module-list-ghost` | MEDIUM | `tainted` 的 bit 12 (OE) 置位（装载过 out-of-tree 模块）而 `/proc/modules` 一条都不列。taint 是黏性的（rmmod 后仍保留），所以只算佐证：要么模块被卸载过，要么列表被清空 |
 
 模块名按**前缀**匹配（`susfs_guard_lkm`、`susfs_guard_lkm_android13_5_15`…）：该模块以 `.ko` 文件名作为模块名，而发布包叫 `susfs_guard_lkm-<kmi>.ko`。
 
-> 非 root 时的盲区（如实说明）：hide 规则武装后 sysfs 目录对非 root 不可见、`/proc/susfs_*` 一律 ENOENT——上面一半证据只有 uid 0 拿得到，与 §8「深度检查需 root」一致。
+模块参数哨兵（7 个，取该模块独有参数的一个子集）：`expose_proc` / `fail_layer` / `opath_test` / `opath_dump` / `hide_modules` / `or_entry` / `uname_spoof_enabled`——都是该移植版独有的参数名，任一出现在 `/sys/module/<名字>/parameters/` 即确认身份（其中 `opath_test` / `opath_dump` / `or_entry` 为 r18 新增参数，其余至少 r16 起就有）。
+
+> 非 root 时的**直接**视图盲区（如实说明，至少 r16 起即如此）：hide 规则武装后 `/sys/module/<名字>` 对**所有非 root 调用者**（`adb shell`=2000、`system`=1000、应用 uid 一视同仁）应答 ENOENT、`/proc/susfs_*` 同样对非 root ENOENT、kallsyms 模块标签被全读者过滤——本表多数判定（与 §4C 的一部分）依赖 uid 0 才拿得到的可见视图，与 §8「深度检查需 root」一致。**但这不等于非 root 全盲**：`susfs-lkm-node-oracle` 利用的正是隐藏层自身的结构缺口——「按 syscall 离散覆盖」意味着只要有一个未覆盖的调用仍解析同一路径，而 `stat` 说它不存在，矛盾即成立；`mkdir(2)` 自 r16 至今从未被任何版本包装，是结构性铁证。该预言机无需 root：父目录可写时拒跑、`stat` 的 ENOENT 在给出判定前会重验一次（防模块加载竞态），任何一次探针被 SELinux/权限挡住（`-1`）都不参与判定。设备上一条 `mkdir /sys/module/susfs_guard_lkm` 回 `File exists`（而不是 `Permission denied`）即可人工复核——EEXIST 来自 `filename_create()`，SELinux 都还没轮到表态。其余判定逻辑本身与 uid 无关：隐藏层一旦失效、视图可见，任何 uid 都会报出同一 CRITICAL。
 
 ---
 
@@ -164,7 +167,7 @@ adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 
 1. **决策逻辑**：投票表在各种组合下的判定、verdict 映射、JSON 转义、缓冲区边界、verdict 对应的 flag。
 2. **误报卫士**：在「干净设备」上，最容易误报的两项必须保持沉默——`uname()` 必须等于 `/proc/sys/kernel/osrelease`，`/proc/mounts` 与 `/proc/self/mountinfo` 的挂载目标集合必须相等。
-3. **专项检测一致性**：`susfs_guard_lkm` 专项检查的结论用独立扫描从 `/proc/modules`、`/sys/module`、kallsyms 现场重算后比对——干净设备必须沉默，模块存在时必须给出对应结论；节点内容指纹另有纯逻辑用例。
+3. **专项检测一致性**：`susfs_guard_lkm` 专项检查的结论用独立扫描从 `/proc/modules`、`/sys/module`、kallsyms 现场重算后比对——干净设备必须沉默，模块存在时必须给出对应结论；节点内容指纹与 syscall 覆盖缺口预言机（`susfs-lkm-node-oracle`）各有纯逻辑用例，预言机的现场结论还会与一次独立探测过程逐路径比对（防接线错误）。
 
 ```
 $ adb shell /data/local/rx/rx --selftest
@@ -284,7 +287,7 @@ powershell -ExecutionPolicy Bypass -File scripts/inject-root-fixtures.ps1 -Clean
 
 ## 8. 已知局限（诚实说明）
 
-* **非 root 身份下，SuSFS 的路径隐藏本身不可直接观测**：它的 `/proc/susfs_*` 节点对非 uid 0 返回 `-ENOENT`，与「真的不存在」在 errno 上无法区分。所以非 root 时的判定依赖 §4C 的矛盾检测（这是设计上的必然，不是实现偷懒）。uid 0 下则可以直接读到节点内容。
+* **非 root 身份下，SuSFS 的路径隐藏不可「直接读」**：它的 `/proc/susfs_*` 节点与 `/sys/module/<名字>` 对非 uid 0 返回 `-ENOENT`，与「真的不存在」在 errno 上无法区分。所以非 root 时对**可见视图**（§4B/§4D 的多数项）无法判定——这是设计上的必然，不是实现偷懒。**但非 root 并非全盲**：§4C 的跨 syscall 矛盾检测与 §4D 的 `susfs-lkm-node-oracle`（syscall 覆盖缺口）都能在 uid 0 之外独立给出判定；后者连"隐藏层是否武装"都不需要假设。剩余盲区如实列出：如果某个版本把 mkdir/mknod/symlink 族与全部已知缺口一起包装掉（截至上游 main 尚未发生），预言机会回到无声——届时非 root 侧将只剩 §4C。uid 0 下则可以直接读到节点内容。
 * §4B 里依赖 `/proc/kallsyms`、`/proc/kcore`、debugfs 的项在部分设备上会被 SELinux 挡住（工具会打印 `kernel-kallsyms` / `kernel-kcore` 的 INFO 说明「没查成」，不会把「查不到」当成「干净」或「有 root」）。
 * mount 视图对比在**挂载命名空间不同**的情况下会产生差异：以 `shell` 身份运行时与 init 同一个 namespace，正常应完全一致；如果你用 `su --mount-master` 之类进入独立 namespace，该判定需要人工复核。
 * 未实现：协议层证据（Play Integrity / key attestation）、硬件断点/性能计数器层面的 hook 检测。
@@ -510,5 +513,18 @@ wsl -u root -e bash android-rootdetect/scripts/verify-all.sh
 ```
 
 最近一次：**PASS=18 FAIL=0 SKIP=0**（Linux 真内核自检 + 干净基线；模拟器自检 + shell/root 双视角；注入 fixtures 命中 `package-hidden` CRITICAL；跨 ABI 差分；APK 结构与三 ABI 二进制哈希）。原始输出在 `/tmp/verify-all/`。
+
+### 11.7 syscall 覆盖缺口预言机的四态验证（非 root，宿主内核模拟）
+
+上游每个版本对自隐藏路径的覆盖是离散的、逐版本变化的。用 `LD_PRELOAD` 垫片在同一台真 Linux 内核（WSL2）上复刻四种内核状态——同一份源码动态编译的同一枚二进制、同一 uid 2000，只更换被模拟的隐藏层——实测（`-v`）：
+
+| 模拟的内核状态 | 垫片模拟的覆盖 | 实测结果 |
+|---|---|---|
+| clean（无隐藏层） | 全部放行 | **CLEAN**；预言机沉默（`10 path(s) … all answered consistently`）。唯一 MEDIUM 是 `env-preload`——工具自己报告 `LD_PRELOAD` 被设置，属预期而非误报 |
+| r16 | stat 家族/access/open/getdents → ENOENT；statfs → ENOENT；mkdir → EEXIST；readlink → EINVAL；O_PATH → 成功 | **HIDING_DETECTED（rc=3）**：`susfs-lkm-node-oracle` 命中 10/10 路径（证据：`mkdir(2) -> EEXIST` + `readlink(2) -> EINVAL` + `open(O_PATH) -> resolved`）；`susfs-node-inconsistency`×10 与 `susfs-lkm-module-filtered`（视图 B 借由 O_PATH 解析到了 sysfs）同时命中 |
+| r18.3 | 再加 O_PATH → ENOENT、readlink → ENOENT | **HIDING_DETECTED（rc=3）**：预言机仍命中 10/10，证据只剩 `mkdir(2) -> EEXIST`——其余两条腿按源码时间线关闭 |
+| main | 同 r18.3（i_op 副本负责 readlink） | 同 r18.3 |
+
+负控：不带垫片的动态二进制、同一 uid → **CLEAN（rc=0）**、零判定。本组验证证明的是"判定对输入的响应符合版本矩阵"，不是真机行为；真机非 root 的一行复核见 §4D 脚注（`mkdir /sys/module/susfs_guard_lkm` → `File exists` = 前提成立；`Permission denied` = SELinux 挡住了探测，工具对 `-1` 不判定）。垫片与原始输出未入库，保存在验证机临时目录。
 
 > 本机没有 PowerShell 7（`pwsh`），所有 `.ps1` 请用 `powershell -ExecutionPolicy Bypass -File` 调用——README 里的示例已按此修正（这是 t-abi 发现的文档问题）。
