@@ -505,15 +505,18 @@ void rd_check_susfs(rd_ctx *c, rd_report *rep) {
  * `ksud insmod` or the release's own susfs_insmod loader.
  *
  * The checks below lean on statements the project makes about itself, not on
- * string luck. v2.3.0-r18 (susfs_hide_syms.c) spells the self-filter out:
+ * string luck. v2.3.0-r18 (susfs_hide_syms.c) spells the self-filter out; the
+ * three views below are present since at least r16, so they are not an r18
+ * novelty (only the citations here are from r18.3):
  *  - /proc/modules: its m_show() line is removed "for EVERY reader, root
  *    included, since a checker may well run as root and this listing is what
  *    it compares against";
  *  - /proc/kallsyms: lines whose module tag is in the hide list are filtered,
- *    "also for every reader", so a visible [susfs_guard_lkm] tag now means an
+ *    "also for every reader", so a visible [susfs_guard_lkm] tag means an
  *    older build or a kprobe that failed to arm - bonus evidence only;
- *  - /sys/module/<name>: hidden from non-root callers only - "root keeps
- *    access (that is where a module's parameters live)". The sysfs directory,
+ *  - /sys/module/<name>: stat/open/readdir answer ENOENT to EVERY non-root
+ *    caller - shell (2000), system (1000) and app uids alike - while "root
+ *    keeps access (that is where a module's parameters live)". The sysfs directory,
  *    its parameter files and the /proc/susfs_* bodies are therefore views a
  *    root scan still reaches, and any of them answering while /proc/modules
  *    omits the module is the self-filter observed in the act.
@@ -525,9 +528,8 @@ void rd_check_susfs(rd_ctx *c, rd_report *rep) {
  *    for every caller including root, so `lsmod | grep susfs` stays empty -
  *    check /sys/module/susfs_guard_lkm instead."
  *  - module/load.sh uses `[ -d /sys/module/susfs_guard_lkm ]` as its own
- *    "already loaded" probe; the parameters expose_proc / fail_layer /
- *    opath_test / opath_dump (v2.3.0-r18 adds hide_modules / or_entry /
- *    uname_spoof_enabled) are unique to this port.
+ *    "already loaded" probe; the module's parameter names are unique to this
+ *    port (the sentinel subset this file probes is lkm_params[] below).
  *  - susfs.h: the module name is the .ko file name; releases ship
  *    susfs_guard_lkm-<kmi>.ko, so name lookups here are prefix matches
  *    (susfs_guard_lkm, susfs_guard_lkm_android13_5_15, ...).
@@ -538,10 +540,12 @@ void rd_check_susfs(rd_ctx *c, rd_report *rep) {
  *    shapes are reproduced in rd_susfs_lkm_node_fingerprint().
  */
 
-/* Module parameters this LKM declares (susfs_main.c, susfs_opath.c,
- * susfs_hide_syms.c, susfs_or_entry.c, susfs_uname.c; the v2.3.0-r18 set).
- * Seeing any of them under /sys/module/<name>/parameters/ identifies the
- * port - none of these names is a stock kernel parameter. */
+/* A sentinel subset of this LKM's module parameters (declared in susfs_main.c,
+ * susfs_opath.c, susfs_hide_syms.c, susfs_or_entry.c, susfs_uname.c; the
+ * module declares more - none of the chosen names is a stock kernel name).
+ * opath_test / opath_dump / or_entry are new in r18; the other four exist
+ * since at least r16. Seeing any of them under /sys/module/<name>/parameters/
+ * identifies the port. */
 static const char *const lkm_params[] = {"expose_proc",    "fail_layer", "opath_test", "opath_dump",
                                          "hide_modules",   "or_entry",   "uname_spoof_enabled"};
 
@@ -925,9 +929,9 @@ void rd_check_susfs_lkm(rd_ctx *c, rd_report *rep) {
     rd_add(rep, SEV_INFO, "susfs-lkm-module-absent", "no kernel view shows susfs_guard_lkm",
            "checked %d module name(s), the /sys/module listing, module parameters and "
            "/proc/kallsyms; no view names the LKM. Under a non-root uid this is also what a "
-           "loaded module looks like - its sysfs directory is hidden from non-root callers and "
-           "the /proc/susfs_* nodes answer ENOENT - so absence alone proves nothing without "
-           "uid 0.",
+           "loaded module looks like - its sysfs directory answers ENOENT to every non-root "
+           "caller and so do the /proc/susfs_* nodes - so absence alone proves nothing "
+           "without uid 0.",
            mod_count);
   }
 

@@ -144,7 +144,7 @@ adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 
 | id | 级别 | 原理 |
 |---|---|---|
-| `susfs-lkm-module-filtered` | **CRITICAL** | **模块自过滤被抓现行**：`/sys/module/susfs_guard_lkm` 及其 `parameters/` 对 root 仍然可见，而 `/proc/modules` 没有对应行。它的加载横幅原文写着「本模块会被从 `/proc/modules` 中滤除，对包括 root 在内的所有调用者生效，请改用 `/sys/module/susfs_guard_lkm` 判断是否已加载」——两个视图互相矛盾，就是过滤器正在工作（v2.3.0-r18 起 kallsyms 的模块标签也被一并过滤、`/sys/module` 目录只对非 root 隐藏，不影响 root 视角下这组 sysfs/参数矛盾） |
+| `susfs-lkm-module-filtered` | **CRITICAL** | **模块自过滤被抓现行**：`/sys/module/susfs_guard_lkm` 及其 `parameters/` 对 root 仍然可见，而 `/proc/modules` 没有对应行。它的加载横幅原文写着「本模块会被从 `/proc/modules` 中滤除，对包括 root 在内的所有调用者生效，请改用 `/sys/module/susfs_guard_lkm` 判断是否已加载」——两个视图互相矛盾，就是过滤器正在工作（`/proc/kallsyms` 的模块标签对包括 root 在内的所有读者过滤、`/sys/module` 目录对**所有非 root 调用者**应答 ENOENT——前者让「kallsyms 标签」这条旁证失效，后者不影响 root 视角下这组 sysfs/参数矛盾；两处行为至少自 r16 起就是这样，非 r18 新增） |
 | `susfs-lkm-module` | HIGH | 模块被 `/proc/modules` 列出（自过滤未启用或 hide 列表被 `clear`），或 `/proc/modules` 不可读但 sysfs / 参数任一可见——隐藏能力本身已就位 |
 | `susfs-lkm-artefact` | HIGH | 磁盘上的安装/加载布局：`/data/adb/modules{,s_update}/susfs_guard_lkm`（含 `module.prop`、`lib/susfs_guard_lkm-<kmi>.ko`、`bin/susfs_insmod`、`early_load`、`early-dispatch.sh`）、`/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh`、README 手动路线的 `/data/adb/loader/susfs_guard_lkm.ko`。`.ko` 必须留盘以便开机重插，藏不掉 |
 | `susfs-lkm-artefact-hidden` | **CRITICAL** | 上述路径对部分 syscall 可见、对另一部分 ENOENT——按路径的隐藏规则只拦截了一部分接口 |
@@ -154,9 +154,9 @@ adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 
 模块名按**前缀**匹配（`susfs_guard_lkm`、`susfs_guard_lkm_android13_5_15`…）：该模块以 `.ko` 文件名作为模块名，而发布包叫 `susfs_guard_lkm-<kmi>.ko`。
 
-模块参数哨兵：`expose_proc` / `fail_layer` / `opath_test` / `opath_dump`（v2.3.0-r18 起还有 `hide_modules` / `or_entry` / `uname_spoof_enabled`）——都是该移植版独有的参数名，任一出现在 `/sys/module/<名字>/parameters/` 即确认身份。
+模块参数哨兵（7 个，取该模块独有参数的一个子集）：`expose_proc` / `fail_layer` / `opath_test` / `opath_dump` / `hide_modules` / `or_entry` / `uname_spoof_enabled`——都是该移植版独有的参数名，任一出现在 `/sys/module/<名字>/parameters/` 即确认身份（其中 `opath_test` / `opath_dump` / `or_entry` 为 r18 新增参数，其余至少 r16 起就有）。
 
-> 非 root 时的盲区（如实说明）：hide 规则武装后 sysfs 目录对非 root 不可见、`/proc/susfs_*` 一律 ENOENT，kallsyms 模块标签也被过滤——判定所依赖的一致/矛盾证据只有 uid 0 拿得到，与 §8「深度检查需 root」一致。
+> 非 root 时的盲区（如实说明，至少 r16 起即如此）：hide 规则武装后 `/sys/module/<名字>` 对**所有非 root 调用者**（`adb shell`=2000、`system`=1000、应用 uid 一视同仁）应答 ENOENT、`/proc/susfs_*` 同样对非 root ENOENT，kallsyms 模块标签被全读者过滤——判定所依赖的一致/矛盾证据只有 uid 0 拿得到，与 §8「深度检查需 root」一致。检查逻辑本身与 uid 无关：非 root 视图下零判定、零误报；隐藏层一旦失效、视图可见，任何 uid 都会报出同一 CRITICAL。
 
 ---
 
