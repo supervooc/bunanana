@@ -65,7 +65,22 @@ foreach ($a in $Abi) {
   $rc = $LASTEXITCODE
   $ErrorActionPreference = $prevEap
   if ($rc -ne 0) { throw "build failed for $a (exit $rc)" }
-  $len = (Get-Item $exe).Length
-  Write-Host ("    -> {0} ({1:N0} bytes)" -f $exe, $len)
+  $before = (Get-Item $exe).Length
+  if (-not $DebugBuild) {
+    # The NDK's static libraries ship with DWARF, and -g0 cannot remove it:
+    # it comes from libc.a members, not from our objects. Unstripped scanners
+    # measured 6.7-8.3 MB each (7.2 MB APK); llvm-strip brings one down to
+    # roughly a sixth of that. -DebugBuild keeps the symbols on purpose.
+    $strip = Join-Path $sysroot "bin\llvm-strip.exe"
+    if (-not (Test-Path $strip)) { throw "llvm-strip not found: $strip" }
+    $prevStripEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $strip --strip-all --remove-section=.comment $exe 2>&1 | ForEach-Object { Write-Host "    strip: $_" }
+    $stripRc = $LASTEXITCODE
+    $ErrorActionPreference = $prevStripEap
+    if ($stripRc -ne 0) { throw "strip failed for $a (exit $stripRc)" }
+  }
+  $after = (Get-Item $exe).Length
+  Write-Host ("    -> {0} ({1:N0} bytes; {2:N0} before strip)" -f $exe, $after, $before)
 }
 Write-Host "done."
