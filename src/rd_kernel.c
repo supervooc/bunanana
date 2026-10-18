@@ -484,7 +484,9 @@ void rd_check_susfs(rd_ctx *c, rd_report *rep) {
   } else {
     rd_add(rep, SEV_INFO, "susfs-node-absent", "no SuSFS control node reachable",
            "all %zu paths answered ENOENT. Note this is also what a non-root process sees when "
-           "SuSFS hides them, so absence alone is not evidence of a clean device.",
+           "SuSFS hides them, so absence alone is not evidence of a clean device - the "
+           "susfs_guard_lkm section cross-checks exactly this case with its syscall-coverage "
+           "oracle.",
            RD_HIDING_PATH_COUNT);
   }
 
@@ -505,28 +507,69 @@ void rd_check_susfs(rd_ctx *c, rd_report *rep) {
  * `ksud insmod` or the release's own susfs_insmod loader.
  *
  * The checks below lean on statements the project makes about itself, not on
- * string luck:
+ * string luck. v2.3.0-r18 (susfs_hide_syms.c) spells the self-filter out; the
+ * three views below are present since at least r16, so they are not an r18
+ * novelty (only the citations here are from r18.3):
+ *  - /proc/modules: its m_show() line is removed "for EVERY reader, root
+ *    included, since a checker may well run as root and this listing is what
+ *    it compares against";
+ *  - /proc/kallsyms: lines whose module tag is in the hide list are filtered,
+ *    "also for every reader", so a visible [susfs_guard_lkm] tag means an
+ *    older build or a kprobe that failed to arm - bonus evidence only;
+ *  - /sys/module/<name>: stat/open/readdir answer ENOENT to EVERY non-root
+ *    caller - shell (2000), system (1000) and app uids alike - while "root
+ *    keeps access (that is where a module's parameters live)". The sysfs directory,
+ *    its parameter files and the /proc/susfs_* bodies are therefore views a
+ *    root scan still reaches, and any of them answering while /proc/modules
+ *    omits the module is the self-filter observed in the act.
+ *  - The default hide list holds just this module ("a built-in SUSFS has no
+ *    module entry"), seeded at init; the /proc/susfs_hide_modules body's
+ *    names: line therefore carries susfs_guard_lkm on a fresh load (`clear`
+ *    is the project's debugging mode).
  *  - susfs_main.c's load banner: "This module is filtered out of /proc/modules
  *    for every caller including root, so `lsmod | grep susfs` stays empty -
- *    check /sys/module/susfs_guard_lkm instead." The sysfs directory, its
- *    parameter files and the kallsyms module tag are views that self-filter
- *    does NOT cover, so any of them answering while /proc/modules omits the
- *    module is the filter observed in the act.
+ *    check /sys/module/susfs_guard_lkm instead."
  *  - module/load.sh uses `[ -d /sys/module/susfs_guard_lkm ]` as its own
- *    "already loaded" probe; the parameters expose_proc / fail_layer /
- *    opath_test / opath_dump are unique to this port.
+ *    "already loaded" probe; the module's parameter names are unique to this
+ *    port (the sentinel subset this file probes is lkm_params[] below).
  *  - susfs.h: the module name is the .ko file name; releases ship
  *    susfs_guard_lkm-<kmi>.ko, so name lookups here are prefix matches
  *    (susfs_guard_lkm, susfs_guard_lkm_android13_5_15, ...).
- *  - PROC_INTERFACES.md: hide_modules removes the module's own /proc/modules
- *    line only - another module's "used by" column would still name it.
+ *  - PROC_INTERFACES.md: hide_modules removes a listed module's own
+ *    /proc/modules line only - another module's "used by" column would still
+ *    name it.
  *  - PROC_INTERFACES.md documents the control-node bodies; the counter/table
  *    shapes are reproduced in rd_susfs_lkm_node_fingerprint().
+ *  - The self-hiding itself answers through a discrete set of LSM hooks plus,
+ *    later, sys_call_table wrappers: stat family (inode_getattr), permission
+ *    (inode_permission), setattr, sb_statfs, the xattr hooks, path_notify,
+ *    unlink/rmdir/rename/link, getdents64 (dirent filter) and - since r18.3 -
+ *    openat/openat2 for O_PATH. Any syscall those layers do not cover still
+ *    resolves the very same entry, so a "stat(2) says ENOENT" contradicted by
+ *    another call IS the hiding act observed, without root. The oracle below
+ *    (lkm_syscall_oracle) uses:
+ *      mkdir(2)     EEXIST from filename_create()'s lookup, ahead of every
+ *                   permission/LSM decision - no LSM hook can reach it, and no
+ *                   release (r16..main) touches mkdir/mknod/symlink/lookup;
+ *      readlink(2)  EINVAL on a resolved non-symlink; upstream's own source
+ *                   calls the disagreement with stat "the tell" and closed it
+ *                   only after v2.3.0-r18.3 (a copy of the inode's i_op whose
+ *                   readlink slot answers through the same predicate);
+ *      statfs(2)    a coverage hole only before its sb_statfs hook (kept as a
+ *                   failed-install detector);
+ *      open(O_PATH) a coverage hole before r18.3's sys_call_table wrapper.
+ *    A hit cannot be produced by a clean kernel: stat() and the other calls
+ *    read the same dentry tree.
  */
 
-/* Module parameters this LKM declares (susfs_main.c, susfs_opath.c). Seeing
- * any of them under /sys/module/<name>/parameters/ identifies the port. */
-static const char *const lkm_params[] = {"expose_proc", "fail_layer", "opath_test", "opath_dump"};
+/* A sentinel subset of this LKM's module parameters (declared in susfs_main.c,
+ * susfs_opath.c, susfs_hide_syms.c, susfs_or_entry.c, susfs_uname.c; the
+ * module declares more - none of the chosen names is a stock kernel name).
+ * opath_test / opath_dump / or_entry are new in r18; the other four exist
+ * since at least r16. Seeing any of them under /sys/module/<name>/parameters/
+ * identifies the port. */
+static const char *const lkm_params[] = {"expose_proc",    "fail_layer", "opath_test", "opath_dump",
+                                         "hide_modules",   "or_entry",   "uname_spoof_enabled"};
 
 /* True for the module's sysfs/proc name: equal to the base name, or the name
  * the kernel derived from the .ko file name (dashes become underscores, so
@@ -563,6 +606,19 @@ const char *rd_susfs_lkm_node_fingerprint(const char *path, const char *content)
   return NULL;
 }
 
+unsigned rd_susfs_lkm_oracle_tell(int stat_r, int mkdir_r, int readlink_r, int statfs_r,
+                                  int opath_r) {
+  /* Only the hidden case is interesting: a reachable path is judged by the
+   * views above, and a stat() the environment blocked ("-1") says nothing. */
+  if (stat_r != 1) return 0;
+  unsigned bits = 0;
+  if (mkdir_r == 0) bits |= RD_TELL_MKDIR;
+  if (readlink_r == 0) bits |= RD_TELL_READLINK;
+  if (statfs_r == 0) bits |= RD_TELL_STATFS;
+  if (opath_r == 0) bits |= RD_TELL_OPATH;
+  return bits;
+}
+
 /* Read the nodes this LKM registers and identify the port from the shape of
  * their bodies. In practice this needs uid 0: with rules armed the sus_path
  * layer answers ENOENT on every interface from anyone else. */
@@ -593,6 +649,20 @@ static void lkm_node_fingerprints(rd_report *rep) {
       first[n] = '\0';
       if (strlen(ev) < sizeof(ev) - 300)
         rd_appendf(ev, sizeof(ev), "%s: %s\n  %s\n", nodes[i], what, first);
+      /* The hide table names what it hides; on a default load that is this
+       * module itself - carry the names: line into the evidence. */
+      if (strcmp(nodes[i], "/proc/susfs_hide_modules") == 0) {
+        const char *nm = strstr(txt, "names:");
+        if (nm && strlen(ev) < sizeof(ev) - 300) {
+          const char *le = strchr(nm, '\n');
+          size_t nl = le ? (size_t)(le - nm) : strlen(nm);
+          char nline[224];
+          if (nl >= sizeof(nline)) nl = sizeof(nline) - 1;
+          memcpy(nline, nm, nl);
+          nline[nl] = '\0';
+          rd_appendf(ev, sizeof(ev), "  %s\n", nline);
+        }
+      }
     }
     free(txt);
   }
@@ -602,6 +672,73 @@ static void lkm_node_fingerprints(rd_report *rep) {
               "%d /proc/susfs_* node(s) answered with the counter/table format this LKM port "
               "documents (stat dispatcher counters, O_PATH self-test, hide tables). The text "
               "identifies the port: these read handlers belong to the module itself.", hits);
+}
+
+/* ---------------------------------------------------- syscall-coverage oracle
+ *
+ * The one check that works WITHOUT root. With the hiding layer armed, stat(2)
+ * on the module's own paths answers ENOENT to every non-root caller - by
+ * design (susfs.h: "hides it from EVERY non-root caller, not merely from app
+ * processes - otherwise a probe running as system (1000) or shell (2000) reads
+ * the node name out of /proc"). That answer comes from discrete hooks; the
+ * paths themselves exist and keep resolving for syscalls outside the hook set.
+ * Proving existence THROUGH such a syscall while stat(2) denies the same path
+ * is contradictory on a clean kernel - the two read the same dentry tree - and
+ * lands here as susfs-lkm-node-oracle. See the section comment above for the
+ * per-syscall rationale and per-release coverage (mkdir/mknod-family from
+ * filename_create() is the leg no release r16..main closes). */
+static void lkm_syscall_oracle(rd_report *rep) {
+  char ev[RD_MAXEVID];
+  ev[0] = '\0';
+  int hits = 0, probed = 0;
+  for (size_t i = 0; i < RD_SUSFS_LKM_SELF_HIDDEN_COUNT; i++) {
+    const char *p = RD_SUSFS_LKM_SELF_HIDDEN[i];
+    /* Visible (the views above own that case) or blocked by the environment:
+     * neither is an oracle case. */
+    if (rd_probe_lstat(p) != 1) continue;
+    probed++;
+    int mk = rd_probe_mkdir_exists(p);
+    int rl = rd_probe_readlink_exists(p);
+    int fs = rd_probe_statfs_exists(p);
+    int op = rd_probe_open_o_path(p);
+    unsigned tell = rd_susfs_lkm_oracle_tell(1, mk, rl, fs, op);
+    if (!tell) continue;
+    /* A module loading while the probes run could race stat() and mkdir():
+     * keep the finding only while stat() STILL denies the path afterwards. */
+    if (rd_probe_lstat(p) != 1) continue;
+    hits++;
+    if (strlen(ev) < sizeof(ev) - 320) {
+      rd_appendf(ev, sizeof(ev), "%s\n  stat -> ENOENT, but", p);
+      if (tell & RD_TELL_MKDIR)
+        rd_appendf(ev, sizeof(ev), " mkdir(2) -> EEXIST (filename_create found the entry)");
+      if (tell & RD_TELL_READLINK)
+        rd_appendf(ev, sizeof(ev), " readlink(2) -> EINVAL (resolved, not a symlink)");
+      if (tell & RD_TELL_STATFS)
+        rd_appendf(ev, sizeof(ev), " statfs(2) -> resolved (pre-sb_statfs-hook build)");
+      if (tell & RD_TELL_OPATH)
+        rd_appendf(ev, sizeof(ev), " open(O_PATH) -> resolved (pre-r18.3 build)");
+      rd_appendf(ev, sizeof(ev), "\n");
+    }
+  }
+  if (hits)
+    rd_add_ev(rep, SEV_CRITICAL, "susfs-lkm-node-oracle",
+              "susfs_guard_lkm's hidden control paths exist for syscalls that deny them to stat()",
+              ev,
+              "%d of %d path(s) this module hides from every non-root caller answered ENOENT to "
+              "stat(2) while another system call resolved the same entry from this uid. On a clean "
+              "kernel both read the same dentry tree, so this split is a per-caller filter "
+              "answering stat(): the module makes its own nodes world-accessible (0777) and relies "
+              "on its LSM layer as the only gate, and that discrete hook set misses at least the "
+              "syscall named above. This is the module observed from a non-root uid.",
+              hits, probed);
+  else if (probed)
+    rd_add_ev(rep, SEV_INFO, "susfs-lkm-node-oracle-absent",
+              "no syscall-coverage contradiction on the self-hidden paths", ev,
+              "%d path(s) that stat(2) denies this uid were re-probed with "
+              "mkdir(2)/readlink(2)/statfs(2)/open(O_PATH): all answered consistently. That is "
+              "what a clean system looks like - and also what a build whose module closed every "
+              "tell this oracle knows looks like, so it does NOT prove the paths are absent.",
+              probed);
 }
 
 /* Files this LKM has to keep on disk: the flashable KernelSU module unpacks to
@@ -820,7 +957,10 @@ void rd_check_susfs_lkm(rd_ctx *c, rd_report *rep) {
     }
   }
 
-  /* ---- view D: /proc/kallsyms module tag ---- */
+  /* ---- view D: /proc/kallsyms module tag ----
+   * v2.3.0-r18 filters kallsyms lines whose module tag is in the hide list,
+   * for every reader, so a hit here now means an older build or a kprobe that
+   * failed to arm - extra evidence when present, never required. */
   bool tag = false;
   char tagline[256] = "";
   char *ks = rd_slurp("/proc/kallsyms", NULL);
@@ -891,9 +1031,10 @@ void rd_check_susfs_lkm(rd_ctx *c, rd_report *rep) {
     rd_add(rep, SEV_INFO, "susfs-lkm-module-absent", "no kernel view shows susfs_guard_lkm",
            "checked %d module name(s), the /sys/module listing, module parameters and "
            "/proc/kallsyms; no view names the LKM. Under a non-root uid this is also what a "
-           "loaded module looks like - its sysfs directory is hidden from non-root callers and "
-           "the /proc/susfs_* nodes answer ENOENT - so absence alone proves nothing without "
-           "uid 0.",
+           "loaded module looks like - its sysfs directory answers ENOENT to every non-root "
+           "caller and so do the /proc/susfs_* nodes - but that case is not left to trust: the "
+           "syscall-coverage oracle below re-probes the self-hidden paths and reports separately "
+           "when stat()'s ENOENT is contradicted by another system call.",
            mod_count);
   }
 
@@ -934,6 +1075,7 @@ void rd_check_susfs_lkm(rd_ctx *c, rd_report *rep) {
 
   lkm_artefacts(rep);
   lkm_node_fingerprints(rep);
+  lkm_syscall_oracle(rep);
 }
 
 /* ------------------------------------------------------- consistency engine */
