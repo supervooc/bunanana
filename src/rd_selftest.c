@@ -396,6 +396,22 @@ static void test_logic(void) {
      "lkm fingerprint: kstat needs both the maps line and a stat counter", NULL);
   ok(rd_susfs_lkm_node_fingerprint("/proc/susfs_kstat", "stat nr fstat (80): ok=1") == NULL,
      "lkm fingerprint: kstat without the maps line is rejected", NULL);
+  /* v2.3.0-r18 bodies, verbatim from its PROC_INTERFACES.md sample output. */
+  ok(rd_susfs_lkm_node_fingerprint(
+         "/proc/susfs_hide_modules",
+         "hide_modules: 1/16 name(s), /sys/module rules=1 (failed=0), /proc/modules lines removed=0, "
+         "kallsyms lines removed=0\nnames: susfs_guard_lkm") != NULL,
+     "lkm fingerprint: hide_modules body with the r18 counters", NULL);
+  ok(rd_susfs_lkm_node_fingerprint(
+         "/proc/susfs_hide_mounts",
+         "mount prefixes: 2/64, rescans=1, recorded=0, hidden_by_identity=0, learned_ids=0\n"
+         "prefixes: /data/adb/ /data/local/tmp/") != NULL,
+     "lkm fingerprint: /proc/susfs_hide_mounts prefix table", NULL);
+  ok(rd_susfs_lkm_node_fingerprint(
+         "/proc/susfs_open_redirect",
+         "(empty)\nhooks: forward=0 dpath=0 statfs=0 maps=0 fdinfo=0 | rev hits: dpath=0 statfs=0 "
+         "maps=0/0/0 fdinfo=0/0 | su_sid=2907") != NULL,
+     "lkm fingerprint: /proc/susfs_open_redirect hook counters", NULL);
 }
 
 /* --------------------------------------------------------------- live probes */

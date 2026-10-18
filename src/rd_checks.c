@@ -58,7 +58,8 @@ const size_t RD_HIDING_PATH_COUNT = sizeof(RD_HIDING_PATHS) / sizeof(RD_HIDING_P
  *  - the flashable KernelSU module installs to /data/adb/modules/susfs_guard_lkm
  *    with lib/susfs_guard_lkm-<kmi>.ko, bin/susfs_insmod, module.prop
  *    (id=susfs_guard_lkm) and an optional early_load marker;
- *  - customize.sh also installs /data/adb/post-fs-data.d/00-susfs-guard-lkm.sh;
+ *  - customize.sh also installs /data/adb/post-fs-data.d/00-susfs-guard-lkm.sh
+ *    (a copy of its early-dispatch.sh, the shared boot loader);
  *  - the manual route in the README loads /data/adb/loader/susfs_guard_lkm.ko
  *    (KernelSU: `ksud insmod`, otherwise the susfs_insmod loader).
  * The KMI-suffixed .ko names under .../lib are found by a directory scan in
@@ -71,6 +72,7 @@ const char *const RD_SUSFS_LKM_PATHS[] = {
     "/data/adb/modules/susfs_guard_lkm/skip_mount",
     "/data/adb/modules/susfs_guard_lkm/bin/susfs_insmod",
     "/data/adb/modules/susfs_guard_lkm/kmi.sh",
+    "/data/adb/modules/susfs_guard_lkm/early-dispatch.sh",
     "/data/adb/modules_update/susfs_guard_lkm",
     "/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh",
     "/data/adb/loader/susfs_guard_lkm.ko",

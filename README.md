@@ -144,17 +144,19 @@ adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 
 | id | 级别 | 原理 |
 |---|---|---|
-| `susfs-lkm-module-filtered` | **CRITICAL** | **模块自过滤被抓现行**：`/sys/module/susfs_guard_lkm`（或其 `parameters/`、kallsyms 的 `[susfs_guard_lkm]` 标签）在内核里可见，而 `/proc/modules` 没有对应行。它的加载横幅原文写着「本模块会被从 `/proc/modules` 中滤除，对包括 root 在内的所有调用者生效，请改用 `/sys/module/susfs_guard_lkm` 判断是否已加载」——两个视图互相矛盾，就是过滤器正在工作 |
-| `susfs-lkm-module` | HIGH | 模块被 `/proc/modules` 列出（自过滤未启用或 hide 列表被 `clear`），或 `/proc/modules` 不可读但 sysfs / 参数 / kallsyms 任一可见——隐藏能力本身已就位 |
-| `susfs-lkm-artefact` | HIGH | 磁盘上的安装/加载布局：`/data/adb/modules{,s_update}/susfs_guard_lkm`（含 `module.prop`、`lib/susfs_guard_lkm-<kmi>.ko`、`bin/susfs_insmod`、`early_load`）、`/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh`、README 手动路线的 `/data/adb/loader/susfs_guard_lkm.ko`。`.ko` 必须留盘以便开机重插，藏不掉 |
+| `susfs-lkm-module-filtered` | **CRITICAL** | **模块自过滤被抓现行**：`/sys/module/susfs_guard_lkm` 及其 `parameters/` 对 root 仍然可见，而 `/proc/modules` 没有对应行。它的加载横幅原文写着「本模块会被从 `/proc/modules` 中滤除，对包括 root 在内的所有调用者生效，请改用 `/sys/module/susfs_guard_lkm` 判断是否已加载」——两个视图互相矛盾，就是过滤器正在工作（v2.3.0-r18 起 kallsyms 的模块标签也被一并过滤、`/sys/module` 目录只对非 root 隐藏，不影响 root 视角下这组 sysfs/参数矛盾） |
+| `susfs-lkm-module` | HIGH | 模块被 `/proc/modules` 列出（自过滤未启用或 hide 列表被 `clear`），或 `/proc/modules` 不可读但 sysfs / 参数任一可见——隐藏能力本身已就位 |
+| `susfs-lkm-artefact` | HIGH | 磁盘上的安装/加载布局：`/data/adb/modules{,s_update}/susfs_guard_lkm`（含 `module.prop`、`lib/susfs_guard_lkm-<kmi>.ko`、`bin/susfs_insmod`、`early_load`、`early-dispatch.sh`）、`/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh`、README 手动路线的 `/data/adb/loader/susfs_guard_lkm.ko`。`.ko` 必须留盘以便开机重插，藏不掉 |
 | `susfs-lkm-artefact-hidden` | **CRITICAL** | 上述路径对部分 syscall 可见、对另一部分 ENOENT——按路径的隐藏规则只拦截了一部分接口 |
-| `susfs-lkm-node-fingerprint` | **CRITICAL** | `/proc/susfs_*` 节点**内容**与该移植版文档（`PROC_INTERFACES.md`）记载的计数器/表格格式吻合：`opath/openat nr=`、`maps: armed=`、`stat nr `、`hide_modules:`、`priv_app_sid=`…。光「节点存在」可能被伪造，能复现这些读数说明是模块自己的 read handler 在响应 |
+| `susfs-lkm-node-fingerprint` | **CRITICAL** | `/proc/susfs_*` 节点**内容**与该移植版文档（`PROC_INTERFACES.md`）记载的计数器/表格格式吻合：`opath/openat nr=`、`maps: armed=`、`stat nr `、`hide_modules:`、`priv_app_sid=`…；其中 `hide_modules` 节默认还会列出 `names: susfs_guard_lkm`——等于把自己的名字写进了隐藏名单。光「节点存在」可能被伪造，能复现这些读数说明是模块自己的 read handler 在响应 |
 | `susfs-lkm-usedby` | HIGH | `hide_modules` 只删模块自己那一行；其他模块的 used-by 列仍会写出它的名字 |
 | `kernel-module-list-ghost` | MEDIUM | `tainted` 的 bit 12 (OE) 置位（装载过 out-of-tree 模块）而 `/proc/modules` 一条都不列。taint 是黏性的（rmmod 后仍保留），所以只算佐证：要么模块被卸载过，要么列表被清空 |
 
 模块名按**前缀**匹配（`susfs_guard_lkm`、`susfs_guard_lkm_android13_5_15`…）：该模块以 `.ko` 文件名作为模块名，而发布包叫 `susfs_guard_lkm-<kmi>.ko`。
 
-> 非 root 时的盲区（如实说明）：hide 规则武装后 sysfs 目录对非 root 不可见、`/proc/susfs_*` 一律 ENOENT——上面一半证据只有 uid 0 拿得到，与 §8「深度检查需 root」一致。
+模块参数哨兵：`expose_proc` / `fail_layer` / `opath_test` / `opath_dump`（v2.3.0-r18 起还有 `hide_modules` / `or_entry` / `uname_spoof_enabled`）——都是该移植版独有的参数名，任一出现在 `/sys/module/<名字>/parameters/` 即确认身份。
+
+> 非 root 时的盲区（如实说明）：hide 规则武装后 sysfs 目录对非 root 不可见、`/proc/susfs_*` 一律 ENOENT，kallsyms 模块标签也被过滤——判定所依赖的一致/矛盾证据只有 uid 0 拿得到，与 §8「深度检查需 root」一致。
 
 ---
 

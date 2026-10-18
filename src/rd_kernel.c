@@ -505,28 +505,45 @@ void rd_check_susfs(rd_ctx *c, rd_report *rep) {
  * `ksud insmod` or the release's own susfs_insmod loader.
  *
  * The checks below lean on statements the project makes about itself, not on
- * string luck:
+ * string luck. v2.3.0-r18 (susfs_hide_syms.c) spells the self-filter out:
+ *  - /proc/modules: its m_show() line is removed "for EVERY reader, root
+ *    included, since a checker may well run as root and this listing is what
+ *    it compares against";
+ *  - /proc/kallsyms: lines whose module tag is in the hide list are filtered,
+ *    "also for every reader", so a visible [susfs_guard_lkm] tag now means an
+ *    older build or a kprobe that failed to arm - bonus evidence only;
+ *  - /sys/module/<name>: hidden from non-root callers only - "root keeps
+ *    access (that is where a module's parameters live)". The sysfs directory,
+ *    its parameter files and the /proc/susfs_* bodies are therefore views a
+ *    root scan still reaches, and any of them answering while /proc/modules
+ *    omits the module is the self-filter observed in the act.
+ *  - The default hide list holds just this module ("a built-in SUSFS has no
+ *    module entry"), seeded at init; the /proc/susfs_hide_modules body's
+ *    names: line therefore carries susfs_guard_lkm on a fresh load (`clear`
+ *    is the project's debugging mode).
  *  - susfs_main.c's load banner: "This module is filtered out of /proc/modules
  *    for every caller including root, so `lsmod | grep susfs` stays empty -
- *    check /sys/module/susfs_guard_lkm instead." The sysfs directory, its
- *    parameter files and the kallsyms module tag are views that self-filter
- *    does NOT cover, so any of them answering while /proc/modules omits the
- *    module is the filter observed in the act.
+ *    check /sys/module/susfs_guard_lkm instead."
  *  - module/load.sh uses `[ -d /sys/module/susfs_guard_lkm ]` as its own
  *    "already loaded" probe; the parameters expose_proc / fail_layer /
- *    opath_test / opath_dump are unique to this port.
+ *    opath_test / opath_dump (v2.3.0-r18 adds hide_modules / or_entry /
+ *    uname_spoof_enabled) are unique to this port.
  *  - susfs.h: the module name is the .ko file name; releases ship
  *    susfs_guard_lkm-<kmi>.ko, so name lookups here are prefix matches
  *    (susfs_guard_lkm, susfs_guard_lkm_android13_5_15, ...).
- *  - PROC_INTERFACES.md: hide_modules removes the module's own /proc/modules
- *    line only - another module's "used by" column would still name it.
+ *  - PROC_INTERFACES.md: hide_modules removes a listed module's own
+ *    /proc/modules line only - another module's "used by" column would still
+ *    name it.
  *  - PROC_INTERFACES.md documents the control-node bodies; the counter/table
  *    shapes are reproduced in rd_susfs_lkm_node_fingerprint().
  */
 
-/* Module parameters this LKM declares (susfs_main.c, susfs_opath.c). Seeing
- * any of them under /sys/module/<name>/parameters/ identifies the port. */
-static const char *const lkm_params[] = {"expose_proc", "fail_layer", "opath_test", "opath_dump"};
+/* Module parameters this LKM declares (susfs_main.c, susfs_opath.c,
+ * susfs_hide_syms.c, susfs_or_entry.c, susfs_uname.c; the v2.3.0-r18 set).
+ * Seeing any of them under /sys/module/<name>/parameters/ identifies the
+ * port - none of these names is a stock kernel parameter. */
+static const char *const lkm_params[] = {"expose_proc",    "fail_layer", "opath_test", "opath_dump",
+                                         "hide_modules",   "or_entry",   "uname_spoof_enabled"};
 
 /* True for the module's sysfs/proc name: equal to the base name, or the name
  * the kernel derived from the .ko file name (dashes become underscores, so
@@ -593,6 +610,20 @@ static void lkm_node_fingerprints(rd_report *rep) {
       first[n] = '\0';
       if (strlen(ev) < sizeof(ev) - 300)
         rd_appendf(ev, sizeof(ev), "%s: %s\n  %s\n", nodes[i], what, first);
+      /* The hide table names what it hides; on a default load that is this
+       * module itself - carry the names: line into the evidence. */
+      if (strcmp(nodes[i], "/proc/susfs_hide_modules") == 0) {
+        const char *nm = strstr(txt, "names:");
+        if (nm && strlen(ev) < sizeof(ev) - 300) {
+          const char *le = strchr(nm, '\n');
+          size_t nl = le ? (size_t)(le - nm) : strlen(nm);
+          char nline[224];
+          if (nl >= sizeof(nline)) nl = sizeof(nline) - 1;
+          memcpy(nline, nm, nl);
+          nline[nl] = '\0';
+          rd_appendf(ev, sizeof(ev), "  %s\n", nline);
+        }
+      }
     }
     free(txt);
   }
@@ -820,7 +851,10 @@ void rd_check_susfs_lkm(rd_ctx *c, rd_report *rep) {
     }
   }
 
-  /* ---- view D: /proc/kallsyms module tag ---- */
+  /* ---- view D: /proc/kallsyms module tag ----
+   * v2.3.0-r18 filters kallsyms lines whose module tag is in the hide list,
+   * for every reader, so a hit here now means an older build or a kprobe that
+   * failed to arm - extra evidence when present, never required. */
   bool tag = false;
   char tagline[256] = "";
   char *ks = rd_slurp("/proc/kallsyms", NULL);
