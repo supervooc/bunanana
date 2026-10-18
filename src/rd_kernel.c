@@ -735,7 +735,7 @@ void rd_check_susfs_lkm(rd_ctx *c, rd_report *rep) {
 
   /* ---- view A: /proc/modules, the view the module filters ---- */
   bool mods_readable = false, in_modules = false;
-  int mod_count = 0, usedby_hits = 0;
+  int mod_count = 0, usedby_hits = 0, othername_hits = 0;
   char modline[512] = "";
   char usedby[RD_MAXEVID];
   usedby[0] = '\0';
@@ -752,10 +752,17 @@ void rd_check_susfs_lkm(rd_ctx *c, rd_report *rep) {
         rd_copy(modline, sizeof(modline), line);
         continue;
       }
-      /* hide_modules removes the module's own line only: a dependent module's
-       * "used by" column (or any other column) still names it. */
+      /* Two different things put "susfs" on a line that is not the LKM's own:
+       * a module whose *own* name spells it (a differently named build of the
+       * same family - the module name comes from the .ko file name, so a rename
+       * is all it takes), and another module's "used by" column, which is the
+       * leak hide_modules leaves behind. Only the second one is the self-filter
+       * observed in the act, so they are counted apart. */
       if (rd_contains_ci(line, "susfs")) {
-        usedby_hits++;
+        if (rd_contains_ci(name, "susfs"))
+          othername_hits++;
+        else
+          usedby_hits++;
         if (strlen(usedby) < sizeof(usedby) - 512) rd_appendf(usedby, sizeof(usedby), "%s\n", line);
       }
     }
@@ -839,8 +846,10 @@ void rd_check_susfs_lkm(rd_ctx *c, rd_report *rep) {
     free(ks);
   }
 
-  /* ---- decision ---- */
-  bool kernel_view = sysfs || params > 0 || tag;
+  /* ---- decision ----
+   * sysfs already implies the parameters: sysname is only filled in when a
+   * sysfs view answered, and the parameter loop runs off sysname. */
+  bool kernel_view = sysfs || tag;
   if (kernel_view && mods_readable && !in_modules) {
     char ev[RD_MAXEVID];
     ev[0] = '\0';
@@ -893,8 +902,18 @@ void rd_check_susfs_lkm(rd_ctx *c, rd_report *rep) {
               "another module's line names the LKM missing from the module list", usedby,
               "%d /proc/modules line(s) mention susfs in a column other than a module name. The "
               "self-filter removes only the module's own line, so a dependent's \"used by\" list "
-              "still leaks it.",
-              usedby_hits);
+              "still leaks it.%s",
+              usedby_hits,
+              othername_hits ? " Other lines carry susfs in a module's own name - those are a "
+                               "differently named susfs build, not this LKM." : "");
+  else if (othername_hits && !in_modules)
+    rd_add_ev(rep, SEV_HIGH, "susfs-lkm-usedby",
+              "a susfs module is loaded under a name other than susfs_guard_lkm", usedby,
+              "%d /proc/modules line(s) carry susfs in their own module name, so a susfs hiding "
+              "module is loaded - just not under the LKM's name (the module name is taken from "
+              "the .ko file name, so a renamed build is enough). The self-filter explanation "
+              "would be wrong here; the module list never carried this LKM's name to filter.",
+              othername_hits);
 
   /* ---- taint/list ghost: OE set while no module is listed at all ---- */
   if (mods_readable && mod_count == 0 && !in_modules &&
@@ -904,9 +923,10 @@ void rd_check_susfs_lkm(rd_ctx *c, rd_report *rep) {
       rd_add(rep, SEV_MEDIUM, "kernel-module-list-ghost",
              "taint says an out-of-tree module was loaded but no module is listed",
              "tainted=%ld has bit 12 (OE) set: the kernel recorded an out-of-tree module load, "
-             "yet /proc/modules lists none at all. The bit is sticky - an rmmod leaves it set - "
-             "so this is corroboration, not proof; but removing its own line is exactly what "
-             "susfs_guard_lkm does, and an emptied list covers that up best.",
+             "yet /proc/modules lists none at all. The bit is sticky, so a stock device whose "
+             "only vendor module was rmmod'ed once leaves the same state - this is corroboration, "
+             "not proof. It is reported because emptying the list is also what susfs_guard_lkm's "
+             "self-filter looks like when nothing else is loaded.",
              t);
   }
 
