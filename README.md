@@ -358,8 +358,8 @@ wsl -u root -e bash android-rootdetect/scripts/wsl-verify.sh fixtures # 注入 +
 
 | 场景 | 实测结果 |
 |---|---|
-| `--selftest` | **75 checks, 0 failure(s), 6 skipped**（当前二进制；多出的 SKIP 是内核模块列表相关的结构性断言，本机 WSL 内核无可加载模块标签） |
-| 干净系统基线（误报率） | **verdict: CLEAN** —— 0 critical / 0 high / 0 medium / 0 low（19 条 INFO） |
+| `--selftest` | **107 checks, 0 failure(s), 2 skipped**（当前二进制；两条 SKIP 是 Android 专属断言——getprop 表与 ro.build.version.sdk） |
+| 干净系统基线（误报率） | **verdict: CLEAN** —— 0 critical / 0 high / 0 medium / 0 low（其余全部 INFO；条数随内核与环境不同） |
 | 注入 root 痕迹（`/system/xbin/su`、`/system/bin/ksud`、`/data/adb/magisk`） | `artefact-present` + `artefact-listing` = **HIGH**，verdict: ROOT_DETECTED（exit 2） |
 | `tmpfs` 覆盖 `/system` | `mount-overlay` = **HIGH** |
 | bind-mount 伪造 `/proc/version`（复刻 SuSFS uname 层：syscall 被改而 `/proc` 保持真值） | `spoof-uname` = **CRITICAL**，verdict: HIDING_DETECTED |
@@ -403,7 +403,7 @@ APK 内容（已逐项核验）：
 
 产物（已核验）：
 
-- 产物：`out/bunanana.apk`，**7,218,732 字节**，`sha256=c78d49584ddca3719b82dad0be7fc56fd4f806dfe08c21eac39d2089f2cec59b`
+- 产物：`out/bunanana.apk`，**951,852 字节**，`sha256=caf3163378620331cd38ec25dfae08b5f62267e27f62cbe150a3b67bb0a3dec1`
 - 下载直链：https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
 
 设计要点：

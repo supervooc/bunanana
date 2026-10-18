@@ -358,8 +358,8 @@ wsl -u root -e bash android-rootdetect/scripts/wsl-verify.sh fixtures # inject +
 
 | Scenario | Measured result |
 |---|---|
-| `--selftest` | **75 checks, 0 failure(s), 6 skipped** (current binary; the extra skips are the kernel module-list assertions, this WSL kernel exposes no loadable module tags) |
-| clean-system baseline (false-positive rate) | **verdict: CLEAN** — 0 critical / 0 high / 0 medium / 0 low (19 INFO items) |
+| `--selftest` | **107 checks, 0 failure(s), 2 skipped** (current binary; the two skips are the Android-only assertions - the getprop table and ro.build.version.sdk) |
+| clean-system baseline (false-positive rate) | **verdict: CLEAN** — 0 critical / 0 high / 0 medium / 0 low (the rest are INFO rows; the count depends on the kernel and environment) |
 | injected root traces (`/system/xbin/su`, `/system/bin/ksud`, `/data/adb/magisk`) | `artefact-present` + `artefact-listing` = **HIGH**, verdict: ROOT_DETECTED (exit 2) |
 | `tmpfs` over `/system` | `mount-overlay` = **HIGH** |
 | bind-mounting a fake `/proc/version` (replicating SuSFS's uname layer: the syscall is changed while `/proc` keeps the truth) | `spoof-uname` = **CRITICAL**, verdict: HIDING_DETECTED |
@@ -403,7 +403,7 @@ APK contents (verified item by item):
 
 Product (verified):
 
-- Product: `out/bunanana.apk`, **7,218,732 bytes**, `sha256=c78d49584ddca3719b82dad0be7fc56fd4f806dfe08c21eac39d2089f2cec59b`
+- Product: `out/bunanana.apk`, **951,852 bytes**, `sha256=caf3163378620331cd38ec25dfae08b5f62267e27f62cbe150a3b67bb0a3dec1`
 - Direct download: https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
 
 Design points:
