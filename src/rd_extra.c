@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
@@ -96,13 +97,66 @@ static long socket_owner_uid(const char *inode, char *how, size_t howsz) {
   return uid;
 }
 
-/* One AF_UNIX socket as reported by NETLINK_SOCK_DIAG. */
+/* Collects suspicious socket names from either view in one pass.
+ *
+ * A device can expose a complete /proc/net/unix, a complete netlink table, or
+ * either one filtered. Matches are merged by socket inode so a socket seen in
+ * both views is counted once. The netlink view is collected first: it is the
+ * only one that carries UNIX_DIAG_UID, and that UID must win over the
+ * /proc/<pid>/fd walk, which cannot see a root process from an app domain. */
 typedef struct {
-  char name[192];
-  unsigned int uid;
-  unsigned int ino;
-  bool have_uid;
-} unix_diag_row;
+  int hits;
+  int root_owned;
+  int nonroot_owned;
+  unsigned int seen[256];
+  size_t n_seen;
+  char ev[RD_MAXEVID];
+} unix_scan;
+
+/* True when this inode was already counted. A zero inode is never merged
+ * because there is nothing to compare. */
+static bool unix_seen(unix_scan *sc, unsigned int ino) {
+  if (!ino) return false;
+  for (size_t i = 0; i < sc->n_seen; i++)
+    if (sc->seen[i] == ino) return true;
+  if (sc->n_seen < sizeof(sc->seen) / sizeof(sc->seen[0])) sc->seen[sc->n_seen++] = ino;
+  return false;
+}
+
+/* Record one name match. `display` is what the evidence line shows, `match` is
+ * the text searched for the keywords, and `uid` is the already-known owner when
+ * have_uid is true. */
+static void unix_account(unix_scan *sc, const char *display, const char *match,
+                         unsigned int ino, long uid, bool have_uid) {
+  const char *which = NULL;
+  if (!rd_has_keyword(match, &which)) return;
+  if (strcmp(which, "busybox") == 0) return;
+  if (unix_seen(sc, ino)) return;
+  sc->hits++;
+  char how[96] = "owner unknown";
+  if (have_uid) {
+    snprintf(how, sizeof(how), "netlink uid %ld", uid);
+  } else if (ino) {
+    char ino_s[32];
+    snprintf(ino_s, sizeof(ino_s), "%u", ino);
+    uid = socket_owner_uid(ino_s, how, sizeof(how));
+  }
+  if (uid == 0)
+    sc->root_owned++;
+  else if (uid > 0)
+    sc->nonroot_owned++;
+  if (strlen(sc->ev) < sizeof(sc->ev) - 256)
+    rd_appendf(sc->ev, sizeof(sc->ev), "%s [%s]\n", display, how);
+}
+
+typedef void (*unix_diag_cb)(void *ud, const char *name, unsigned int uid,
+                             bool have_uid, unsigned int ino);
+
+enum {
+  UNIX_DUMP_OK = 0,
+  UNIX_DUMP_ERR = -1,
+  UNIX_DUMP_INCOMPLETE = -2
+};
 
 /* Enumerate AF_UNIX sockets through NETLINK_SOCK_DIAG.
  *
@@ -110,14 +164,22 @@ typedef struct {
  * the whole socket-name check a skip. The kernel exposes the same table over
  * sock_diag, and modern kernels include UNIX_DIAG_UID, so the owner of a name
  * can be known without walking /proc/<pid>/fd (which an app cannot do for root
- * processes anyway). Returns the number of rows filled, or -1 with `why` set.
- */
-static int unix_diag_dump(unix_diag_row *rows, int max, char *why, size_t whysz) {
+ * processes anyway). The table is streamed to `cb` instead of being stored in a
+ * fixed-size array: busy hosts can have far more than 256 named sockets, and
+ * the old cap silently dropped every match past it.
+ *
+ * Only messages from the kernel (port 0), with our sequence number and a
+ * complete unix_diag_msg header, are accepted. A dump that ends with
+ * NLM_F_DUMP_INTR, a truncated datagram, a recv error before NLMSG_DONE, or an
+ * NLMSG_ERROR is reported as incomplete instead of being mistaken for a
+ * complete table. Returns UNIX_DUMP_OK, UNIX_DUMP_ERR or
+ * UNIX_DUMP_INCOMPLETE; `why` explains anything but OK. */
+static int unix_diag_dump(unix_diag_cb cb, void *ud, char *why, size_t whysz) {
   if (whysz) why[0] = '\0';
   int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG);
   if (fd < 0) {
     snprintf(why, whysz, "socket: %s", strerror(errno));
-    return -1;
+    return UNIX_DUMP_ERR;
   }
   /* Never let a wedged kernel hang the whole scan: the tool has a watchdog,
    * but a two-second cap keeps the check itself bounded. */
@@ -132,7 +194,7 @@ static int unix_diag_dump(unix_diag_row *rows, int max, char *why, size_t whysz)
   if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
     snprintf(why, whysz, "bind: %s", strerror(errno));
     close(fd);
-    return -1;
+    return UNIX_DUMP_ERR;
   }
 
   struct {
@@ -140,45 +202,80 @@ static int unix_diag_dump(unix_diag_row *rows, int max, char *why, size_t whysz)
     struct unix_diag_req req;
   } msg;
   memset(&msg, 0, sizeof(msg));
+  const unsigned int seq = 1;
   msg.nlh.nlmsg_len = sizeof(msg);
   msg.nlh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
   msg.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
-  msg.nlh.nlmsg_seq = 1;
+  msg.nlh.nlmsg_seq = seq;
   msg.req.sdiag_family = AF_UNIX;
   msg.req.udiag_states = 0xffffffffu;
-  msg.req.udiag_show = UDIAG_SHOW_NAME;
+  /* NAME gives the path; UID is what turns a bare name into a root-owned
+   * control channel. Kernels predating UNIX_DIAG_UID ignore the bit. */
+  msg.req.udiag_show = UDIAG_SHOW_NAME | UDIAG_SHOW_UID;
   if (send(fd, &msg, sizeof(msg), 0) < 0) {
     snprintf(why, whysz, "send: %s", strerror(errno));
     close(fd);
-    return -1;
+    return UNIX_DUMP_ERR;
   }
 
-  int n = 0;
-  for (;;) {
+  bool done = false, intr = false, failed = false, saw_msg = false;
+  while (!done && !failed) {
     char buf[8192];
-    ssize_t got = recv(fd, buf, sizeof(buf), 0);
+    struct sockaddr_nl from;
+    memset(&from, 0, sizeof(from));
+    struct iovec iov;
+    iov.iov_base = buf;
+    iov.iov_len = sizeof(buf);
+    struct msghdr mh;
+    memset(&mh, 0, sizeof(mh));
+    mh.msg_name = &from;
+    mh.msg_namelen = sizeof(from);
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    ssize_t got = recvmsg(fd, &mh, 0);
     if (got < 0) {
-      if (n > 0) break; /* timeout after useful rows: keep them */
+      if (errno == EINTR) continue;
       snprintf(why, whysz, "recv: %s", strerror(errno));
-      close(fd);
-      return -1;
+      break;
     }
-    if (got == 0) break;
+    if (got == 0) {
+      snprintf(why, whysz, "netlink closed before NLMSG_DONE");
+      break;
+    }
+    /* Kernel replies come from port 0. A user process can send to our port but
+     * cannot spoof the source, so anything else is not the kernel's table. */
+    if (mh.msg_namelen < sizeof(from) || from.nl_family != AF_NETLINK || from.nl_pid != 0) {
+      intr = true;
+      continue;
+    }
+    /* A truncated datagram can still contain complete messages, but the rest
+     * of the table is lost: parse it, then force the incomplete return. */
+    if (mh.msg_flags & MSG_TRUNC) intr = true;
     unsigned int left = (unsigned int)got;
     for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, left); h = NLMSG_NEXT(h, left)) {
+      if (h->nlmsg_seq != seq) continue; /* late reply from an earlier dump, if any */
+      if (h->nlmsg_flags & NLM_F_DUMP_INTR) intr = true;
       if (h->nlmsg_type == NLMSG_DONE) {
-        close(fd);
-        return n;
+        done = true;
+        break;
       }
       if (h->nlmsg_type == NLMSG_ERROR) {
-        struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(h);
-        if (n == 0) {
-          snprintf(why, whysz, "netlink error %d", e->error);
-          close(fd);
-          return -1;
+        if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr))) {
+          snprintf(why, whysz, "short NLMSG_ERROR");
+          failed = true;
+          break;
         }
-        close(fd);
-        return n;
+        struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(h);
+        if (e->error) {
+          snprintf(why, whysz, "netlink error %d", e->error);
+          failed = true;
+          break;
+        }
+        continue; /* ACK; the dump still ends with NLMSG_DONE */
+      }
+      if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct unix_diag_msg))) {
+        intr = true;
+        continue;
       }
       struct unix_diag_msg *d = (struct unix_diag_msg *)NLMSG_DATA(h);
       int alen = (int)h->nlmsg_len - (int)NLMSG_LENGTH(sizeof(*d));
@@ -195,91 +292,90 @@ static int unix_diag_dump(unix_diag_row *rows, int max, char *why, size_t whysz)
           have_uid = true;
         }
       }
-      if (!name || n >= max) continue;
-      unix_diag_row *row = &rows[n++];
-      memset(row, 0, sizeof(*row));
-      bool abstract = nlen > 0 && name[0] == '\0';
+      saw_msg = true;
+      if (!name || nlen == 0) continue;
+      bool abstract = name[0] == '\0';
       size_t off = abstract ? 1 : 0;
       size_t copy = nlen - off;
-      if (copy > sizeof(row->name) - 2) copy = sizeof(row->name) - 2;
-      if (abstract) row->name[0] = '@';
-      memcpy(row->name + (abstract ? 1 : 0), name + off, copy);
-      row->name[(abstract ? 1 : 0) + copy] = '\0';
-      row->uid = uid;
-      row->have_uid = have_uid;
-      row->ino = d->udiag_ino;
+      char pretty[192];
+      if (copy > sizeof(pretty) - 2) copy = sizeof(pretty) - 2;
+      if (abstract) pretty[0] = '@';
+      memcpy(pretty + (abstract ? 1 : 0), name + off, copy);
+      pretty[(abstract ? 1 : 0) + copy] = '\0';
+      cb(ud, pretty, uid, have_uid, d->udiag_ino);
     }
   }
   close(fd);
-  return n;
+  if (done && !intr) return UNIX_DUMP_OK;
+  if (done || intr || saw_msg) {
+    if (!why[0]) snprintf(why, whysz, "%s", intr ? "dump was interrupted" : "dump did not finish");
+    return UNIX_DUMP_INCOMPLETE;
+  }
+  if (!why[0]) snprintf(why, whysz, "no netlink reply");
+  return UNIX_DUMP_ERR;
+}
+
+static void unix_diag_collect(void *ud, const char *name, unsigned int uid,
+                              bool have_uid, unsigned int ino) {
+  unix_account((unix_scan *)ud, name, name, ino, have_uid ? (long)uid : -1, have_uid);
 }
 
 /* Root and instrumentation frameworks keep a control channel as an abstract
  * unix socket: Frida's linjector, Zygisk's daemon, Magisk's socket, LSPosed. */
 static void check_unix_sockets(rd_report *rep) {
-  char ev[RD_MAXEVID];
-  ev[0] = '\0';
-  int hits = 0, root_owned = 0, nonroot_owned = 0;
+  unix_scan sc;
+  memset(&sc, 0, sizeof(sc));
+  char why[160] = "";
+  int rc = unix_diag_dump(unix_diag_collect, &sc, why, sizeof(why));
+  if (rc == UNIX_DUMP_INCOMPLETE) {
+    /* One retry covers the common transient case (a dump racing a table
+     * change); the inode merge keeps the first attempt's matches from being
+     * counted twice. */
+    char why2[160] = "";
+    int rc2 = unix_diag_dump(unix_diag_collect, &sc, why2, sizeof(why2));
+    if (rc2 == UNIX_DUMP_OK) {
+      rc = UNIX_DUMP_OK;
+    } else {
+      rc = UNIX_DUMP_INCOMPLETE;
+      if (why2[0]) snprintf(why, sizeof(why), "%s", why2);
+    }
+  }
 
-  int rows = 0;
+  /* /proc/net/unix is merged after the kernel table: a name that both views
+   * see is counted once, with the kernel's UID taking precedence. A socket
+   * that only the proc view still exposes is added, and vice versa. This
+   * closes the gap where a filtered proc view with a plausible row count was
+   * trusted and the netlink fallback never ran. */
+  int proc_rows = 0;
   char *txt = rd_slurp("/proc/net/unix", NULL);
   if (txt) {
     char *save = NULL;
     for (char *line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-      char ino[64] = "";
-      if (unix_row_inode(line, ino, sizeof(ino))) rows++;
-      const char *which = NULL;
-      if (!rd_has_keyword(line, &which)) continue;
-      if (strcmp(which, "busybox") == 0) continue;
-      hits++;
-      char how[96] = "owner unknown";
-      long uid = -1;
-      if (ino[0]) uid = socket_owner_uid(ino, how, sizeof(how));
-      if (uid == 0)
-        root_owned++;
-      else if (uid > 0)
-        nonroot_owned++;
-      if (strlen(ev) < sizeof(ev) - 256) rd_appendf(ev, sizeof(ev), "%s [%s]\n", line, how);
+      char ino_s[64] = "";
+      if (!unix_row_inode(line, ino_s, sizeof(ino_s))) continue;
+      proc_rows++;
+      unix_account(&sc, line, line, (unsigned int)strtoul(ino_s, NULL, 10), -1, false);
     }
     free(txt);
   }
-  /* A header-only or empty view is as useless as an unreadable one: fall back
-   * to the kernel's own table instead of reporting "no suspicious names". */
-  if (rows == 0) {
-    static unix_diag_row net_rows[256];
-    char why[160] = "";
-    int n = unix_diag_dump(net_rows, 256, why, sizeof(why));
-    if (n < 0) {
-      rd_add_skip(rep, SEV_INFO, "unix-sockets",
-                  "/proc/net/unix unavailable and the netlink dump failed",
-                  "/proc/net/unix is denied to this domain or returned no rows, and "
-                  "NETLINK_SOCK_DIAG returned no table (%s), so the socket-name check could not "
-                  "run. This is not a clean result.", why);
-      return;
-    }
-    for (int i = 0; i < n; i++) {
-      const char *which = NULL;
-      if (!rd_has_keyword(net_rows[i].name, &which)) continue;
-      if (strcmp(which, "busybox") == 0) continue;
-      hits++;
-      long uid = net_rows[i].have_uid ? (long)net_rows[i].uid : -1;
-      char how[96] = "owner unknown";
-      if (uid >= 0) {
-        snprintf(how, sizeof(how), "netlink uid %ld", uid);
-      } else if (net_rows[i].ino) {
-        char ino[32];
-        snprintf(ino, sizeof(ino), "%u", net_rows[i].ino);
-        uid = socket_owner_uid(ino, how, sizeof(how));
-      }
-      if (uid == 0)
-        root_owned++;
-      else if (uid > 0)
-        nonroot_owned++;
-      if (strlen(ev) < sizeof(ev) - 256)
-        rd_appendf(ev, sizeof(ev), "%s [%s]\n", net_rows[i].name, how);
-    }
+
+  if (rc == UNIX_DUMP_ERR && proc_rows == 0) {
+    rd_add_skip(rep, SEV_INFO, "unix-sockets",
+                "/proc/net/unix unavailable and the netlink dump failed",
+                "/proc/net/unix is denied to this domain or returned no rows, and "
+                "NETLINK_SOCK_DIAG returned no table (%s), so the socket-name check could not "
+                "run. This is not a clean result.", why);
+    return;
   }
-  if (!hits) {
+  if (rc == UNIX_DUMP_INCOMPLETE) {
+    rd_add_skip(rep, SEV_INFO, "unix-sockets",
+                "the netlink socket table dump was incomplete",
+                "The NETLINK_SOCK_DIAG cross-check was interrupted, truncated or timed out (%s). "
+                "Any match below is real, but a missing name is not proof of a clean device.",
+                why);
+    if (!sc.hits) return;
+  }
+  if (!sc.hits) {
     rd_add(rep, SEV_INFO, "unix-sockets", "no suspicious unix socket names", "");
     return;
   }
@@ -287,21 +383,21 @@ static void check_unix_sockets(rd_report *rep) {
    * process may take an abstract name, so one unprivileged bind() was enough to
    * turn this finding into ROOT_DETECTED (reproduced). Only a socket that can be
    * attributed to uid 0 earns HIGH. */
-  rd_sev sev = root_owned ? SEV_HIGH : SEV_MEDIUM;
+  rd_sev sev = sc.root_owned ? SEV_HIGH : SEV_MEDIUM;
   rd_add_ev(rep, sev, "unix-socket-roots",
-            "unix socket name references a root/instrumentation framework", ev,
-            root_owned
+            "unix socket name references a root/instrumentation framework", sc.ev,
+            sc.root_owned
                 ? "%d socket name(s) matched and at least one is held by uid 0, so it is a control "
                   "channel of a root process (a socket name, not a file, so hiding the filesystem "
                   "does not remove it)."
-                : nonroot_owned
+                : sc.nonroot_owned
                       ? "%d socket name(s) matched but none are held by uid 0: every match belongs "
                         "to a non-root process, and any process can bind an abstract name such as "
                         "\"@magisk\", so this is not proof of root."
                       : "%d socket name(s) matched but the owning process could not be determined "
                         "from this domain (no /proc/<pid>/fd access), so the name alone is not "
                         "proof of root.",
-            hits);
+            sc.hits);
 }
 
 /* ------------------------------------------------------- tracer / environment */
