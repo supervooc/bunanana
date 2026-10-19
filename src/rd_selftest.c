@@ -378,6 +378,16 @@ static void test_logic(void) {
   ok((rep2.flags & RD_F_HIDE) != 0 && strcmp(rep2.verdict, "HIDING_DETECTED") == 0,
      "flags: observed /proc/modules self-filter -> HIDING_DETECTED", rep2.verdict);
   rd_report_free(&rep2);
+  /* The sysfs-vs-/proc/modules cross-check is a second, kallsyms-independent
+   * proof that the module list is filtered; it must earn the same HIDING
+   * verdict instead of being classified as plain root. */
+  rd_report_init(&rep2);
+  rd_add(&rep2, SEV_HIGH, "kernel-module-list-filtered", "module list filtered", "x");
+  rd_finalize(&rep2);
+  ok((rep2.flags & RD_F_HIDE) != 0 && (rep2.flags & RD_F_HOOK) != 0 &&
+         strcmp(rep2.verdict, "HIDING_DETECTED") == 0,
+     "flags: filtered module list -> HIDING_DETECTED", rep2.verdict);
+  rd_report_free(&rep2);
   rd_report_init(&rep2);
   rd_add(&rep2, SEV_HIGH, "susfs-lkm-artefact", "lkm files", "x");
   rd_finalize(&rep2);
