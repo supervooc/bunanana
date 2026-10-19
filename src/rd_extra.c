@@ -94,8 +94,8 @@ static long socket_owner_uid(const char *inode, char *how, size_t howsz) {
 static void check_unix_sockets(rd_report *rep) {
   char *txt = rd_slurp("/proc/net/unix", NULL);
   if (!txt) {
-    rd_add(rep, SEV_INFO, "unix-sockets", "/proc/net/unix not readable",
-           "SELinux may restrict this file for the current domain.");
+    rd_add_skip(rep, SEV_INFO, "unix-sockets", "/proc/net/unix not readable",
+                "SELinux may restrict this file for the current domain.");
     return;
   }
   char ev[RD_MAXEVID];

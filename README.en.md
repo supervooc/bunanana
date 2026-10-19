@@ -90,6 +90,8 @@ adb root && adb shell /data/local/rx/rx     # uid 0: enables the deep kernel che
 
 > Run it **once under each identity**: the `shell` identity shows the app's point of view; `adb root`/`su` can see `/proc/kcore`, the kprobe list and the kernel log, covering the `deep-*` checks.
 
+> The report also ends with a `coverage:` line that counts the **checks that could not run because of permissions or the environment** (as a non-root user this usually includes the kernel symbol table, `/proc/modules`, the deep checks and the cross-ABI comparison). `CLEAN` only covers the checks that did run: `coverage: partial (...)` gives the count, and `-v` also prints the ids and the reason for each skip.
+
 ---
 
 ## 4. Detection matrix
@@ -361,7 +363,7 @@ wsl -u root -e bash android-rootdetect/scripts/wsl-verify.sh fixtures # inject +
 
 | Scenario | Measured result |
 |---|---|
-| `--selftest` | **107 checks, 0 failure(s), 2 skipped** (current binary; the two skips are the Android-only assertions - the getprop table and ro.build.version.sdk) |
+| `--selftest` | **128 checks, 0 failure(s), 2 skipped** (current binary; the two skips are the Android-only assertions - the getprop table and ro.build.version.sdk) |
 | clean-system baseline (false-positive rate) | **verdict: CLEAN** — 0 critical / 0 high / 0 medium / 0 low (the rest are INFO rows; the count depends on the kernel and environment) |
 | injected root traces (`/system/xbin/su`, `/system/bin/ksud`, `/data/adb/magisk`) | `artefact-present` + `artefact-listing` = **HIGH**, verdict: ROOT_DETECTED (exit 2) |
 | `tmpfs` over `/system` | `mount-overlay` = **HIGH** |
@@ -406,15 +408,15 @@ APK contents (verified item by item):
 
 Product (verified):
 
-- Product: `out/bunanana.apk`, **951,852 bytes**, `sha256=caf3163378620331cd38ec25dfae08b5f62267e27f62cbe150a3b67bb0a3dec1`
+- Product: `out/bunanana.apk`, **964,140 bytes**, `sha256=771a4f246a9c3389c8724f144cee59c443fc4b8d6ced4fcd408b508ecb5b40d4`
 - Direct download: https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
 
 Design points:
 
 * **No resource files at all**; the UI is built entirely in code, so `aapt2 + javac + d8` is all a build needs.
-* The static executable ships as `lib/<abi>/librootdetect.so` and is extracted into the app's native library directory on install (that directory is executable); the Activity runs it with `ProcessBuilder` and displays its output.
+* The static executable ships as `lib/<abi>/librootdetect.so` and is extracted into the app's native library directory on install (that directory is executable); the Activity runs it with `ProcessBuilder` and displays its output. The APK always carries all three builds (arm64-v8a / armeabi-v7a / x86_64) while the system extracts only the primary ABI: the Activity extracts the other 32-bit ABI's scanner from the APK into `filesDir` and points `ROOTDETECT_ABI_HELPER` at it, so the cross-ABI syscall-table comparison actually runs in the app (on 64-bit-only kernels the 32-bit ELF cannot execute and the check falls back to skipped).
 * `targetSdkVersion=28` is deliberate: Android 10+ forbids apps with targetSdk≥29 from `exec`ing out of their own data directory, and this tool needs to run native code on the device without root; should an OEM also block the native library directory, it degrades to "copy into `filesDir` and execute", and if that fails too it shows the adb command line.
-* **Result banner and log export**: the top of the report is now a result banner that states outright whether the device is rooted and whether anything is hidden, plus the risk counts, and lists *which concrete paths* each MEDIUM-or-above problem appears at (absolute paths parsed out of the evidence lines, e.g. `package-hidden -> /data/data/com.topjohnwu.magisk`). An **Export log** button writes the whole log (device header + banner + full report) to `Android/data/com.rootdetect.app/files/bunanana-report-<timestamp>.txt` and then opens the system share sheet (plain-text share, no storage permission; falls back to the app's private files directory when external storage is unavailable).
+* **Result banner and log export**: the top of the report is now a result banner that states outright whether the device is rooted and whether anything is hidden, plus the risk counts, and lists *which concrete paths* each MEDIUM-or-above problem appears at (absolute paths parsed out of the evidence lines, e.g. `package-hidden -> /data/data/com.topjohnwu.magisk`). The banner also shows **coverage** (parsed from the engine's trailing `coverage:` line): `complete`, or `N checks could not run (see the log below)` - so `CLEAN` is not misread as "everything was checked". An **Export log** button writes the whole log (device header + banner + full report) to `Android/data/com.rootdetect.app/files/bunanana-report-<timestamp>.txt` and then opens the system share sheet (plain-text share, no storage permission; falls back to the app's private files directory when external storage is unavailable).
 * **Installation was field-tested on an emulator**: `adb install` succeeded → the Activity displayed normally → pressing "RUN DETECTION" successfully executed the bundled static scanner and rendered the full report in the UI (screenshots: [apk-screenshot.png](out/apk-screenshot.png), [apk-screenshot-after.png](out/apk-screenshot-after.png)). No `avc: denied` blocked execution in the app domain (`untrusted_app_27`); the only things SELinux blocked were `stat` on `/sys/fs/selinux/enforce`, `/proc/sys/kernel/tainted` and `/system/xbin/su` (type `su_exec`), and the tool honestly degrades those to INFO and does **not** misjudge "some interfaces blocked" as hiding — probes rejected by SELinux do not take part in the vote.
 * Two build-pipeline pitfalls (both of which turn "looks fixed" into a lie): ① `build/apk-work` is wiped on every build, which used to delete the debug keystore along with it, so the regenerated key made the new package **unable to overwrite-install**, and `adb install` failed silently while the old version kept running (the keystore now lives persistently in `build/debug.keystore`, and the install script has an "uninstall first if the signature differs" fallback); ② the test script matched the button text in lowercase, while Android's `Button` uppercases its label.
 

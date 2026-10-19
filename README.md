@@ -90,6 +90,8 @@ adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 
 > 建议**两种身份各跑一次**：`shell` 身份看到的是应用视角；`adb root`/`su` 身份能看到 `/proc/kcore`、kprobe 列表、内核日志，覆盖 `deep-*` 系列检查。
 
+> 报告末尾另有一行 `coverage:`，统计**因权限/环境而没能执行的检查**（非 root 时通常包括内核符号表、`/proc/modules`、深度检查、跨 ABI 对比等）。`CLEAN` 只代表已执行的检查没有发现问题：`coverage: partial (...)` 会给出数量，`-v` 会连 id 和每个跳过原因一起打印。
+
 ---
 
 ## 4. 检测矩阵
@@ -361,7 +363,7 @@ wsl -u root -e bash android-rootdetect/scripts/wsl-verify.sh fixtures # 注入 +
 
 | 场景 | 实测结果 |
 |---|---|
-| `--selftest` | **107 checks, 0 failure(s), 2 skipped**（当前二进制；两条 SKIP 是 Android 专属断言——getprop 表与 ro.build.version.sdk） |
+| `--selftest` | **128 checks, 0 failure(s), 2 skipped**（当前二进制；两条 SKIP 是 Android 专属断言——getprop 表与 ro.build.version.sdk） |
 | 干净系统基线（误报率） | **verdict: CLEAN** —— 0 critical / 0 high / 0 medium / 0 low（其余全部 INFO；条数随内核与环境不同） |
 | 注入 root 痕迹（`/system/xbin/su`、`/system/bin/ksud`、`/data/adb/magisk`） | `artefact-present` + `artefact-listing` = **HIGH**，verdict: ROOT_DETECTED（exit 2） |
 | `tmpfs` 覆盖 `/system` | `mount-overlay` = **HIGH** |
@@ -406,15 +408,15 @@ APK 内容（已逐项核验）：
 
 产物（已核验）：
 
-- 产物：`out/bunanana.apk`，**951,852 字节**，`sha256=caf3163378620331cd38ec25dfae08b5f62267e27f62cbe150a3b67bb0a3dec1`
+- 产物：`out/bunanana.apk`，**964,140 字节**，`sha256=771a4f246a9c3389c8724f144cee59c443fc4b8d6ced4fcd408b508ecb5b40d4`
 - 下载直链：https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
 
 设计要点：
 
 * **没有任何资源文件**，UI 全部用代码搭建，所以只需要 `aapt2 + javac + d8` 就能构建。
-* 静态可执行文件以 `lib/<abi>/librootdetect.so` 随包分发，安装时被解压到应用的 native library 目录（该目录可执行），Activity 用 `ProcessBuilder` 运行它并把输出显示出来。
+* 静态可执行文件以 `lib/<abi>/librootdetect.so` 随包分发，安装时被解压到应用的 native library 目录（该目录可执行），Activity 用 `ProcessBuilder` 运行它并把输出显示出来。包内始终带 arm64-v8a / armeabi-v7a / x86_64 三份，而系统只解压主 ABI：Activity 会把另一个 32 位 ABI 的扫描器从 APK 解到 `filesDir` 并设为 `ROOTDETECT_ABI_HELPER`，让"跨 ABI syscall 表对比"在应用里也真正执行（64 位专用内核上无法执行 32 位 ELF，会自动退回跳过）。
 * `targetSdkVersion=28` 是刻意的：Android 10+ 对 targetSdk≥29 的应用禁止从自身数据目录 `exec`，而本工具需要在无 root 的情况下运行设备上的原生代码；万一 native lib 目录也被 OEM 拦截，会退化成"复制到 `filesDir` 再执行"，仍失败则显示 adb 命令行用法。
-* **结论区与日志导出**：报告顶部新增一块结论横幅——直接给出"是否 root / 是否存在隐藏"以及风险计数，并列出每条 MEDIUM 及以上问题**出现在哪些具体路径**（从证据行里解析出的绝对路径，例如 `package-hidden -> /data/data/com.topjohnwu.magisk`）；`Export log` 按钮把整份日志（设备头 + 结论 + 完整报告）写到应用外部目录 `Android/data/com.rootdetect.app/files/bunanana-report-<时间戳>.txt`，然后打开系统分享面板（纯文本分享，不需要任何存储权限；外部目录不可用时退回应用私有目录）。
+* **结论区与日志导出**：报告顶部新增一块结论横幅——直接给出"是否 root / 是否存在隐藏"以及风险计数，并列出每条 MEDIUM 及以上问题**出现在哪些具体路径**（从证据行里解析出的绝对路径，例如 `package-hidden -> /data/data/com.topjohnwu.magisk`）；横幅还会显示**检查覆盖**（解析引擎末尾的 `coverage:` 行）：`完整`，或 `N 项检查未完成（原因见下方日志）`——`CLEAN` 因此不会被误读成"所有检查都跑过了"。`Export log` 按钮把整份日志（设备头 + 结论 + 完整报告）写到应用外部目录 `Android/data/com.rootdetect.app/files/bunanana-report-<时间戳>.txt`，然后打开系统分享面板（纯文本分享，不需要任何存储权限；外部目录不可用时退回应用私有目录）。
 * **已在模拟器上完成装机实测**：`adb install` 成功 → Activity 正常显示 → 按下 "RUN DETECTION" → 包内的静态扫描器被成功执行并在界面渲染出完整报告（截图：[apk-screenshot.png](out/apk-screenshot.png)、[apk-screenshot-after.png](out/apk-screenshot-after.png)）。应用域（`untrusted_app_27`）里没有任何 `avc: denied` 阻断执行；唯一被 SELinux 挡住的是 `/sys/fs/selinux/enforce`、`/proc/sys/kernel/tainted` 和 `/system/xbin/su` 的 `stat`（`su_exec` 类型），工具对此如实降级成 INFO，并且**没有**因为"部分接口被挡住"而误判成隐藏——被 SELinux 拒绝的探针不参与投票。
 * 构建流水线的两个坑（都会让"看起来已经修好了"变成假的）：① `build/apk-work` 每次构建被清空，连带删掉 debug keystore，重新生成的密钥让新包**无法覆盖安装**、`adb install` 静默失败并继续跑旧版本（keystore 现已移到持久的 `build/debug.keystore`，安装脚本也加了"签名不符先卸载"的兜底）；② 测试脚本按小写匹配按钮文字，而 Android 的 `Button` 会把标签转成大写。
 

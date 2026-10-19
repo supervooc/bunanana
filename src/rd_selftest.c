@@ -350,6 +350,21 @@ static void test_logic(void) {
   ok((rep.flags & RD_F_HIDE) != 0, "flags: spoof sets RD_F_HIDE", NULL);
   rd_report_free(&rep);
 
+  /* coverage bookkeeping: a check that could not run is recorded once, and an
+   * ordinary (successful) informational finding never enters the list. */
+  rd_report rep3;
+  rd_report_init(&rep3);
+  rd_add_skip(&rep3, SEV_INFO, "env-selinux", "unavailable", "x");
+  rd_add_skip(&rep3, SEV_INFO, "kernel-module", "unreadable", "x");
+  rd_add_skip(&rep3, SEV_INFO, "env-selinux", "unavailable", "x");
+  rd_add(&rep3, SEV_INFO, "kernel-kallsyms", "readable", "x");
+  char skips[128];
+  rd_skip_list(&rep3, skips, sizeof(skips));
+  ok(rep3.n_skips == 2, "coverage: skipped ids are deduplicated", skips);
+  ok(strcmp(skips, "env-selinux, kernel-module") == 0,
+     "coverage: skipped ids are listed in scan order", skips);
+  rd_report_free(&rep3);
+
   /* susfs_guard_lkm ids feed the right capabilities: a loaded LKM is a HOOK
    * artefact, its observed self-filter is HIDING, installer files are ROOT. */
   rd_report rep2;
