@@ -191,6 +191,7 @@ static unsigned id_flags(const char *id) {
       {"kernel-module-list-ghost", RD_F_HOOK},
       {"susfs-lkm-module", RD_F_HOOK},
       {"susfs-lkm-module-filtered", RD_F_HOOK | RD_F_HIDE},
+      {"kernel-module-list-filtered", RD_F_HOOK | RD_F_HIDE},
       {"susfs-lkm-usedby", RD_F_HOOK | RD_F_HIDE},
       {"susfs-lkm-artefact", RD_F_ROOT},
       {"susfs-lkm-artefact-hidden", RD_F_HIDE},
