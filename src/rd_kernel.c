@@ -58,17 +58,21 @@ static size_t sysfs_live_modules(char **names, size_t max, size_t *total) {
   return n;
 }
 
-/* Names from a /proc/modules buffer. The buffer is consumed (strtok_r). */
-static size_t proc_module_names(char *txt, char **names, size_t max) {
-  size_t n = 0;
+/* Names from a /proc/modules buffer. The buffer is consumed (strtok_r).
+ * `total` receives the number of parseable entries, so a caller can tell a
+ * complete list from one truncated at `max` (or by a failed strdup). */
+static size_t proc_module_names(char *txt, char **names, size_t max, size_t *total) {
+  size_t n = 0, count = 0;
   char *save = NULL;
   for (char *line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
     char name[128];
     if (!rd_parse_proc_modules_line(line, name, sizeof(name))) continue;
+    count++;
     if (n >= max) continue;
     char *dup = strdup(name);
     if (dup) names[n++] = dup;
   }
+  if (total) *total = count;
   return n;
 }
 
@@ -305,6 +309,11 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
   char *sys_names[512];
   size_t sys_total = 0;
   size_t n_sys_names = sysfs_live_modules(sys_names, 512, &sys_total);
+  /* A list longer than the 512-entry window (or one a failed strdup shortened)
+   * must not be cross-checked as if it were complete: a name beyond the window
+   * would look like a filtered entry. */
+  bool mod_complete = mods && (size_t)mod_count == n_mod_names;
+  bool sys_complete = sys_total == n_sys_names;
   if (!mods && sys_total)
     rd_add(rep, SEV_INFO, "kernel-module", "loaded module list read from /sys/module",
            "/proc/modules is denied to this domain; %zu module(s) report initstate=live under "
@@ -350,7 +359,15 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
    * (susfs_guard_lkm's self-filter is exactly that). Re-read /proc/modules once
    * before concluding, so a module loading between the two reads cannot produce
    * a false positive. */
-  if (mods && n_sys_names) {
+  if (mods && n_sys_names && (!mod_complete || !sys_complete)) {
+    rd_add_skip(rep, SEV_INFO, "kernel-module-sysfs-crosscheck",
+                "module list too long for the sysfs cross-check",
+                "/proc/modules and/or /sys/module yielded more names than the 512-entry window "
+                "(/proc/modules: %d seen, %zu kept; /sys/module: %zu live, %zu kept). A live "
+                "module missing from the other view cannot be told apart from one beyond the "
+                "window, so the filtered-list conclusion was skipped.",
+                mod_count, n_mod_names, sys_total, n_sys_names);
+  } else if (mods && n_sys_names) {
     size_t missing = 0;
     for (size_t i = 0; i < n_sys_names; i++) {
       bool listed = false;
@@ -365,7 +382,8 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
                "could not re-read /proc/modules, cross-check inconclusive", "");
       } else {
         char *again_names[512];
-        size_t n_again = proc_module_names(again, again_names, 512);
+        size_t again_total = 0;
+        size_t n_again = proc_module_names(again, again_names, 512, &again_total);
         size_t confirmed = 0;
         char mev[RD_MAXEVID];
         mev[0] = '\0';
@@ -381,7 +399,14 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
         }
         for (size_t i = 0; i < n_again; i++) free(again_names[i]);
         free(again);
-        if (confirmed)
+        if (again_total != n_again)
+          rd_add_skip(rep, SEV_INFO, "kernel-module-sysfs-crosscheck",
+                      "module list changed during the cross-check",
+                      "the re-read of /proc/modules yielded %zu entries but only %zu were kept; a "
+                      "name missing from that list cannot be told apart from one beyond the "
+                      "window, so the filtered-list conclusion was skipped.",
+                      again_total, n_again);
+        else if (confirmed)
           rd_add_ev(rep, SEV_HIGH, "kernel-module-list-filtered",
                     "live modules are missing from /proc/modules",
                     mev,
@@ -411,6 +436,10 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
     n_baseline = n_sys_names;
     baseline_src = "/sys/module";
   }
+  /* How many names the chosen baseline view actually held: more than were kept
+   * means the list was truncated, and a module beyond the window must not be
+   * judged as hidden. */
+  size_t baseline_total = (baseline == mod_names) ? (size_t)mod_count : sys_total;
   const char *const want[] = {"sys_call_table", "compat_sys_call_table", "kallsyms_lookup_name",
                               "__x64_sys_openat", "__arm64_sys_openat", "__x64_sys_newuname",
                               "__arm64_sys_newuname", "__x64_sys_stat", "__arm64_sys_fstatat",
@@ -453,6 +482,14 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
                "module symbol(s) seen in kallsyms cannot be told apart from a filtered module "
                "list; skipping the hidden-module conclusion.",
                hidden_mod);
+      else if (hidden_mod && baseline_total != n_baseline)
+        rd_add_skip(rep, SEV_INFO, "kernel-modules-crosscheck-skipped",
+                    "module list truncated, hidden-module conclusion skipped",
+                    "the %d module name(s) that kallsyms reports as missing are absent from the "
+                    "%zu kept names of %s, but that view held %zu entries; a module beyond the "
+                    "window cannot be told apart from a filtered one, so the hidden-module "
+                    "conclusion was skipped.",
+                    hidden_mod, n_baseline, baseline_src, baseline_total);
       else if (hidden_mod)
         rd_add_ev(rep, SEV_HIGH, "kernel-module-hidden",
                   "module symbols visible in kallsyms but the module is missing from the module list",
