@@ -54,12 +54,20 @@ typedef struct {
   char *evidence; /* may be NULL */
 } rd_finding;
 
+/* Checks that could not run because of permissions or an unreadable source.
+ * Kept separately from the findings: a CLEAN verdict only says the checks that
+ * did run found nothing, so the report has to state how much was checked. */
+#define RD_MAX_SKIPS 24
+#define RD_SKIP_ID_MAX 40
+
 typedef struct {
   rd_finding *items;
   size_t n, cap;
   int counts[5];
   char *verdict;   /* filled by rd_finalize() */
   unsigned flags;  /* RD_F_* */
+  char skip_ids[RD_MAX_SKIPS][RD_SKIP_ID_MAX]; /* deduplicated, scan order */
+  int n_skips;
 } rd_report;
 
 #define RD_F_ROOT (1u << 0)   /* something established root access exists */
@@ -74,6 +82,16 @@ void rd_add(rd_report *r, rd_sev sev, const char *id, const char *title,
  * UTF-8 via rd_text_escape(), rd_print_json() escapes for JSON. */
 void rd_add_ev(rd_report *r, rd_sev sev, const char *id, const char *title,
                const char *evidence, const char *fmt, ...);
+/* Same, but records `id` as a check that could not run. Use this only for a
+ * finding that means "not verified" (permission denied, unreadable source,
+ * missing helper), never for a successful or merely informational result: the
+ * coverage line is what stops a CLEAN verdict from implying full coverage. */
+void rd_add_skip(rd_report *r, rd_sev sev, const char *id, const char *title,
+                 const char *fmt, ...);
+void rd_add_skip_ev(rd_report *r, rd_sev sev, const char *id, const char *title,
+                    const char *evidence, const char *fmt, ...);
+/* Comma-separated skip ids, deduplicated, in scan order. */
+void rd_skip_list(const rd_report *r, char *out, size_t outsz);
 void rd_report_init(rd_report *r);
 void rd_report_free(rd_report *r);
 void rd_finalize(rd_report *r);

@@ -204,8 +204,8 @@ void rd_check_environment(rd_ctx *c, rd_report *rep) {
     else
       rd_add(rep, SEV_INFO, "env-selinux", "SELinux enforcing", "enforce=%s", buf);
   } else {
-    rd_add(rep, SEV_INFO, "env-selinux", "SELinux state unavailable",
-           "could not read /sys/fs/selinux/enforce");
+    rd_add_skip(rep, SEV_INFO, "env-selinux", "SELinux state unavailable",
+                "could not read /sys/fs/selinux/enforce");
   }
   if (read_first_line("/proc/self/attr/current", buf, sizeof(buf))) {
     if (rd_contains(buf, ":su:") || rd_contains(buf, "magisk"))
@@ -437,7 +437,7 @@ void rd_check_packages(rd_ctx *c, rd_report *rep) {
     bool is_android = sdk && *sdk;
     rd_props_free(&props);
     if (!is_android) {
-      rd_add(rep, SEV_INFO, "package-enum", "package manager enumeration not applicable",
+      rd_add_skip(rep, SEV_INFO, "package-enum", "package manager enumeration not applicable",
              "this is not an Android system (no ro.build.version.sdk), so the package-manager "
              "check cannot run here; the artefact probes cover the same filesystem paths.");
       free(out);
@@ -548,7 +548,7 @@ void rd_check_packages(rd_ctx *c, rd_report *rep) {
                 "returned EACCES although other paths in the same directory were readable, so a "
                 "hidden install cannot be ruled out.", unknown);
     else
-      rd_add_ev(rep, SEV_INFO, "package-unverifiable",
+      rd_add_skip_ev(rep, SEV_INFO, "package-unverifiable",
                 "known root manager package(s) could not be verified", unk,
                 "%d known root manager name(s) are neither listed nor readable: this uid cannot "
                 "search the app data directory at all (every path returned EACCES), so a hidden "
@@ -654,7 +654,7 @@ void rd_check_mounts(rd_ctx *c, rd_report *rep) {
              "and /proc/self/mountstats=%zu list mounts: an emptied primary view defeats every "
              "cross-check.", ns[1], ns[2], ns[3]);
     else
-      rd_add(rep, SEV_INFO, "mount-view", "mount views unavailable",
+      rd_add_skip(rep, SEV_INFO, "mount-view", "mount views unavailable",
              "could not parse /proc/mounts - a hide module may be filtering it entirely, or the "
              "file is unreadable.");
   } else
@@ -728,13 +728,33 @@ void rd_check_mounts(rd_ctx *c, rd_report *rep) {
    * the /proc/1/mountinfo cross-check while blaming a namespace difference. */
   int ns_state = (self_n <= 0 || init_n <= 0) ? -1 : (strcmp(self_ns, init_ns) == 0);
   int init_view_ok = (ns_state == 1);
-  if (ns_state < 0)
-    rd_add(rep, SEV_INFO, "mount-view-namespace",
-           "cannot tell whether /proc/1 shares this mount namespace",
-           "/proc/1/ns/mnt or /proc/self/ns/mnt is not readable from this domain, so "
-           "/proc/1/mountinfo is not compared. This is not a statement about hiding - the "
-           "cross-check simply cannot run here.");
-  else if (!init_view_ok)
+  if (ns_state < 0) {
+    /* readlink() can be denied while both mount files stay readable. If the
+     * two views agree anyway, there is no disagreement to report: keep the
+     * comparison result instead of turning a readable, consistent view into a
+     * coverage skip. (If they differ we still cannot tell a different
+     * namespace from filtering, so the skip below stays.) */
+    bool views_agree = false;
+    if (ns[0] && ns[2] && ns[0] == ns[2]) {
+      views_agree = true;
+      for (size_t k = 0; k < ns[0]; k++)
+        if (!set_has(sets[2], ns[2], sets[0][k])) { views_agree = false; break; }
+    }
+    if (views_agree)
+      rd_add(rep, SEV_INFO, "mount-view-namespace",
+             "mount namespace identity unavailable, but the readable views agree",
+             "readlink() on the namespace links is denied to this domain, so namespace identity "
+             "is unknown; /proc/mounts and /proc/1/mountinfo nonetheless list the same %zu mount "
+             "targets, so there is no disagreement to report. This does not prove a shared "
+             "namespace.", ns[0]);
+    else
+      rd_add_skip(rep, SEV_INFO, "mount-view-namespace",
+                  "cannot tell whether /proc/1 shares this mount namespace",
+             "/proc/1/ns/mnt or /proc/self/ns/mnt is not readable from this domain, and the "
+             "readable mount views differ or are unavailable, so /proc/1/mountinfo cannot be "
+             "compared. This is not a statement about hiding - the cross-check simply cannot "
+             "run here.");
+  } else if (!init_view_ok)
     rd_add(rep, SEV_INFO, "mount-view-namespace",
            "/proc/1 is in a different mount namespace",
            "init does not share this process's mount namespace, so /proc/1/mountinfo is not "
@@ -746,8 +766,8 @@ void rd_check_mounts(rd_ctx *c, rd_report *rep) {
       /* One of the two sets hit the entry cap, so a difference between them can
        * be a truncation artefact rather than filtering. Say so instead of
        * emitting CRITICAL for a benign reason. */
-      rd_add(rep, SEV_INFO, "mount-view-truncated",
-             "mount view comparison skipped: entry cap reached",
+      rd_add_skip(rep, SEV_INFO, "mount-view-truncated",
+                  "mount view comparison skipped: entry cap reached",
              "%s cannot be compared with /proc/mounts because at least one of them lists more "
              "than %d mounts; the truncated sets would differ for a benign reason, so no "
              "cross-view verdict is issued.", files[i], (int)MAXX);
@@ -928,7 +948,7 @@ void rd_check_processes(rd_ctx *c, rd_report *rep) {
   if (st.skipped)
     /* Silently stopping at the cap meant the checks disappeared without a trace
      * on exactly the busy systems where a hiding daemon is most likely. */
-    rd_add(rep, SEV_INFO, "proc-scan-limit", "process scan stopped at the entry cap",
+    rd_add_skip(rep, SEV_INFO, "proc-scan-limit", "process scan stopped at the entry cap",
            "%d /proc entries were not scanned (cap 800); root or hiding daemons outside that "
            "window are not examined by this pass.",
            st.skipped);

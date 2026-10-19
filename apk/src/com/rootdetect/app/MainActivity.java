@@ -33,6 +33,8 @@ import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 /* NOTE: android.os.Process is *not* imported - it would shadow java.lang.Process
  * and make `Process p = pb.start()` a type error. myUid() is called fully
@@ -55,8 +57,8 @@ import java.util.regex.Pattern;
  *
  * On top of the raw report this front end adds two things the raw text makes
  * hard to read at a glance:
- *   1. a result banner - is the device rooted, is anything hidden, and *where*
- *      the problems are (the concrete paths/keys behind each finding);
+ *   1. a result banner - is the device rooted, is anything hidden, *where* the
+ *      problems are, and how many checks could not run at all;
  *   2. an "export log" button that writes the whole report to a file and opens
  *      the system share sheet, so the log can leave the device.
  */
@@ -93,6 +95,10 @@ public class MainActivity extends Activity {
      * "stat/getdents" would look like the path "/getdents". */
     private static final Pattern PATH =
             Pattern.compile("(?:^|[\\s=\"'(])(/[A-Za-z0-9._+@:/-]{2,200})");
+    /* "coverage: partial (9 checks could not run: ...)" - the count matters, the
+     * id list after the colon is for humans reading -v output. */
+    private static final Pattern COVERAGE =
+            Pattern.compile("^partial \\((\\d+) checks? could not run");
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -185,11 +191,11 @@ public class MainActivity extends Activity {
         } else if (sPendingReport != null && !sPendingReport.isEmpty()) {
             String log = sPendingReport;
             String verdict = verdictOf(log);
-            applyResult(buildSummary(verdict, parseFindings(log)), verdict, log);
+            applyResult(buildSummary(verdict, parseFindings(log), coverageOf(log)), verdict, log);
         } else if (saved != null && !saved.isEmpty()) {
             lastLog = saved;
             String verdict = verdictOf(saved);
-            summary.setText(buildSummary(verdict, parseFindings(saved)));
+            summary.setText(buildSummary(verdict, parseFindings(saved), coverageOf(saved)));
             summary.setBackgroundColor(colorFor(verdict));
             output.setText(saved);
             runButton.setText("重新检测");
@@ -231,7 +237,7 @@ public class MainActivity extends Activity {
                 try {
                     String report = scan();
                     verdict = verdictOf(report);
-                    banner = buildSummary(verdict, parseFindings(report));
+                    banner = buildSummary(verdict, parseFindings(report), coverageOf(report));
                     log = header() + "\n\n" + banner + "\n\n"
                             + "----------------------------------------------\n" + report;
                 } catch (Throwable t) {
@@ -244,7 +250,7 @@ public class MainActivity extends Activity {
                      * so the UI always comes back. */
                     log = header() + "\n\n检测线程异常中止：" + t + "\n";
                     verdict = verdictOf(log);   // no verdict line -> SCAN_ERROR
-                    banner = buildSummary(verdict, parseFindings(log));
+                    banner = buildSummary(verdict, parseFindings(log), null);
                 }
                 final String fVerdict = verdict;
                 final String fBanner = banner;
@@ -317,6 +323,73 @@ public class MainActivity extends Activity {
         return local;
     }
 
+    /**
+     * Extract the scanner for a second ABI from this APK and return its path, so
+     * the engine can run its cross-ABI comparison (SuSFS patches the native and
+     * the compat syscall tables independently; the app otherwise always reported
+     * abi-diff-skipped because the package manager extracts only the primary
+     * ABI). The APK itself carries all three builds.
+     *
+     * Returns null when the CPU cannot execute another ABI (64-bit-only kernel),
+     * when the APK has no build for it, or on any IO error: the scanner then
+     * reports abi-diff-skipped and still finishes normally.
+     */
+    private String stageAbiHelper() {
+        try {
+            String primary = Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "";
+            String abi = null;
+            if ("arm64-v8a".equals(primary)) {
+                abi = "armeabi-v7a";
+            } else if ("x86_64".equals(primary)) {
+                abi = "x86";
+            }
+            if (abi == null) {
+                return null;
+            }
+            boolean supported = false;
+            for (String a : Build.SUPPORTED_32_BIT_ABIS) {
+                if (abi.equals(a)) {
+                    supported = true;
+                    break;
+                }
+            }
+            if (!supported) {
+                return null;
+            }
+
+            ZipFile apk = new ZipFile(new File(getApplicationInfo().sourceDir));
+            try {
+                ZipEntry entry = apk.getEntry("lib/" + abi + "/librootdetect.so");
+                if (entry == null) {
+                    return null;
+                }
+                File local = new File(getFilesDir(), "rx-" + abi);
+                InputStream in = apk.getInputStream(entry);
+                try {
+                    OutputStream out = new FileOutputStream(local);
+                    try {
+                        byte[] buf = new byte[65536];
+                        int n;
+                        while ((n = in.read(buf)) > 0) {
+                            out.write(buf, 0, n);
+                        }
+                    } finally {
+                        out.close();
+                    }
+                } finally {
+                    in.close();
+                }
+                local.setExecutable(true, false);
+                return local.getAbsolutePath();
+            } finally {
+                apk.close();
+            }
+        } catch (Throwable t) {
+            /* A missing helper only disables one check; never fail the scan. */
+            return null;
+        }
+    }
+
     /** Run the scanner and return its report (no device header). */
     private String scan() {
         StringBuilder sb = new StringBuilder();
@@ -334,8 +407,12 @@ public class MainActivity extends Activity {
         cmd.add(bin.getAbsolutePath());
         cmd.add("-v");
 
+        /* The package manager extracts only the primary ABI's scanner; hand the
+         * engine a second-ABI sibling when this CPU can run one. */
+        String abiHelper = stageAbiHelper();
+
         StringBuilder out = new StringBuilder();
-        boolean ok = runProcess(cmd, out);
+        boolean ok = runProcess(cmd, out, abiHelper);
         if (!ok) {
             /* execve can refuse the native-library copy even though canExecute()
              * said yes (noexec mount, SELinux), which is why scannerFile() no
@@ -347,7 +424,7 @@ public class MainActivity extends Activity {
                 if (!staged.getAbsolutePath().equals(bin.getAbsolutePath())) {
                     cmd.set(0, staged.getAbsolutePath());
                     out.setLength(0);
-                    ok = runProcess(cmd, out);
+                    ok = runProcess(cmd, out, abiHelper);
                     if (ok) {
                         bin = staged;
                     }
@@ -400,13 +477,16 @@ public class MainActivity extends Activity {
      * `out`. Returns true when the process started and exited before the
      * timeout; the exit code (and its verdict) is appended in that case.
      */
-    private boolean runProcess(List<String> cmd, StringBuilder out) {
+    private boolean runProcess(List<String> cmd, StringBuilder out, String abiHelper) {
         Process p = null;
         final AtomicBoolean finished = new AtomicBoolean(false);
         final AtomicBoolean timedOut = new AtomicBoolean(false);
         try {
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
+            if (abiHelper != null) {
+                pb.environment().put("ROOTDETECT_ABI_HELPER", abiHelper);
+            }
             p = pb.start();
             /* The scanner reads no input; closing stdin keeps a scanner that
              * probes stdin from waiting on a pipe that never closes. */
@@ -533,6 +613,24 @@ public class MainActivity extends Activity {
         return "SCAN_ERROR";
     }
 
+    /**
+     * The scanner's coverage hint: "complete", the number of checks that could
+     * not run, or null when the report has no coverage line (an older engine).
+     * A CLEAN verdict cannot be told apart from "most checks were skipped"
+     * without it, which is exactly the blind spot the banner has to show.
+     */
+    private static String coverageOf(String report) {
+        for (String line : report.split("\n", -1)) {
+            if (!line.startsWith("coverage:")) continue;
+            String v = line.substring("coverage:".length()).trim();
+            if (v.startsWith("complete")) return "complete";
+            Matcher m = COVERAGE.matcher(v);
+            if (m.find()) return m.group(1);
+            return "unknown";
+        }
+        return null;
+    }
+
     /** Chinese display name for the engine's verdict codes. */
     private static String verdictName(String v) {
         if ("CLEAN".equals(v)) return "干净";
@@ -542,8 +640,8 @@ public class MainActivity extends Activity {
         return "扫描出错";
     }
 
-    /** The banner text: verdict + root/hiding booleans + where the problems are. */
-    private static String buildSummary(String verdict, List<Finding> findings) {
+    /** The banner text: verdict + root/hiding booleans + coverage + problem paths. */
+    private static String buildSummary(String verdict, List<Finding> findings, String coverage) {
         if ("SCAN_ERROR".equals(verdict)) {
             /* No "verdict:" line: the scanner could not be staged or it refused
              * to run. That is not a clean device, so the clean banner must not
@@ -552,6 +650,7 @@ public class MainActivity extends Activity {
             return "结论        ：扫描出错\n"
                     + "是否 root   ：未知\n"
                     + "是否存在隐藏：未知\n"
+                    + "检查覆盖    ：未知\n"
                     + "扫描器没有给出结论（无法部署或执行）。\n"
                     + "请查看下方日志以及手动运行说明。\n";
         }
@@ -563,6 +662,17 @@ public class MainActivity extends Activity {
         sb.append("结论        ：").append(verdictName(verdict)).append('\n');
         sb.append("是否 root   ：").append(rootText).append('\n');
         sb.append("是否存在隐藏：").append(hiding ? "是" : "否").append('\n');
+        /* "CLEAN" only covers the checks that ran: show how many did not. */
+        if (coverage != null) {
+            if ("complete".equals(coverage)) {
+                sb.append("检查覆盖    ：完整\n");
+            } else if ("unknown".equals(coverage)) {
+                sb.append("检查覆盖    ：无法解析（见下方日志）\n");
+            } else {
+                sb.append("检查覆盖    ：").append(coverage)
+                        .append(" 项检查未完成（原因见下方日志）\n");
+            }
+        }
         sb.append("问题位置：\n");
 
         int shown = 0;

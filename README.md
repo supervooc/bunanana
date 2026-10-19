@@ -90,6 +90,10 @@ adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 
 > 建议**两种身份各跑一次**：`shell` 身份看到的是应用视角；`adb root`/`su` 身份能看到 `/proc/kcore`、kprobe 列表、内核日志，覆盖 `deep-*` 系列检查。
 
+> 报告末尾另有一行 `coverage:`，统计**因权限/环境而没能执行的检查**（非 root 时通常包括内核符号表、深度检查、跨 ABI 对比，以及被 SELinux 挡住的 `/proc/modules`、`/proc/net/unix` 等）。`CLEAN` 只代表已执行的检查没有发现问题：`coverage: partial (...)` 会给出数量，`-v` 会连 id 和每个跳过原因一起打印。
+>
+> 其中三处已有**不需要额外权限的独立视图**：`/proc/net/unix` 不可读时改走 `NETLINK_SOCK_DIAG` 枚举（拿得到 socket 名，内核导出 `UNIX_DIAG_UID` 时还带 owner uid）；`/proc/modules` 不可读时改用 `/sys/module/<名字>/initstate == "live"`；`/proc/1/ns/mnt` 的 readlink 被拒时，只要两个可读的挂载视图一致就不再算盲区（只有视图确实不同或不可读才保留 skip）。sysfs 与 `/proc/modules` 还会互相交叉验证：连续两次读取中都在 sysfs 里 `live`、却不在 `/proc/modules` 里的模块，会报 `kernel-module-list-filtered`（HIGH）。
+
 ---
 
 ## 4. 检测矩阵
@@ -114,8 +118,9 @@ adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 | id | 级别 | 手段 |
 |---|---|---|
 | `kernel-taint-oe` | HIGH | `/proc/sys/kernel/tainted` 的 **bit 12 (OE)**：有 out-of-tree 模块被 insmod——隐藏 LKM 的必然痕迹（stock 设备通常只有 bit 0 的厂商专有模块） |
-| `kernel-module` / `kernel-sysmodule` | HIGH | `/proc/modules` 与 `/sys/module/*` 名称匹配框架关键字 |
-| `kernel-module-hidden` | HIGH | **kallsyms 里出现 `[模块名]` 标注，但 `/proc/modules` 里没有该模块**——两张表被分别过滤了 |
+| `kernel-module` / `kernel-sysmodule` | HIGH | `/proc/modules` 或 `/sys/module/<名字>/initstate` 回退视图、以及 `/sys/module/*` 名称匹配框架关键字 |
+| `kernel-module-hidden` | HIGH | **kallsyms 里出现 `[模块名]` 标注，但已加载模块列表（`/proc/modules`；不可读时用 sysfs live 列表）里没有该模块**——两张表被分别过滤了 |
+| `kernel-module-list-filtered` | HIGH | **模块在 `/sys/module` 下 `initstate=live`，连续两次读 `/proc/modules` 都不存在**：模块列表被过滤，与 kallsyms 无关的第二条证据 |
 | `kernel-kallsyms-symbol` | HIGH | `/proc/kallsyms` 里仍然残留 `susfs_` / `ksu_` 符号（SuSFS 的 `hide_syms` 就是干这个的，它在说明过滤器没生效） |
 | `kernel-syscall-table-patched` | **CRITICAL** | 只要 uid 0：解析 `/proc/kcore` 的 ELF program header 做虚拟地址→文件偏移映射，读出 `sys_call_table[openat]` 并与 kallsyms 里 `__x64_sys_openat` 的地址比对——**表项被改写就是铁证**（SuSFS `susfs_fp_hook` 正是改这里） |
 | `hook-kprobe` | **CRITICAL** | 读 `/sys/kernel/debug/kprobes/list`、tracefs 的 `kprobe_events`，命中 `s_show` / `m_show` / `slow_avc_audit` / `*newuname` / `kallsyms*` 等 SuSFS 的挂载点 |
@@ -288,7 +293,7 @@ powershell -ExecutionPolicy Bypass -File scripts/inject-root-fixtures.ps1 -Clean
 ## 8. 已知局限（诚实说明）
 
 * **非 root 身份下，SuSFS 的路径隐藏不可「直接读」**：它的 `/proc/susfs_*` 节点与 `/sys/module/<名字>` 对非 uid 0 返回 `-ENOENT`，与「真的不存在」在 errno 上无法区分。所以非 root 时对**可见视图**（§4B/§4D 的多数项）无法判定——这是设计上的必然，不是实现偷懒。**但非 root 并非全盲**：§4C 的跨 syscall 矛盾检测与 §4D 的 `susfs-lkm-node-oracle`（syscall 覆盖缺口）都能在 uid 0 之外独立给出判定；后者连"隐藏层是否武装"都不需要假设。剩余盲区如实列出：如果某个版本把 mkdir/mknod/symlink 族与全部已知缺口一起包装掉（截至上游 main 尚未发生），预言机会回到无声——届时非 root 侧将只剩 §4C。uid 0 下则可以直接读到节点内容。
-* §4B 里依赖 `/proc/kallsyms`、`/proc/kcore`、debugfs 的项在部分设备上会被 SELinux 挡住（工具会打印 `kernel-kallsyms` / `kernel-kcore` 的 INFO 说明「没查成」，不会把「查不到」当成「干净」或「有 root」）。
+* §4B 里依赖 `/proc/kallsyms`、`/proc/kcore`、debugfs 的项在部分设备上会被 SELinux 挡住（工具会打印 `kernel-kallsyms` / `kernel-kcore` 的 INFO 说明「没查成」，不会把「查不到」当成「干净」或「有 root」）。`/proc/modules` 与 `/proc/net/unix` 在现代 Android 的应用域里也常被拒绝，但它们不再直接终止检查：模块列表回退到 `/sys/module/<名字>/initstate`（两者都可读时互相交叉验证），socket 名扫描回退到 `NETLINK_SOCK_DIAG`；只有两套视图都不可用时才保留 `coverage` 跳过，而不是静默算干净。
 * mount 视图对比在**挂载命名空间不同**的情况下会产生差异：以 `shell` 身份运行时与 init 同一个 namespace，正常应完全一致；如果你用 `su --mount-master` 之类进入独立 namespace，该判定需要人工复核。
 * 未实现：协议层证据（Play Integrity / key attestation）、硬件断点/性能计数器层面的 hook 检测。
 * 跨 ABI 差分（§10）已实现但**尚未在有 32/64 位混合支持的设备上实测过**：需要把两个 ABI 的产物都推进 `/data/local/tmp` 才会启用，缺一个就自动降级为 INFO。
@@ -332,7 +337,7 @@ adb shell /data/local/rx/rx        # 自动发现助手并启用差分
 
 | id | 级别 | 内容 |
 |---|---|---|
-| `unix-socket-roots` | HIGH | `/proc/net/unix` 里的控制通道名（Frida linjector / Zygisk / Magisk / LSPosed）。它们是 socket 不是文件，藏文件系统不会让它们消失 |
+| `unix-socket-roots` | HIGH | `/proc/net/unix`（不可读时改走 `NETLINK_SOCK_DIAG` 枚举，内核导出 `UNIX_DIAG_UID` 时还带 owner uid）里的控制通道名（Frida linjector / Zygisk / Magisk / LSPosed）。它们是 socket 不是文件，藏文件系统不会让它们消失 |
 | `self-traced` | HIGH | `/proc/self/status` 的 `TracerPid != 0`：本进程正被 ptrace 附加 |
 | `map-backing-hidden` | **CRITICAL** | 自己地址空间里 mmap 进来的文件却 `stat`/`open` 不到——路径隐藏没覆盖 mmap 这条路径 |
 | `map-deleted-exec` | MEDIUM | 可执行映射的宿主文件已被 unlink |
@@ -361,7 +366,7 @@ wsl -u root -e bash android-rootdetect/scripts/wsl-verify.sh fixtures # 注入 +
 
 | 场景 | 实测结果 |
 |---|---|
-| `--selftest` | **107 checks, 0 failure(s), 2 skipped**（当前二进制；两条 SKIP 是 Android 专属断言——getprop 表与 ro.build.version.sdk） |
+| `--selftest` | **128 checks, 0 failure(s), 2 skipped**（当前二进制；两条 SKIP 是 Android 专属断言——getprop 表与 ro.build.version.sdk） |
 | 干净系统基线（误报率） | **verdict: CLEAN** —— 0 critical / 0 high / 0 medium / 0 low（其余全部 INFO；条数随内核与环境不同） |
 | 注入 root 痕迹（`/system/xbin/su`、`/system/bin/ksud`、`/data/adb/magisk`） | `artefact-present` + `artefact-listing` = **HIGH**，verdict: ROOT_DETECTED（exit 2） |
 | `tmpfs` 覆盖 `/system` | `mount-overlay` = **HIGH** |
@@ -406,15 +411,15 @@ APK 内容（已逐项核验）：
 
 产物（已核验）：
 
-- 产物：`out/bunanana.apk`，**951,852 字节**，`sha256=caf3163378620331cd38ec25dfae08b5f62267e27f62cbe150a3b67bb0a3dec1`
+- 产物：`out/bunanana.apk`，**972,332 字节**，`sha256=cfbb183d83150892eb045333021320e303e574ed20a3b3f7cbd7e869c9bee16b`
 - 下载直链：https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
 
 设计要点：
 
 * **没有任何资源文件**，UI 全部用代码搭建，所以只需要 `aapt2 + javac + d8` 就能构建。
-* 静态可执行文件以 `lib/<abi>/librootdetect.so` 随包分发，安装时被解压到应用的 native library 目录（该目录可执行），Activity 用 `ProcessBuilder` 运行它并把输出显示出来。
+* 静态可执行文件以 `lib/<abi>/librootdetect.so` 随包分发，安装时被解压到应用的 native library 目录（该目录可执行），Activity 用 `ProcessBuilder` 运行它并把输出显示出来。包内始终带 arm64-v8a / armeabi-v7a / x86_64 三份，而系统只解压主 ABI：Activity 会把另一个 32 位 ABI 的扫描器从 APK 解到 `filesDir` 并设为 `ROOTDETECT_ABI_HELPER`，让"跨 ABI syscall 表对比"在应用里也真正执行（64 位专用内核上无法执行 32 位 ELF，会自动退回跳过）。
 * `targetSdkVersion=28` 是刻意的：Android 10+ 对 targetSdk≥29 的应用禁止从自身数据目录 `exec`，而本工具需要在无 root 的情况下运行设备上的原生代码；万一 native lib 目录也被 OEM 拦截，会退化成"复制到 `filesDir` 再执行"，仍失败则显示 adb 命令行用法。
-* **结论区与日志导出**：报告顶部新增一块结论横幅——直接给出"是否 root / 是否存在隐藏"以及风险计数，并列出每条 MEDIUM 及以上问题**出现在哪些具体路径**（从证据行里解析出的绝对路径，例如 `package-hidden -> /data/data/com.topjohnwu.magisk`）；`Export log` 按钮把整份日志（设备头 + 结论 + 完整报告）写到应用外部目录 `Android/data/com.rootdetect.app/files/bunanana-report-<时间戳>.txt`，然后打开系统分享面板（纯文本分享，不需要任何存储权限；外部目录不可用时退回应用私有目录）。
+* **结论区与日志导出**：报告顶部新增一块结论横幅——直接给出"是否 root / 是否存在隐藏"以及风险计数，并列出每条 MEDIUM 及以上问题**出现在哪些具体路径**（从证据行里解析出的绝对路径，例如 `package-hidden -> /data/data/com.topjohnwu.magisk`）；横幅还会显示**检查覆盖**（解析引擎末尾的 `coverage:` 行）：`完整`，或 `N 项检查未完成（原因见下方日志）`——`CLEAN` 因此不会被误读成"所有检查都跑过了"。`Export log` 按钮把整份日志（设备头 + 结论 + 完整报告）写到应用外部目录 `Android/data/com.rootdetect.app/files/bunanana-report-<时间戳>.txt`，然后打开系统分享面板（纯文本分享，不需要任何存储权限；外部目录不可用时退回应用私有目录）。
 * **已在模拟器上完成装机实测**：`adb install` 成功 → Activity 正常显示 → 按下 "RUN DETECTION" → 包内的静态扫描器被成功执行并在界面渲染出完整报告（截图：[apk-screenshot.png](out/apk-screenshot.png)、[apk-screenshot-after.png](out/apk-screenshot-after.png)）。应用域（`untrusted_app_27`）里没有任何 `avc: denied` 阻断执行；唯一被 SELinux 挡住的是 `/sys/fs/selinux/enforce`、`/proc/sys/kernel/tainted` 和 `/system/xbin/su` 的 `stat`（`su_exec` 类型），工具对此如实降级成 INFO，并且**没有**因为"部分接口被挡住"而误判成隐藏——被 SELinux 拒绝的探针不参与投票。
 * 构建流水线的两个坑（都会让"看起来已经修好了"变成假的）：① `build/apk-work` 每次构建被清空，连带删掉 debug keystore，重新生成的密钥让新包**无法覆盖安装**、`adb install` 静默失败并继续跑旧版本（keystore 现已移到持久的 `build/debug.keystore`，安装脚本也加了"签名不符先卸载"的兜底）；② 测试脚本按小写匹配按钮文字，而 Android 的 `Button` 会把标签转成大写。
 
@@ -448,7 +453,7 @@ wsl -u root -e bash scripts/wsl-android-verify.sh   # 推送 + 全量验证
 | 注入 `/data/data/com.topjohnwu.magisk`（不在包管理器列表中） | `package-hidden` = **CRITICAL**（KernelSU「隐藏应用」的确定性特征） |
 | 注入 `/data/adb/magisk`、`/data/local/tmp/su` | `artefact-present` + `artefact-listing` = **HIGH**，verdict **HIDING_DETECTED** |
 
-## 11.5 真实执行抓出并修掉的误报（共 10 处）
+## 11.5 真实执行抓出并修掉的误报/盲区（共 12 处）
 
 | 环境 | 问题 | 修复 |
 |---|---|---|
@@ -462,6 +467,8 @@ wsl -u root -e bash scripts/wsl-android-verify.sh   # 推送 + 全量验证
 | Android | `kernel-taint-oe` 定级过高（实测 `tainted=4096` 由厂商模块造成） | 降为 MEDIUM 并说明 |
 | Android | `kernel-module-hidden` 把内核伪模块 `bpf` 当成被隐藏模块 → **HIGH 误报** | 允许列表跳过 `bpf` |
 | Android | `spoof-cmdline` 因 3/10 个属性本就不来自 cmdline 而报 HIGH | 改为多数规则（>50% 才报） |
+| WSL | `spoof-uname` 把**可读但为空**的 `/proc/sys/kernel/osrelease` 当成不一致 → **CRITICAL 误报** | 只有首行非空的来源才参与比较 |
+| Android | `mount-view-namespace` 只要 namespace 符号链接读不到就跳过，即使 `/proc/mounts` 与 `/proc/1/mountinfo` 完全一致 | 比较可读视图；只有两者确实不同或不可读才保留跳过 |
 
 这张表是"为什么必须真跑一遍"最好的证明：其中 **4 处会直接把干净设备判成 HIDING_DETECTED**，而它们全部是执行验证（而非代码审查）发现的。
 

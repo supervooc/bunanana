@@ -28,6 +28,54 @@ static bool read_first_line_public(const char *p, char *b, size_t s) {
   return rd_read_first_line(p, b, s);
 }
 
+/* Loaded modules as seen through /sys/module/<name>/initstate. Built-in modules
+ * have no initstate node; a loadable one reports "live" while it is loaded.
+ * Verified on a stock kernel: the set is exactly /proc/modules (14 = 14).
+ * This is the fallback for Android app domains, where /proc/modules is denied,
+ * and an independent view for the cross-check when both are readable. */
+static size_t sysfs_live_modules(char **names, size_t max, size_t *total) {
+  size_t n = 0, count = 0;
+  DIR *d = opendir("/sys/module");
+  if (!d) {
+    if (total) *total = 0;
+    return 0;
+  }
+  struct dirent *e;
+  while ((e = readdir(d))) {
+    if (e->d_name[0] == '.') continue;
+    char p[320], b[32];
+    snprintf(p, sizeof(p), "/sys/module/%s/initstate", e->d_name);
+    if (!read_first_line_public(p, b, sizeof(b))) continue;
+    if (strcmp(b, "live") != 0) continue;
+    count++;
+    if (n < max) {
+      char *dup = strdup(e->d_name);
+      if (dup) names[n++] = dup;
+    }
+  }
+  closedir(d);
+  if (total) *total = count;
+  return n;
+}
+
+/* Names from a /proc/modules buffer. The buffer is consumed (strtok_r).
+ * `total` receives the number of parseable entries, so a caller can tell a
+ * complete list from one truncated at `max` (or by a failed strdup). */
+static size_t proc_module_names(char *txt, char **names, size_t max, size_t *total) {
+  size_t n = 0, count = 0;
+  char *save = NULL;
+  for (char *line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+    char name[128];
+    if (!rd_parse_proc_modules_line(line, name, sizeof(name))) continue;
+    count++;
+    if (n >= max) continue;
+    char *dup = strdup(name);
+    if (dup) names[n++] = dup;
+  }
+  if (total) *total = count;
+  return n;
+}
+
 /* Bounded copy that always NUL-terminates. Used in place of
  * snprintf(dst, n, "%s", src) so that a long source is truncated explicitly
  * instead of tripping the compiler's -Wformat-truncation analysis. */
@@ -258,10 +306,24 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
       }
     }
   }
-  if (!mods)
-    rd_add(rep, SEV_INFO, "kernel-module", "/proc/modules unreadable",
-           "the loaded-module list could not be read (SELinux restricts it to root on some "
-           "devices), so the module-name check did not run - this is not a clean result.");
+  char *sys_names[512];
+  size_t sys_total = 0;
+  size_t n_sys_names = sysfs_live_modules(sys_names, 512, &sys_total);
+  /* A list longer than the 512-entry window (or one a failed strdup shortened)
+   * must not be cross-checked as if it were complete: a name beyond the window
+   * would look like a filtered entry. */
+  bool mod_complete = mods && (size_t)mod_count == n_mod_names;
+  bool sys_complete = sys_total == n_sys_names;
+  if (!mods && sys_total)
+    rd_add(rep, SEV_INFO, "kernel-module", "loaded module list read from /sys/module",
+           "/proc/modules is denied to this domain; %zu module(s) report initstate=live under "
+           "/sys/module and are used as the loaded-module list for the kallsyms cross-check "
+           "below. The /sys/module name scan covers their names.", sys_total);
+  else if (!mods)
+    rd_add_skip(rep, SEV_INFO, "kernel-module", "/proc/modules unreadable",
+                "the loaded-module list could not be read (SELinux restricts it to root on some "
+           "devices) and /sys/module exposed no live module either, so the module-name check did "
+           "not run - this is not a clean result.");
   else if (mod_hits)
     rd_add_ev(rep, SEV_HIGH, "kernel-module", "loaded kernel module names a root framework",
               mod_ev, "%d of %d loaded modules match a hiding-framework name.", mod_hits, mod_count);
@@ -269,9 +331,9 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
     rd_add(rep, SEV_INFO, "kernel-module", "no suspicious module name in /proc/modules",
            "%d modules listed.", mod_count);
 
-  /* /sys/module: names matching a framework. (The cross-check of /proc/modules
-   * names against their /sys/module node - which sus_path hides independently -
-   * is NOT implemented here; an earlier comment claimed it was.) */
+  /* /sys/module: names matching a framework. This view also yields an
+   * independent loaded-module list (<name>/initstate == "live"), which the
+   * cross-check below uses - sus_path hides the two views independently. */
   char sys_ev[RD_MAXEVID];
   sys_ev[0] = '\0';
   int sys_hits = 0;
@@ -292,9 +354,92 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
     rd_add_ev(rep, SEV_HIGH, "kernel-sysmodule", "kernel module visible under /sys/module", sys_ev,
               "%d /sys/module entries match a hiding-framework name.", sys_hits);
 
-  /* --- module list cross-check via kallsyms tags ---
-   * kallsyms annotates module symbols with [module]. A module that shows up
-   * there but not in /proc/modules had its module list filtered. */
+  /* /proc/modules and /sys/module/<name>/initstate are independent views of the
+   * loaded set. A live module absent from /proc/modules had the list filtered
+   * (susfs_guard_lkm's self-filter is exactly that). Re-read /proc/modules once
+   * before concluding, so a module loading between the two reads cannot produce
+   * a false positive. */
+  if (mods && n_sys_names && (!mod_complete || !sys_complete)) {
+    rd_add_skip(rep, SEV_INFO, "kernel-module-sysfs-crosscheck",
+                "module list too long for the sysfs cross-check",
+                "/proc/modules and/or /sys/module yielded more names than the 512-entry window "
+                "(/proc/modules: %d seen, %zu kept; /sys/module: %zu live, %zu kept). A live "
+                "module missing from the other view cannot be told apart from one beyond the "
+                "window, so the filtered-list conclusion was skipped.",
+                mod_count, n_mod_names, sys_total, n_sys_names);
+  } else if (mods && n_sys_names) {
+    size_t missing = 0;
+    for (size_t i = 0; i < n_sys_names; i++) {
+      bool listed = false;
+      for (size_t k = 0; k < n_mod_names; k++)
+        if (strcmp(mod_names[k], sys_names[i]) == 0) { listed = true; break; }
+      if (!listed) missing++;
+    }
+    if (missing) {
+      char *again = rd_slurp("/proc/modules", NULL);
+      if (!again) {
+        rd_add(rep, SEV_INFO, "kernel-module-sysfs-crosscheck",
+               "could not re-read /proc/modules, cross-check inconclusive", "");
+      } else {
+        char *again_names[512];
+        size_t again_total = 0;
+        size_t n_again = proc_module_names(again, again_names, 512, &again_total);
+        size_t confirmed = 0;
+        char mev[RD_MAXEVID];
+        mev[0] = '\0';
+        for (size_t i = 0; i < n_sys_names; i++) {
+          bool listed = false;
+          for (size_t k = 0; k < n_mod_names; k++)
+            if (strcmp(mod_names[k], sys_names[i]) == 0) { listed = true; break; }
+          for (size_t k = 0; !listed && k < n_again; k++)
+            if (strcmp(again_names[k], sys_names[i]) == 0) { listed = true; break; }
+          if (listed) continue;
+          confirmed++;
+          if (strlen(mev) < sizeof(mev) - 128) rd_appendf(mev, sizeof(mev), "%s\n", sys_names[i]);
+        }
+        for (size_t i = 0; i < n_again; i++) free(again_names[i]);
+        free(again);
+        if (again_total != n_again)
+          rd_add_skip(rep, SEV_INFO, "kernel-module-sysfs-crosscheck",
+                      "module list changed during the cross-check",
+                      "the re-read of /proc/modules yielded %zu entries but only %zu were kept; a "
+                      "name missing from that list cannot be told apart from one beyond the "
+                      "window, so the filtered-list conclusion was skipped.",
+                      again_total, n_again);
+        else if (confirmed)
+          rd_add_ev(rep, SEV_HIGH, "kernel-module-list-filtered",
+                    "live modules are missing from /proc/modules",
+                    mev,
+                    "%zu module(s) report initstate=live under /sys/module yet are absent from "
+                    "/proc/modules in two consecutive reads. The two lists are filtered "
+                    "independently; a module-list hider is the only normal explanation (a load "
+                    "race would have shown up in the second read).", confirmed);
+        else
+          rd_add(rep, SEV_INFO, "kernel-module-sysfs-crosscheck",
+                 "module appeared in the re-read, not a filter", "");
+      }
+    } else {
+      rd_add(rep, SEV_INFO, "kernel-module-sysfs-crosscheck",
+             "sysfs and /proc/modules agree", "%zu live module(s) in both views.", n_sys_names);
+    }
+  }
+
+  /* kallsyms annotates module symbols with [module]. A module that shows up
+   * there but not in the loaded-module list had that list filtered. Use
+   * /proc/modules when readable, otherwise the sysfs live list; built-in
+   * modules appear in neither view. */
+  char **baseline = mod_names;
+  size_t n_baseline = n_mod_names;
+  const char *baseline_src = "/proc/modules";
+  if (n_mod_names == 0 && n_sys_names) {
+    baseline = sys_names;
+    n_baseline = n_sys_names;
+    baseline_src = "/sys/module";
+  }
+  /* How many names the chosen baseline view actually held: more than were kept
+   * means the list was truncated, and a module beyond the window must not be
+   * judged as hidden. */
+  size_t baseline_total = (baseline == mod_names) ? (size_t)mod_count : sys_total;
   const char *const want[] = {"sys_call_table", "compat_sys_call_table", "kallsyms_lookup_name",
                               "__x64_sys_openat", "__arm64_sys_openat", "__x64_sys_newuname",
                               "__arm64_sys_newuname", "__x64_sys_stat", "__arm64_sys_fstatat",
@@ -316,8 +461,8 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
         if (strcmp(ktab->v[i].mod, "bpf") == 0) continue;
         vis_mod++;
         bool listed = false;
-        for (size_t k = 0; k < n_mod_names; k++)
-          if (strcmp(mod_names[k], ktab->v[i].mod) == 0) { listed = true; break; }
+        for (size_t k = 0; k < n_baseline; k++)
+          if (strcmp(baseline[k], ktab->v[i].mod) == 0) { listed = true; break; }
         if (!listed) {
           hidden_mod++;
           if (strlen(mod_ev2) < sizeof(mod_ev2) - 128)
@@ -325,28 +470,36 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
                        ktab->v[i].name, kptr_str(ktab->v[i].addr, buf, sizeof(buf)));
         }
       }
-      /* Only conclude "hidden" when /proc/modules was actually readable AND
-       * non-empty. If it is unreadable (some kernels/SELinux restrict it to
-       * root) or empty, kallsyms still carries [module] tags and every one of
-       * them would be reported as hidden - turning a clean device into
-       * HIDING_DETECTED. That is worse than not checking. */
-      if (hidden_mod && (mods == NULL || mod_count == 0))
-        rd_add(rep, SEV_INFO, "kernel-modules-crosscheck-skipped",
-               "module list unavailable or empty, cross-check skipped",
-               "/proc/modules could not be read or lists no modules, so the %d module symbol(s) "
-               "seen in kallsyms cannot be told apart from a filtered module list; "
-               "skipping the hidden-module conclusion.",
+      /* Only conclude "hidden" when the baseline list was actually readable
+       * AND non-empty. If neither /proc/modules nor /sys/module yielded a
+       * list, kallsyms still carries [module] tags and every one of them would
+       * be reported as hidden - turning a clean device into HIDING_DETECTED.
+       * That is worse than not checking. */
+      if (hidden_mod && n_baseline == 0)
+        rd_add_skip(rep, SEV_INFO, "kernel-modules-crosscheck-skipped",
+                    "module list unavailable or empty, cross-check skipped",
+               "neither /proc/modules nor /sys/module yielded a loaded-module list, so the %d "
+               "module symbol(s) seen in kallsyms cannot be told apart from a filtered module "
+               "list; skipping the hidden-module conclusion.",
                hidden_mod);
+      else if (hidden_mod && baseline_total != n_baseline)
+        rd_add_skip(rep, SEV_INFO, "kernel-modules-crosscheck-skipped",
+                    "module list truncated, hidden-module conclusion skipped",
+                    "the %d module name(s) that kallsyms reports as missing are absent from the "
+                    "%zu kept names of %s, but that view held %zu entries; a module beyond the "
+                    "window cannot be told apart from a filtered one, so the hidden-module "
+                    "conclusion was skipped.",
+                    hidden_mod, n_baseline, baseline_src, baseline_total);
       else if (hidden_mod)
         rd_add_ev(rep, SEV_HIGH, "kernel-module-hidden",
-                  "module symbols visible in kallsyms but the module is missing from /proc/modules",
+                  "module symbols visible in kallsyms but the module is missing from the module list",
                   mod_ev2,
-                  "%d module name(s) appear in kallsyms yet are absent from the module list: the "
-                  "lists are filtered independently and disagree.", hidden_mod);
+                  "%d module name(s) appear in kallsyms yet are absent from %s: the lists are "
+                  "filtered independently and disagree.", hidden_mod, baseline_src);
       else
         rd_add(rep, SEV_INFO, "kernel-module-crosscheck",
-               "module lists agree", "%d module(s) seen in kallsyms, all present in /proc/modules.",
-               vis_mod);
+               "module lists agree", "%d module(s) seen in kallsyms, all present in %s.",
+               vis_mod, baseline_src);
 
       /* framework symbols still visible -> the symbol filter is not installed */
       char sym_ev[RD_MAXEVID];
@@ -378,8 +531,8 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
        * table, so the 32-bit syscall numbers (i386 openat=295, arm32=322) would
        * read an unrelated entry and invent a patched table (review B2). */
       if (c->is_root && sizeof(void *) != 8) {
-        rd_add(rep, SEV_INFO, "kernel-syscall-table-skipped",
-               "32-bit build: the native sys_call_table cannot be indexed safely",
+        rd_add_skip(rep, SEV_INFO, "kernel-syscall-table-skipped",
+                    "32-bit build: the native sys_call_table cannot be indexed safely",
                "Reported instead of a bogus kernel-syscall-table-patched finding.");
       } else if (c->is_root) {
         unsigned long long sct = ksym_find(ktab, "sys_call_table");
@@ -398,8 +551,8 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
           /* Never stay silent about the strongest check not running: a kernel
            * built without CONFIG_KALLSYMS_ALL omits data symbols, so
            * sys_call_table simply is not in the table. */
-          rd_add(rep, SEV_INFO, "kernel-syscall-table-skipped",
-                 "sys_call_table could not be verified",
+          rd_add_skip(rep, SEV_INFO, "kernel-syscall-table-skipped",
+                      "sys_call_table could not be verified",
                  "kallsyms did not resolve %s%s%s. A kernel built without CONFIG_KALLSYMS_ALL omits "
                  "data symbols; Android GKI kernels normally keep it enabled, so on a device this "
                  "check does run.", sct ? "" : "sys_call_table", (!sct && !openat) ? " and " : "",
@@ -423,20 +576,21 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
                      "sys_call_table[openat] matches kallsyms",
                      "verified through /proc/kcore: %s", kptr_str(entry, buf, sizeof(buf)));
           } else {
-            rd_add(rep, SEV_INFO, "kernel-kcore", "/proc/kcore not readable",
-                   "cannot verify sys_call_table contents from user space on this device.");
+            rd_add_skip(rep, SEV_INFO, "kernel-kcore", "/proc/kcore not readable",
+                        "cannot verify sys_call_table contents from user space on this device.");
           }
         }
       }
     }
   } else {
-    rd_add(rep, SEV_INFO, "kernel-kallsyms", "/proc/kallsyms unreadable",
-           "SELinux blocks the symbol table for this domain; cross-checks skipped.");
+    rd_add_skip(rep, SEV_INFO, "kernel-kallsyms", "/proc/kallsyms unreadable",
+                "SELinux blocks the symbol table for this domain; cross-checks skipped.");
   }
   free(ks);
   ksym_free(ktab);
   if (mods) free(mods);
   for (size_t i = 0; i < n_mod_names; i++) free(mod_names[i]);
+  for (size_t i = 0; i < n_sys_names; i++) free(sys_names[i]);
 
   if (read_first_line_public("/proc/sys/kernel/kptr_restrict", buf, sizeof(buf)))
     rd_add(rep, SEV_INFO, "kernel-kptr", "kptr_restrict", "%s", buf);
@@ -482,12 +636,12 @@ void rd_check_susfs(rd_ctx *c, rd_report *rep) {
   } else if (inconsistent) {
     /* already reported per path */
   } else {
-    rd_add(rep, SEV_INFO, "susfs-node-absent", "no SuSFS control node reachable",
-           "all %zu paths answered ENOENT. Note this is also what a non-root process sees when "
-           "SuSFS hides them, so absence alone is not evidence of a clean device - the "
-           "susfs_guard_lkm section cross-checks exactly this case with its syscall-coverage "
-           "oracle.",
-           RD_HIDING_PATH_COUNT);
+    rd_add_skip(rep, SEV_INFO, "susfs-node-absent", "no SuSFS control node reachable",
+                "all %zu paths answered ENOENT. Note this is also what a non-root process sees when "
+                "SuSFS hides them, so absence alone is not evidence of a clean device - the "
+                "susfs_guard_lkm section cross-checks exactly this case with its syscall-coverage "
+                "oracle.",
+                RD_HIDING_PATH_COUNT);
   }
 
   /* SuSFS/LKM present at boot is also visible through the kernel command line. */
@@ -859,8 +1013,8 @@ static void lkm_artefacts(rd_report *rep) {
               "to be re-inserted at boot, so installer files survive hiding rules aimed at the "
               "running kernel.", found);
   else
-    rd_add(rep, SEV_INFO, "susfs-lkm-artefact-absent", "no susfs_guard_lkm installer file found",
-           "probed %zu LKM-specific paths plus the KernelSU module and loader directories; "
+    rd_add_skip(rep, SEV_INFO, "susfs-lkm-artefact-absent", "no susfs_guard_lkm installer file found",
+                "probed %zu LKM-specific paths plus the KernelSU module and loader directories; "
            "nothing matched. /data/adb is unreadable to non-root, so this proves nothing "
            "without uid 0.",
            RD_SUSFS_LKM_PATH_COUNT);
@@ -1086,9 +1240,12 @@ static void check_uname_spoof(rd_report *rep) {
   if (uname(&u) != 0) return;
   char file_rel[512] = "", file_ver[1024] = "";
   char sys_rel[512] = "", sys_ver[1024] = "";
-  bool have_file = read_first_line_public("/proc/version", file_ver, sizeof(file_ver));
-  bool have_sys = read_first_line_public("/proc/sys/kernel/osrelease", sys_rel, sizeof(sys_rel));
-  bool have_sysver = read_first_line_public("/proc/sys/kernel/version", sys_ver, sizeof(sys_ver));
+  bool have_file = read_first_line_public("/proc/version", file_ver, sizeof(file_ver)) &&
+                   file_ver[0];
+  bool have_sys = read_first_line_public("/proc/sys/kernel/osrelease", sys_rel, sizeof(sys_rel)) &&
+                  sys_rel[0];
+  bool have_sysver = read_first_line_public("/proc/sys/kernel/version", sys_ver, sizeof(sys_ver)) &&
+                     sys_ver[0];
 
   if (have_file) {
     const char *p = strstr(file_ver, "Linux version ");
@@ -1145,7 +1302,7 @@ static void check_uname_spoof(rd_report *rep) {
     /* "All utsname sources agree" was printed even when not a single one of them
      * could be read, which turns "the check did not run" into an apparent clean
      * result (the exact failure mode a hiding layer wants). */
-    rd_add_ev(rep, SEV_INFO, "spoof-uname", "uname() could not be cross-checked", ev,
+    rd_add_skip_ev(rep, SEV_INFO, "spoof-uname", "uname() could not be cross-checked", ev,
               "none of /proc/version, /proc/sys/kernel/osrelease or /proc/sys/kernel/version were "
               "readable from this domain, so nothing was compared - this is not a consistent "
               "result.");
@@ -1160,16 +1317,16 @@ static void check_cmdline_spoof(rd_ctx *c, rd_report *rep) {
   char *cmdline = rd_slurp("/proc/cmdline", NULL);
   if (!cmdline || !cmdline[0]) {
     /* Returning silently hid the fact that the cross-check never ran. */
-    rd_add(rep, SEV_INFO, "spoof-cmdline", "/proc/cmdline is not readable",
-           "the kernel command line could not be read from this domain (SELinux or a hiding "
+    rd_add_skip(rep, SEV_INFO, "spoof-cmdline", "/proc/cmdline is not readable",
+                "the kernel command line could not be read from this domain (SELinux or a hiding "
            "layer), so the ro.boot.* cross-check did not run - this is not a clean result.");
     free(cmdline);
     return;
   }
   size_t clen = strlen(cmdline);
   if (clen < 32) {
-    rd_add(rep, SEV_INFO, "spoof-cmdline", "kernel command line is too short to compare",
-           "/proc/cmdline is %zu bytes long, so it carries no androidboot.* parameter to verify "
+    rd_add_skip(rep, SEV_INFO, "spoof-cmdline", "kernel command line is too short to compare",
+                "/proc/cmdline is %zu bytes long, so it carries no androidboot.* parameter to verify "
            "the property table against.", clen);
     free(cmdline);
     return;
@@ -1222,8 +1379,8 @@ static void check_cmdline_spoof(rd_ctx *c, rd_report *rep) {
               "layer rewrites /proc/cmdline only; init has already copied the real values into "
               "ro.boot.*, so the two views diverge.", mismatch, checked);
   else if (checked >= 3 && mismatch * 2 > checked)
-    rd_add_ev(rep, SEV_INFO, "spoof-cmdline",
-              "property table and command line cannot be compared", ev,
+    rd_add_skip_ev(rep, SEV_INFO, "spoof-cmdline",
+                   "property table and command line cannot be compared", ev,
               "%d of %d ro.boot.* properties have no counterpart, but neither source exposes any "
               "androidboot.* token from this domain (/proc/cmdline: %s; /proc/bootconfig: %s), so "
               "the parameters are not visible here rather than hidden - there is nothing to "
@@ -1469,8 +1626,8 @@ static void deep_dmesg(rd_report *rep) {
   }
   if (rc != 0 || !out[0]) {
     free(out);
-    rd_add(rep, SEV_INFO, "deep-dmesg", "kernel log not readable",
-           "dmesg needs root and an SELinux policy that allows it.");
+    rd_add_skip(rep, SEV_INFO, "deep-dmesg", "kernel log not readable",
+                "dmesg needs root and an SELinux policy that allows it.");
     return;
   }
   char ev[RD_MAXEVID];
@@ -1494,7 +1651,7 @@ static void deep_dmesg(rd_report *rep) {
 
 void rd_check_deep(rd_ctx *c, rd_report *rep) {
   if (!c->is_root) {
-    rd_add(rep, SEV_INFO, "deep-skipped", "deep kernel checks need uid 0",
+    rd_add_skip(rep, SEV_INFO, "deep-skipped", "deep kernel checks need uid 0",
            "run the tool through `adb root` or `su` to verify the syscall table through "
            "/proc/kcore, list kernel probes and read the kernel log.");
     return;
@@ -1792,7 +1949,7 @@ void rd_check_abi_diff(rd_ctx *c, rd_report *rep) {
              "ROOTDETECT_ABI_HELPER=/data/local/rx/rootdetect-x86 rootdetect-x86_64 -v",
              helper, why);
     } else {
-      rd_add(rep, SEV_INFO, "abi-diff-skipped", "no second-ABI helper binary found",
+      rd_add_skip(rep, SEV_INFO, "abi-diff-skipped", "no second-ABI helper binary found",
              "push the other ABI's build into a root-only directory and point "
              "ROOTDETECT_ABI_HELPER at it to enable the cross-ABI comparison. SuSFS patches the "
              "native and compat syscall tables separately, so this is one of the strongest "
@@ -1807,7 +1964,7 @@ void rd_check_abi_diff(rd_ctx *c, rd_report *rep) {
   const char *argv[] = {helper, "--probe-dump", NULL};
   int rc = rd_run(argv, out, 1 << 20);
   if (rc != 0 || !strstr(out, "rd-probe-dump")) {
-    rd_add(rep, SEV_INFO, "abi-diff-skipped", "second-ABI helper could not be executed",
+    rd_add_skip(rep, SEV_INFO, "abi-diff-skipped", "second-ABI helper could not be executed",
            "%s exited with %d (a 32-bit binary needs a 32-bit-capable kernel/zygote, and it must "
            "be chmod 755).", helper, rc);
     free(out);
@@ -1819,11 +1976,11 @@ void rd_check_abi_diff(rd_ctx *c, rd_report *rep) {
   int n_remote = abi_parse(out, helper_abi, sizeof(helper_abi), remote, RD_ABI_MAX);
   free(out);
   if (n_remote < 0) {
-    rd_add(rep, SEV_INFO, "abi-diff-skipped", "helper produced no probe data", "%s", helper);
+    rd_add_skip(rep, SEV_INFO, "abi-diff-skipped", "helper produced no probe data", "%s", helper);
     return;
   }
   if (helper_abi[0] && strcmp(helper_abi, rd_abi_name()) == 0) {
-    rd_add(rep, SEV_INFO, "abi-diff-skipped", "helper has the same ABI as this binary",
+    rd_add_skip(rep, SEV_INFO, "abi-diff-skipped", "helper has the same ABI as this binary",
            "%s reports %s; a cross-ABI comparison needs a different one.", helper, helper_abi);
     return;
   }

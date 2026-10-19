@@ -90,6 +90,10 @@ adb root && adb shell /data/local/rx/rx     # uid 0: enables the deep kernel che
 
 > Run it **once under each identity**: the `shell` identity shows the app's point of view; `adb root`/`su` can see `/proc/kcore`, the kprobe list and the kernel log, covering the `deep-*` checks.
 
+> The report also ends with a `coverage:` line that counts the **checks that could not run because of permissions or the environment** (as a non-root user this usually includes the kernel symbol table, the deep checks, the cross-ABI comparison, and `/proc/modules` or `/proc/net/unix` when SELinux denies them). `CLEAN` only covers the checks that did run: `coverage: partial (...)` gives the count, and `-v` also prints the ids and the reason for each skip.
+>
+> Three of those files have a second, independent view that needs no extra privilege: `/proc/net/unix` falls back to a `NETLINK_SOCK_DIAG` dump (socket names, plus the owner uid on kernels that export `UNIX_DIAG_UID`), `/proc/modules` falls back to `/sys/module/<name>/initstate == "live"`, and the `/proc/1/mountinfo` comparison runs even when the namespace symlinks cannot be read (only a real difference or an unreadable view stays a skip). The sysfs and `/proc/modules` views are also cross-checked: a module that is `live` in sysfs but missing from `/proc/modules` in two consecutive reads is reported as `kernel-module-list-filtered` (HIGH).
+
 ---
 
 ## 4. Detection matrix
@@ -114,8 +118,9 @@ adb root && adb shell /data/local/rx/rx     # uid 0: enables the deep kernel che
 | id | Severity | Method |
 |---|---|---|
 | `kernel-taint-oe` | HIGH | **bit 12 (OE)** of `/proc/sys/kernel/tainted`: an out-of-tree module was insmod'ed — the unavoidable trace of a hiding LKM (stock devices usually only carry bit 0 for vendor modules) |
-| `kernel-module` / `kernel-sysmodule` | HIGH | names in `/proc/modules` and `/sys/module/*` match framework keywords |
-| `kernel-module-hidden` | HIGH | **kallsyms tags `[module]` for a module that `/proc/modules` does not list** — the two tables were filtered separately |
+| `kernel-module` / `kernel-sysmodule` | HIGH | names in `/proc/modules` or the `/sys/module/<name>/initstate` fallback, and in `/sys/module/*`, match framework keywords |
+| `kernel-module-hidden` | HIGH | **kallsyms tags `[module]` for a module that the loaded-module list (`/proc/modules`, or the sysfs live list when `/proc/modules` is denied) does not list** — the two tables were filtered separately |
+| `kernel-module-list-filtered` | HIGH | **a module is `initstate=live` under `/sys/module` but missing from `/proc/modules` in two consecutive reads**: the module list was filtered, independently of kallsyms |
 | `kernel-kallsyms-symbol` | HIGH | `susfs_` / `ksu_` symbols are still left in `/proc/kallsyms` (SuSFS's `hide_syms` exists precisely for this, and it shows the filter did not take effect) |
 | `kernel-syscall-table-patched` | **CRITICAL** | uid 0 only: parse the ELF program headers of `/proc/kcore` to map virtual addresses to file offsets, read `sys_call_table[openat]` and compare it with the kallsyms address of `__x64_sys_openat` — **a rewritten table entry is hard evidence** (SuSFS `susfs_fp_hook` patches exactly this) |
 | `hook-kprobe` | **CRITICAL** | read `/sys/kernel/debug/kprobes/list` and tracefs's `kprobe_events`; hits `s_show` / `m_show` / `slow_avc_audit` / `*newuname` / `kallsyms*` and other SuSFS hook points |
@@ -288,7 +293,7 @@ powershell -ExecutionPolicy Bypass -File scripts/inject-root-fixtures.ps1 -Clean
 ## 8. Known limitations (stated honestly)
 
 * **Without root, SuSFS's path hiding cannot be read directly**: its `/proc/susfs_*` nodes and `/sys/module/<name>` return `-ENOENT` to anyone but uid 0, which is indistinguishable from "really absent" at the errno level. So without root the **visible-view** verdicts (most of §4B/§4D) cannot be reached — this is a design necessity, not implementation laziness. **But non-root is not blind**: §4C's cross-syscall contradiction checks and §4D's `susfs-lkm-node-oracle` (syscall coverage gap) both produce independent verdicts at any uid; the latter does not even assume the hiding layer is armed. The remaining blind spot, stated plainly: a future release that also wraps the mkdir/mknod/symlink family and every other known gap (as of upstream `main` this has not happened) would silence the oracle, leaving only §4C for non-root. Under uid 0 the node contents can be read directly.
-* The §4B items that depend on `/proc/kallsyms`, `/proc/kcore` and debugfs are blocked by SELinux on some devices (the tool prints an INFO for `kernel-kallsyms` / `kernel-kcore` saying "could not check", and never treats "could not check" as "clean" or "rooted").
+* The §4B items that depend on `/proc/kallsyms`, `/proc/kcore` and debugfs are blocked by SELinux on some devices (the tool prints an INFO for `kernel-kallsyms` / `kernel-kcore` saying "could not check", and never treats "could not check" as "clean" or "rooted"). `/proc/modules` and `/proc/net/unix` are also commonly denied to app domains on modern Android, but no longer terminate their checks: the loaded-module list falls back to `/sys/module/<name>/initstate` (cross-checked against `/proc/modules` when both are readable), and the socket-name scan falls back to `NETLINK_SOCK_DIAG`. If both views are denied as well, the check stays a `coverage` skip instead of a silent clean.
 * The mount-view comparison produces differences when **mount namespaces differ**: running as `shell` shares init's namespace and should agree exactly; if you enter a separate namespace with `su --mount-master` or the like, that verdict needs manual review.
 * Not implemented: protocol-level evidence (Play Integrity / key attestation), hardware-breakpoint / performance-counter level hook detection.
 * The cross-ABI diff (§10) is implemented but **has not yet been field-tested on a device with 32/64-bit mixed support**: it only activates when both ABI products are pushed to `/data/local/tmp`, otherwise it degrades to INFO.
@@ -332,7 +337,7 @@ adb shell /data/local/rx/rx        # auto-discovers the helper and enables the d
 
 | id | Severity | What it checks |
 |---|---|---|
-| `unix-socket-roots` | HIGH | control-channel names in `/proc/net/unix` (Frida linjector / Zygisk / Magisk / LSPosed). They are sockets, not files, so file-system hiding does not make them disappear |
+| `unix-socket-roots` | HIGH | control-channel names from `/proc/net/unix`, or from a `NETLINK_SOCK_DIAG` dump when `/proc/net/unix` is denied (the netlink view also carries the owner uid on kernels that export `UNIX_DIAG_UID`). They are sockets, not files, so file-system hiding does not make them disappear |
 | `self-traced` | HIGH | `TracerPid != 0` in `/proc/self/status`: this process is being ptraced |
 | `map-backing-hidden` | **CRITICAL** | a file mmap'ed into this process's own address space cannot be `stat`ed/`open`ed — path hiding did not cover the mmap path |
 | `map-deleted-exec` | MEDIUM | the backing file of an executable mapping has been unlinked |
@@ -361,7 +366,7 @@ wsl -u root -e bash android-rootdetect/scripts/wsl-verify.sh fixtures # inject +
 
 | Scenario | Measured result |
 |---|---|
-| `--selftest` | **107 checks, 0 failure(s), 2 skipped** (current binary; the two skips are the Android-only assertions - the getprop table and ro.build.version.sdk) |
+| `--selftest` | **128 checks, 0 failure(s), 2 skipped** (current binary; the two skips are the Android-only assertions - the getprop table and ro.build.version.sdk) |
 | clean-system baseline (false-positive rate) | **verdict: CLEAN** — 0 critical / 0 high / 0 medium / 0 low (the rest are INFO rows; the count depends on the kernel and environment) |
 | injected root traces (`/system/xbin/su`, `/system/bin/ksud`, `/data/adb/magisk`) | `artefact-present` + `artefact-listing` = **HIGH**, verdict: ROOT_DETECTED (exit 2) |
 | `tmpfs` over `/system` | `mount-overlay` = **HIGH** |
@@ -406,15 +411,15 @@ APK contents (verified item by item):
 
 Product (verified):
 
-- Product: `out/bunanana.apk`, **951,852 bytes**, `sha256=caf3163378620331cd38ec25dfae08b5f62267e27f62cbe150a3b67bb0a3dec1`
+- Product: `out/bunanana.apk`, **972,332 bytes**, `sha256=cfbb183d83150892eb045333021320e303e574ed20a3b3f7cbd7e869c9bee16b`
 - Direct download: https://github.com/supervooc/bunanana/raw/main/out/bunanana.apk
 
 Design points:
 
 * **No resource files at all**; the UI is built entirely in code, so `aapt2 + javac + d8` is all a build needs.
-* The static executable ships as `lib/<abi>/librootdetect.so` and is extracted into the app's native library directory on install (that directory is executable); the Activity runs it with `ProcessBuilder` and displays its output.
+* The static executable ships as `lib/<abi>/librootdetect.so` and is extracted into the app's native library directory on install (that directory is executable); the Activity runs it with `ProcessBuilder` and displays its output. The APK always carries all three builds (arm64-v8a / armeabi-v7a / x86_64) while the system extracts only the primary ABI: the Activity extracts the other 32-bit ABI's scanner from the APK into `filesDir` and points `ROOTDETECT_ABI_HELPER` at it, so the cross-ABI syscall-table comparison actually runs in the app (on 64-bit-only kernels the 32-bit ELF cannot execute and the check falls back to skipped).
 * `targetSdkVersion=28` is deliberate: Android 10+ forbids apps with targetSdk≥29 from `exec`ing out of their own data directory, and this tool needs to run native code on the device without root; should an OEM also block the native library directory, it degrades to "copy into `filesDir` and execute", and if that fails too it shows the adb command line.
-* **Result banner and log export**: the top of the report is now a result banner that states outright whether the device is rooted and whether anything is hidden, plus the risk counts, and lists *which concrete paths* each MEDIUM-or-above problem appears at (absolute paths parsed out of the evidence lines, e.g. `package-hidden -> /data/data/com.topjohnwu.magisk`). An **Export log** button writes the whole log (device header + banner + full report) to `Android/data/com.rootdetect.app/files/bunanana-report-<timestamp>.txt` and then opens the system share sheet (plain-text share, no storage permission; falls back to the app's private files directory when external storage is unavailable).
+* **Result banner and log export**: the top of the report is now a result banner that states outright whether the device is rooted and whether anything is hidden, plus the risk counts, and lists *which concrete paths* each MEDIUM-or-above problem appears at (absolute paths parsed out of the evidence lines, e.g. `package-hidden -> /data/data/com.topjohnwu.magisk`). The banner also shows **coverage** (parsed from the engine's trailing `coverage:` line): `complete`, or `N checks could not run (see the log below)` - so `CLEAN` is not misread as "everything was checked". An **Export log** button writes the whole log (device header + banner + full report) to `Android/data/com.rootdetect.app/files/bunanana-report-<timestamp>.txt` and then opens the system share sheet (plain-text share, no storage permission; falls back to the app's private files directory when external storage is unavailable).
 * **Installation was field-tested on an emulator**: `adb install` succeeded → the Activity displayed normally → pressing "RUN DETECTION" successfully executed the bundled static scanner and rendered the full report in the UI (screenshots: [apk-screenshot.png](out/apk-screenshot.png), [apk-screenshot-after.png](out/apk-screenshot-after.png)). No `avc: denied` blocked execution in the app domain (`untrusted_app_27`); the only things SELinux blocked were `stat` on `/sys/fs/selinux/enforce`, `/proc/sys/kernel/tainted` and `/system/xbin/su` (type `su_exec`), and the tool honestly degrades those to INFO and does **not** misjudge "some interfaces blocked" as hiding — probes rejected by SELinux do not take part in the vote.
 * Two build-pipeline pitfalls (both of which turn "looks fixed" into a lie): ① `build/apk-work` is wiped on every build, which used to delete the debug keystore along with it, so the regenerated key made the new package **unable to overwrite-install**, and `adb install` failed silently while the old version kept running (the keystore now lives persistently in `build/debug.keystore`, and the install script has an "uninstall first if the signature differs" fallback); ② the test script matched the button text in lowercase, while Android's `Button` uppercases its label.
 
@@ -448,7 +453,7 @@ wsl -u root -e bash scripts/wsl-android-verify.sh   # push + full verification
 | injecting `/data/data/com.topjohnwu.magisk` (not in the package manager list) | `package-hidden` = **CRITICAL** (the deterministic signature of KernelSU's "hidden app") |
 | injecting `/data/adb/magisk`, `/data/local/tmp/su` | `artefact-present` + `artefact-listing` = **HIGH**, verdict **HIDING_DETECTED** |
 
-## 11.5 False positives caught by real execution and fixed (10 in total)
+## 11.5 False positives and blind spots caught by real execution and fixed (12 in total)
 
 | Environment | Problem | Fix |
 |---|---|---|
@@ -462,6 +467,8 @@ wsl -u root -e bash scripts/wsl-android-verify.sh   # push + full verification
 | Android | `kernel-taint-oe` was rated too high (measured `tainted=4096`, caused by a vendor module) | downgraded to MEDIUM with an explanation |
 | Android | `kernel-module-hidden` treated the kernel pseudo-module `bpf` as a hidden module → **false-positive HIGH** | the allow-list skips `bpf` |
 | Android | `spoof-cmdline` reported HIGH because 3/10 properties never came from cmdline in the first place | switched to a majority rule (report only above 50%) |
+| WSL | `spoof-uname` treated a readable but **empty** `/proc/sys/kernel/osrelease` as a mismatch → **false-positive CRITICAL** | a source only counts when its first line is non-empty |
+| Android | `mount-view-namespace` was skipped whenever the namespace symlinks could not be read, even when `/proc/mounts` and `/proc/1/mountinfo` agreed | compare the readable views; skip only when they differ or are unavailable |
 
 This table is the best proof of "why you must actually run it": **4 of these would have declared a clean device HIDING_DETECTED**, and all of them were found by execution validation (not code review).
 
