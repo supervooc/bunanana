@@ -28,6 +28,50 @@ static bool read_first_line_public(const char *p, char *b, size_t s) {
   return rd_read_first_line(p, b, s);
 }
 
+/* Loaded modules as seen through /sys/module/<name>/initstate. Built-in modules
+ * have no initstate node; a loadable one reports "live" while it is loaded.
+ * Verified on a stock kernel: the set is exactly /proc/modules (14 = 14).
+ * This is the fallback for Android app domains, where /proc/modules is denied,
+ * and an independent view for the cross-check when both are readable. */
+static size_t sysfs_live_modules(char **names, size_t max, size_t *total) {
+  size_t n = 0, count = 0;
+  DIR *d = opendir("/sys/module");
+  if (!d) {
+    if (total) *total = 0;
+    return 0;
+  }
+  struct dirent *e;
+  while ((e = readdir(d))) {
+    if (e->d_name[0] == '.') continue;
+    char p[320], b[32];
+    snprintf(p, sizeof(p), "/sys/module/%s/initstate", e->d_name);
+    if (!read_first_line_public(p, b, sizeof(b))) continue;
+    if (strcmp(b, "live") != 0) continue;
+    count++;
+    if (n < max) {
+      char *dup = strdup(e->d_name);
+      if (dup) names[n++] = dup;
+    }
+  }
+  closedir(d);
+  if (total) *total = count;
+  return n;
+}
+
+/* Names from a /proc/modules buffer. The buffer is consumed (strtok_r). */
+static size_t proc_module_names(char *txt, char **names, size_t max) {
+  size_t n = 0;
+  char *save = NULL;
+  for (char *line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+    char name[128];
+    if (!rd_parse_proc_modules_line(line, name, sizeof(name))) continue;
+    if (n >= max) continue;
+    char *dup = strdup(name);
+    if (dup) names[n++] = dup;
+  }
+  return n;
+}
+
 /* Bounded copy that always NUL-terminates. Used in place of
  * snprintf(dst, n, "%s", src) so that a long source is truncated explicitly
  * instead of tripping the compiler's -Wformat-truncation analysis. */
@@ -258,10 +302,19 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
       }
     }
   }
-  if (!mods)
+  char *sys_names[512];
+  size_t sys_total = 0;
+  size_t n_sys_names = sysfs_live_modules(sys_names, 512, &sys_total);
+  if (!mods && sys_total)
+    rd_add(rep, SEV_INFO, "kernel-module", "loaded module list read from /sys/module",
+           "/proc/modules is denied to this domain; %zu module(s) report initstate=live under "
+           "/sys/module and are used as the loaded-module list for the kallsyms cross-check "
+           "below. The /sys/module name scan covers their names.", sys_total);
+  else if (!mods)
     rd_add_skip(rep, SEV_INFO, "kernel-module", "/proc/modules unreadable",
                 "the loaded-module list could not be read (SELinux restricts it to root on some "
-           "devices), so the module-name check did not run - this is not a clean result.");
+           "devices) and /sys/module exposed no live module either, so the module-name check did "
+           "not run - this is not a clean result.");
   else if (mod_hits)
     rd_add_ev(rep, SEV_HIGH, "kernel-module", "loaded kernel module names a root framework",
               mod_ev, "%d of %d loaded modules match a hiding-framework name.", mod_hits, mod_count);
@@ -269,9 +322,9 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
     rd_add(rep, SEV_INFO, "kernel-module", "no suspicious module name in /proc/modules",
            "%d modules listed.", mod_count);
 
-  /* /sys/module: names matching a framework. (The cross-check of /proc/modules
-   * names against their /sys/module node - which sus_path hides independently -
-   * is NOT implemented here; an earlier comment claimed it was.) */
+  /* /sys/module: names matching a framework. This view also yields an
+   * independent loaded-module list (<name>/initstate == "live"), which the
+   * cross-check below uses - sus_path hides the two views independently. */
   char sys_ev[RD_MAXEVID];
   sys_ev[0] = '\0';
   int sys_hits = 0;
@@ -292,9 +345,72 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
     rd_add_ev(rep, SEV_HIGH, "kernel-sysmodule", "kernel module visible under /sys/module", sys_ev,
               "%d /sys/module entries match a hiding-framework name.", sys_hits);
 
-  /* --- module list cross-check via kallsyms tags ---
-   * kallsyms annotates module symbols with [module]. A module that shows up
-   * there but not in /proc/modules had its module list filtered. */
+  /* /proc/modules and /sys/module/<name>/initstate are independent views of the
+   * loaded set. A live module absent from /proc/modules had the list filtered
+   * (susfs_guard_lkm's self-filter is exactly that). Re-read /proc/modules once
+   * before concluding, so a module loading between the two reads cannot produce
+   * a false positive. */
+  if (mods && n_sys_names) {
+    size_t missing = 0;
+    for (size_t i = 0; i < n_sys_names; i++) {
+      bool listed = false;
+      for (size_t k = 0; k < n_mod_names; k++)
+        if (strcmp(mod_names[k], sys_names[i]) == 0) { listed = true; break; }
+      if (!listed) missing++;
+    }
+    if (missing) {
+      char *again = rd_slurp("/proc/modules", NULL);
+      if (!again) {
+        rd_add(rep, SEV_INFO, "kernel-module-sysfs-crosscheck",
+               "could not re-read /proc/modules, cross-check inconclusive", "");
+      } else {
+        char *again_names[512];
+        size_t n_again = proc_module_names(again, again_names, 512);
+        size_t confirmed = 0;
+        char mev[RD_MAXEVID];
+        mev[0] = '\0';
+        for (size_t i = 0; i < n_sys_names; i++) {
+          bool listed = false;
+          for (size_t k = 0; k < n_mod_names; k++)
+            if (strcmp(mod_names[k], sys_names[i]) == 0) { listed = true; break; }
+          for (size_t k = 0; !listed && k < n_again; k++)
+            if (strcmp(again_names[k], sys_names[i]) == 0) { listed = true; break; }
+          if (listed) continue;
+          confirmed++;
+          if (strlen(mev) < sizeof(mev) - 128) rd_appendf(mev, sizeof(mev), "%s\n", sys_names[i]);
+        }
+        for (size_t i = 0; i < n_again; i++) free(again_names[i]);
+        free(again);
+        if (confirmed)
+          rd_add_ev(rep, SEV_HIGH, "kernel-module-list-filtered",
+                    "live modules are missing from /proc/modules",
+                    mev,
+                    "%zu module(s) report initstate=live under /sys/module yet are absent from "
+                    "/proc/modules in two consecutive reads. The two lists are filtered "
+                    "independently; a module-list hider is the only normal explanation (a load "
+                    "race would have shown up in the second read).", confirmed);
+        else
+          rd_add(rep, SEV_INFO, "kernel-module-sysfs-crosscheck",
+                 "module appeared in the re-read, not a filter", "");
+      }
+    } else {
+      rd_add(rep, SEV_INFO, "kernel-module-sysfs-crosscheck",
+             "sysfs and /proc/modules agree", "%zu live module(s) in both views.", n_sys_names);
+    }
+  }
+
+  /* kallsyms annotates module symbols with [module]. A module that shows up
+   * there but not in the loaded-module list had that list filtered. Use
+   * /proc/modules when readable, otherwise the sysfs live list; built-in
+   * modules appear in neither view. */
+  char **baseline = mod_names;
+  size_t n_baseline = n_mod_names;
+  const char *baseline_src = "/proc/modules";
+  if (n_mod_names == 0 && n_sys_names) {
+    baseline = sys_names;
+    n_baseline = n_sys_names;
+    baseline_src = "/sys/module";
+  }
   const char *const want[] = {"sys_call_table", "compat_sys_call_table", "kallsyms_lookup_name",
                               "__x64_sys_openat", "__arm64_sys_openat", "__x64_sys_newuname",
                               "__arm64_sys_newuname", "__x64_sys_stat", "__arm64_sys_fstatat",
@@ -316,8 +432,8 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
         if (strcmp(ktab->v[i].mod, "bpf") == 0) continue;
         vis_mod++;
         bool listed = false;
-        for (size_t k = 0; k < n_mod_names; k++)
-          if (strcmp(mod_names[k], ktab->v[i].mod) == 0) { listed = true; break; }
+        for (size_t k = 0; k < n_baseline; k++)
+          if (strcmp(baseline[k], ktab->v[i].mod) == 0) { listed = true; break; }
         if (!listed) {
           hidden_mod++;
           if (strlen(mod_ev2) < sizeof(mod_ev2) - 128)
@@ -325,28 +441,28 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
                        ktab->v[i].name, kptr_str(ktab->v[i].addr, buf, sizeof(buf)));
         }
       }
-      /* Only conclude "hidden" when /proc/modules was actually readable AND
-       * non-empty. If it is unreadable (some kernels/SELinux restrict it to
-       * root) or empty, kallsyms still carries [module] tags and every one of
-       * them would be reported as hidden - turning a clean device into
-       * HIDING_DETECTED. That is worse than not checking. */
-      if (hidden_mod && (mods == NULL || mod_count == 0))
+      /* Only conclude "hidden" when the baseline list was actually readable
+       * AND non-empty. If neither /proc/modules nor /sys/module yielded a
+       * list, kallsyms still carries [module] tags and every one of them would
+       * be reported as hidden - turning a clean device into HIDING_DETECTED.
+       * That is worse than not checking. */
+      if (hidden_mod && n_baseline == 0)
         rd_add_skip(rep, SEV_INFO, "kernel-modules-crosscheck-skipped",
                     "module list unavailable or empty, cross-check skipped",
-               "/proc/modules could not be read or lists no modules, so the %d module symbol(s) "
-               "seen in kallsyms cannot be told apart from a filtered module list; "
-               "skipping the hidden-module conclusion.",
+               "neither /proc/modules nor /sys/module yielded a loaded-module list, so the %d "
+               "module symbol(s) seen in kallsyms cannot be told apart from a filtered module "
+               "list; skipping the hidden-module conclusion.",
                hidden_mod);
       else if (hidden_mod)
         rd_add_ev(rep, SEV_HIGH, "kernel-module-hidden",
-                  "module symbols visible in kallsyms but the module is missing from /proc/modules",
+                  "module symbols visible in kallsyms but the module is missing from the module list",
                   mod_ev2,
-                  "%d module name(s) appear in kallsyms yet are absent from the module list: the "
-                  "lists are filtered independently and disagree.", hidden_mod);
+                  "%d module name(s) appear in kallsyms yet are absent from %s: the lists are "
+                  "filtered independently and disagree.", hidden_mod, baseline_src);
       else
         rd_add(rep, SEV_INFO, "kernel-module-crosscheck",
-               "module lists agree", "%d module(s) seen in kallsyms, all present in /proc/modules.",
-               vis_mod);
+               "module lists agree", "%d module(s) seen in kallsyms, all present in %s.",
+               vis_mod, baseline_src);
 
       /* framework symbols still visible -> the symbol filter is not installed */
       char sym_ev[RD_MAXEVID];
@@ -437,6 +553,7 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
   ksym_free(ktab);
   if (mods) free(mods);
   for (size_t i = 0; i < n_mod_names; i++) free(mod_names[i]);
+  for (size_t i = 0; i < n_sys_names; i++) free(sys_names[i]);
 
   if (read_first_line_public("/proc/sys/kernel/kptr_restrict", buf, sizeof(buf)))
     rd_add(rep, SEV_INFO, "kernel-kptr", "kptr_restrict", "%s", buf);
@@ -1086,9 +1203,12 @@ static void check_uname_spoof(rd_report *rep) {
   if (uname(&u) != 0) return;
   char file_rel[512] = "", file_ver[1024] = "";
   char sys_rel[512] = "", sys_ver[1024] = "";
-  bool have_file = read_first_line_public("/proc/version", file_ver, sizeof(file_ver));
-  bool have_sys = read_first_line_public("/proc/sys/kernel/osrelease", sys_rel, sizeof(sys_rel));
-  bool have_sysver = read_first_line_public("/proc/sys/kernel/version", sys_ver, sizeof(sys_ver));
+  bool have_file = read_first_line_public("/proc/version", file_ver, sizeof(file_ver)) &&
+                   file_ver[0];
+  bool have_sys = read_first_line_public("/proc/sys/kernel/osrelease", sys_rel, sizeof(sys_rel)) &&
+                  sys_rel[0];
+  bool have_sysver = read_first_line_public("/proc/sys/kernel/version", sys_ver, sizeof(sys_ver)) &&
+                     sys_ver[0];
 
   if (have_file) {
     const char *p = strstr(file_ver, "Linux version ");

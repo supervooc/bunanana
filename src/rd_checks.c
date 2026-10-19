@@ -728,13 +728,33 @@ void rd_check_mounts(rd_ctx *c, rd_report *rep) {
    * the /proc/1/mountinfo cross-check while blaming a namespace difference. */
   int ns_state = (self_n <= 0 || init_n <= 0) ? -1 : (strcmp(self_ns, init_ns) == 0);
   int init_view_ok = (ns_state == 1);
-  if (ns_state < 0)
-    rd_add_skip(rep, SEV_INFO, "mount-view-namespace",
-                "cannot tell whether /proc/1 shares this mount namespace",
-           "/proc/1/ns/mnt or /proc/self/ns/mnt is not readable from this domain, so "
-           "/proc/1/mountinfo is not compared. This is not a statement about hiding - the "
-           "cross-check simply cannot run here.");
-  else if (!init_view_ok)
+  if (ns_state < 0) {
+    /* readlink() can be denied while both mount files stay readable. If the
+     * two views agree anyway, there is no disagreement to report: keep the
+     * comparison result instead of turning a readable, consistent view into a
+     * coverage skip. (If they differ we still cannot tell a different
+     * namespace from filtering, so the skip below stays.) */
+    bool views_agree = false;
+    if (ns[0] && ns[2] && ns[0] == ns[2]) {
+      views_agree = true;
+      for (size_t k = 0; k < ns[0]; k++)
+        if (!set_has(sets[2], ns[2], sets[0][k])) { views_agree = false; break; }
+    }
+    if (views_agree)
+      rd_add(rep, SEV_INFO, "mount-view-namespace",
+             "mount namespace identity unavailable, but the readable views agree",
+             "readlink() on the namespace links is denied to this domain, so namespace identity "
+             "is unknown; /proc/mounts and /proc/1/mountinfo nonetheless list the same %zu mount "
+             "targets, so there is no disagreement to report. This does not prove a shared "
+             "namespace.", ns[0]);
+    else
+      rd_add_skip(rep, SEV_INFO, "mount-view-namespace",
+                  "cannot tell whether /proc/1 shares this mount namespace",
+             "/proc/1/ns/mnt or /proc/self/ns/mnt is not readable from this domain, and the "
+             "readable mount views differ or are unavailable, so /proc/1/mountinfo cannot be "
+             "compared. This is not a statement about hiding - the cross-check simply cannot "
+             "run here.");
+  } else if (!init_view_ok)
     rd_add(rep, SEV_INFO, "mount-view-namespace",
            "/proc/1 is in a different mount namespace",
            "init does not share this process's mount namespace, so /proc/1/mountinfo is not "
