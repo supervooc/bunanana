@@ -259,8 +259,8 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
     }
   }
   if (!mods)
-    rd_add(rep, SEV_INFO, "kernel-module", "/proc/modules unreadable",
-           "the loaded-module list could not be read (SELinux restricts it to root on some "
+    rd_add_skip(rep, SEV_INFO, "kernel-module", "/proc/modules unreadable",
+                "the loaded-module list could not be read (SELinux restricts it to root on some "
            "devices), so the module-name check did not run - this is not a clean result.");
   else if (mod_hits)
     rd_add_ev(rep, SEV_HIGH, "kernel-module", "loaded kernel module names a root framework",
@@ -331,8 +331,8 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
        * them would be reported as hidden - turning a clean device into
        * HIDING_DETECTED. That is worse than not checking. */
       if (hidden_mod && (mods == NULL || mod_count == 0))
-        rd_add(rep, SEV_INFO, "kernel-modules-crosscheck-skipped",
-               "module list unavailable or empty, cross-check skipped",
+        rd_add_skip(rep, SEV_INFO, "kernel-modules-crosscheck-skipped",
+                    "module list unavailable or empty, cross-check skipped",
                "/proc/modules could not be read or lists no modules, so the %d module symbol(s) "
                "seen in kallsyms cannot be told apart from a filtered module list; "
                "skipping the hidden-module conclusion.",
@@ -378,8 +378,8 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
        * table, so the 32-bit syscall numbers (i386 openat=295, arm32=322) would
        * read an unrelated entry and invent a patched table (review B2). */
       if (c->is_root && sizeof(void *) != 8) {
-        rd_add(rep, SEV_INFO, "kernel-syscall-table-skipped",
-               "32-bit build: the native sys_call_table cannot be indexed safely",
+        rd_add_skip(rep, SEV_INFO, "kernel-syscall-table-skipped",
+                    "32-bit build: the native sys_call_table cannot be indexed safely",
                "Reported instead of a bogus kernel-syscall-table-patched finding.");
       } else if (c->is_root) {
         unsigned long long sct = ksym_find(ktab, "sys_call_table");
@@ -398,8 +398,8 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
           /* Never stay silent about the strongest check not running: a kernel
            * built without CONFIG_KALLSYMS_ALL omits data symbols, so
            * sys_call_table simply is not in the table. */
-          rd_add(rep, SEV_INFO, "kernel-syscall-table-skipped",
-                 "sys_call_table could not be verified",
+          rd_add_skip(rep, SEV_INFO, "kernel-syscall-table-skipped",
+                      "sys_call_table could not be verified",
                  "kallsyms did not resolve %s%s%s. A kernel built without CONFIG_KALLSYMS_ALL omits "
                  "data symbols; Android GKI kernels normally keep it enabled, so on a device this "
                  "check does run.", sct ? "" : "sys_call_table", (!sct && !openat) ? " and " : "",
@@ -423,15 +423,15 @@ void rd_check_kernel(rd_ctx *c, rd_report *rep) {
                      "sys_call_table[openat] matches kallsyms",
                      "verified through /proc/kcore: %s", kptr_str(entry, buf, sizeof(buf)));
           } else {
-            rd_add(rep, SEV_INFO, "kernel-kcore", "/proc/kcore not readable",
-                   "cannot verify sys_call_table contents from user space on this device.");
+            rd_add_skip(rep, SEV_INFO, "kernel-kcore", "/proc/kcore not readable",
+                        "cannot verify sys_call_table contents from user space on this device.");
           }
         }
       }
     }
   } else {
-    rd_add(rep, SEV_INFO, "kernel-kallsyms", "/proc/kallsyms unreadable",
-           "SELinux blocks the symbol table for this domain; cross-checks skipped.");
+    rd_add_skip(rep, SEV_INFO, "kernel-kallsyms", "/proc/kallsyms unreadable",
+                "SELinux blocks the symbol table for this domain; cross-checks skipped.");
   }
   free(ks);
   ksym_free(ktab);
@@ -482,12 +482,12 @@ void rd_check_susfs(rd_ctx *c, rd_report *rep) {
   } else if (inconsistent) {
     /* already reported per path */
   } else {
-    rd_add(rep, SEV_INFO, "susfs-node-absent", "no SuSFS control node reachable",
-           "all %zu paths answered ENOENT. Note this is also what a non-root process sees when "
-           "SuSFS hides them, so absence alone is not evidence of a clean device - the "
-           "susfs_guard_lkm section cross-checks exactly this case with its syscall-coverage "
-           "oracle.",
-           RD_HIDING_PATH_COUNT);
+    rd_add_skip(rep, SEV_INFO, "susfs-node-absent", "no SuSFS control node reachable",
+                "all %zu paths answered ENOENT. Note this is also what a non-root process sees when "
+                "SuSFS hides them, so absence alone is not evidence of a clean device - the "
+                "susfs_guard_lkm section cross-checks exactly this case with its syscall-coverage "
+                "oracle.",
+                RD_HIDING_PATH_COUNT);
   }
 
   /* SuSFS/LKM present at boot is also visible through the kernel command line. */
@@ -859,8 +859,8 @@ static void lkm_artefacts(rd_report *rep) {
               "to be re-inserted at boot, so installer files survive hiding rules aimed at the "
               "running kernel.", found);
   else
-    rd_add(rep, SEV_INFO, "susfs-lkm-artefact-absent", "no susfs_guard_lkm installer file found",
-           "probed %zu LKM-specific paths plus the KernelSU module and loader directories; "
+    rd_add_skip(rep, SEV_INFO, "susfs-lkm-artefact-absent", "no susfs_guard_lkm installer file found",
+                "probed %zu LKM-specific paths plus the KernelSU module and loader directories; "
            "nothing matched. /data/adb is unreadable to non-root, so this proves nothing "
            "without uid 0.",
            RD_SUSFS_LKM_PATH_COUNT);
@@ -1145,7 +1145,7 @@ static void check_uname_spoof(rd_report *rep) {
     /* "All utsname sources agree" was printed even when not a single one of them
      * could be read, which turns "the check did not run" into an apparent clean
      * result (the exact failure mode a hiding layer wants). */
-    rd_add_ev(rep, SEV_INFO, "spoof-uname", "uname() could not be cross-checked", ev,
+    rd_add_skip_ev(rep, SEV_INFO, "spoof-uname", "uname() could not be cross-checked", ev,
               "none of /proc/version, /proc/sys/kernel/osrelease or /proc/sys/kernel/version were "
               "readable from this domain, so nothing was compared - this is not a consistent "
               "result.");
@@ -1160,16 +1160,16 @@ static void check_cmdline_spoof(rd_ctx *c, rd_report *rep) {
   char *cmdline = rd_slurp("/proc/cmdline", NULL);
   if (!cmdline || !cmdline[0]) {
     /* Returning silently hid the fact that the cross-check never ran. */
-    rd_add(rep, SEV_INFO, "spoof-cmdline", "/proc/cmdline is not readable",
-           "the kernel command line could not be read from this domain (SELinux or a hiding "
+    rd_add_skip(rep, SEV_INFO, "spoof-cmdline", "/proc/cmdline is not readable",
+                "the kernel command line could not be read from this domain (SELinux or a hiding "
            "layer), so the ro.boot.* cross-check did not run - this is not a clean result.");
     free(cmdline);
     return;
   }
   size_t clen = strlen(cmdline);
   if (clen < 32) {
-    rd_add(rep, SEV_INFO, "spoof-cmdline", "kernel command line is too short to compare",
-           "/proc/cmdline is %zu bytes long, so it carries no androidboot.* parameter to verify "
+    rd_add_skip(rep, SEV_INFO, "spoof-cmdline", "kernel command line is too short to compare",
+                "/proc/cmdline is %zu bytes long, so it carries no androidboot.* parameter to verify "
            "the property table against.", clen);
     free(cmdline);
     return;
@@ -1222,8 +1222,8 @@ static void check_cmdline_spoof(rd_ctx *c, rd_report *rep) {
               "layer rewrites /proc/cmdline only; init has already copied the real values into "
               "ro.boot.*, so the two views diverge.", mismatch, checked);
   else if (checked >= 3 && mismatch * 2 > checked)
-    rd_add_ev(rep, SEV_INFO, "spoof-cmdline",
-              "property table and command line cannot be compared", ev,
+    rd_add_skip_ev(rep, SEV_INFO, "spoof-cmdline",
+                   "property table and command line cannot be compared", ev,
               "%d of %d ro.boot.* properties have no counterpart, but neither source exposes any "
               "androidboot.* token from this domain (/proc/cmdline: %s; /proc/bootconfig: %s), so "
               "the parameters are not visible here rather than hidden - there is nothing to "
@@ -1469,8 +1469,8 @@ static void deep_dmesg(rd_report *rep) {
   }
   if (rc != 0 || !out[0]) {
     free(out);
-    rd_add(rep, SEV_INFO, "deep-dmesg", "kernel log not readable",
-           "dmesg needs root and an SELinux policy that allows it.");
+    rd_add_skip(rep, SEV_INFO, "deep-dmesg", "kernel log not readable",
+                "dmesg needs root and an SELinux policy that allows it.");
     return;
   }
   char ev[RD_MAXEVID];
@@ -1494,7 +1494,7 @@ static void deep_dmesg(rd_report *rep) {
 
 void rd_check_deep(rd_ctx *c, rd_report *rep) {
   if (!c->is_root) {
-    rd_add(rep, SEV_INFO, "deep-skipped", "deep kernel checks need uid 0",
+    rd_add_skip(rep, SEV_INFO, "deep-skipped", "deep kernel checks need uid 0",
            "run the tool through `adb root` or `su` to verify the syscall table through "
            "/proc/kcore, list kernel probes and read the kernel log.");
     return;
@@ -1792,7 +1792,7 @@ void rd_check_abi_diff(rd_ctx *c, rd_report *rep) {
              "ROOTDETECT_ABI_HELPER=/data/local/rx/rootdetect-x86 rootdetect-x86_64 -v",
              helper, why);
     } else {
-      rd_add(rep, SEV_INFO, "abi-diff-skipped", "no second-ABI helper binary found",
+      rd_add_skip(rep, SEV_INFO, "abi-diff-skipped", "no second-ABI helper binary found",
              "push the other ABI's build into a root-only directory and point "
              "ROOTDETECT_ABI_HELPER at it to enable the cross-ABI comparison. SuSFS patches the "
              "native and compat syscall tables separately, so this is one of the strongest "
@@ -1807,7 +1807,7 @@ void rd_check_abi_diff(rd_ctx *c, rd_report *rep) {
   const char *argv[] = {helper, "--probe-dump", NULL};
   int rc = rd_run(argv, out, 1 << 20);
   if (rc != 0 || !strstr(out, "rd-probe-dump")) {
-    rd_add(rep, SEV_INFO, "abi-diff-skipped", "second-ABI helper could not be executed",
+    rd_add_skip(rep, SEV_INFO, "abi-diff-skipped", "second-ABI helper could not be executed",
            "%s exited with %d (a 32-bit binary needs a 32-bit-capable kernel/zygote, and it must "
            "be chmod 755).", helper, rc);
     free(out);
@@ -1819,11 +1819,11 @@ void rd_check_abi_diff(rd_ctx *c, rd_report *rep) {
   int n_remote = abi_parse(out, helper_abi, sizeof(helper_abi), remote, RD_ABI_MAX);
   free(out);
   if (n_remote < 0) {
-    rd_add(rep, SEV_INFO, "abi-diff-skipped", "helper produced no probe data", "%s", helper);
+    rd_add_skip(rep, SEV_INFO, "abi-diff-skipped", "helper produced no probe data", "%s", helper);
     return;
   }
   if (helper_abi[0] && strcmp(helper_abi, rd_abi_name()) == 0) {
-    rd_add(rep, SEV_INFO, "abi-diff-skipped", "helper has the same ABI as this binary",
+    rd_add_skip(rep, SEV_INFO, "abi-diff-skipped", "helper has the same ABI as this binary",
            "%s reports %s; a cross-ABI comparison needs a different one.", helper, helper_abi);
     return;
   }

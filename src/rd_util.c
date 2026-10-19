@@ -100,24 +100,68 @@ static void set_detail(rd_finding *f, const char *fmt, va_list ap) {
   f->detail = xstrdup(buf);
 }
 
-void rd_add(rd_report *r, rd_sev sev, const char *id, const char *title, const char *fmt, ...) {
+static void add_finding(rd_report *r, rd_sev sev, const char *id, const char *title,
+                        const char *evidence, const char *fmt, va_list ap) {
   rd_finding *f = find_push(r, sev, id, title);
   if (!f) return;
+  set_detail(f, fmt ? fmt : "", ap);
+  if (evidence && *evidence) f->evidence = xstrdup(evidence);
+}
+
+/* Records a check that could not run. Deduplicated: the summary counts distinct
+ * checks, not how many probes hit the same blind spot. */
+static void note_skip(rd_report *r, const char *id) {
+  if (!id || !*id) return;
+  for (int i = 0; i < r->n_skips; i++)
+    if (strcmp(r->skip_ids[i], id) == 0) return;
+  if (r->n_skips >= RD_MAX_SKIPS) return;
+  snprintf(r->skip_ids[r->n_skips], sizeof(r->skip_ids[0]), "%s", id);
+  r->n_skips++;
+}
+
+void rd_add(rd_report *r, rd_sev sev, const char *id, const char *title, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  set_detail(f, fmt ? fmt : "", ap);
+  add_finding(r, sev, id, title, NULL, fmt, ap);
   va_end(ap);
 }
 
 void rd_add_ev(rd_report *r, rd_sev sev, const char *id, const char *title,
                const char *evidence, const char *fmt, ...) {
-  rd_finding *f = find_push(r, sev, id, title);
-  if (!f) return;
   va_list ap;
   va_start(ap, fmt);
-  set_detail(f, fmt ? fmt : "", ap);
+  add_finding(r, sev, id, title, evidence, fmt, ap);
   va_end(ap);
-  if (evidence && *evidence) f->evidence = xstrdup(evidence);
+}
+
+void rd_add_skip(rd_report *r, rd_sev sev, const char *id, const char *title,
+                 const char *fmt, ...) {
+  note_skip(r, id);
+  va_list ap;
+  va_start(ap, fmt);
+  add_finding(r, sev, id, title, NULL, fmt, ap);
+  va_end(ap);
+}
+
+void rd_add_skip_ev(rd_report *r, rd_sev sev, const char *id, const char *title,
+                    const char *evidence, const char *fmt, ...) {
+  note_skip(r, id);
+  va_list ap;
+  va_start(ap, fmt);
+  add_finding(r, sev, id, title, evidence, fmt, ap);
+  va_end(ap);
+}
+
+void rd_skip_list(const rd_report *r, char *out, size_t outsz) {
+  if (!out || !outsz) return;
+  size_t used = 0;
+  out[0] = '\0';
+  for (int i = 0; i < r->n_skips; i++) {
+    if (used >= outsz) return;
+    int n = snprintf(out + used, outsz - used, "%s%s", i ? ", " : "", r->skip_ids[i]);
+    if (n < 0 || (size_t)n >= outsz - used) return; /* truncated; NUL kept */
+    used += (size_t)n;
+  }
 }
 
 static int cmp_sev_desc(const void *a, const void *b) {
@@ -395,6 +439,23 @@ void rd_print_text(const rd_report *r, int use_color, int verbose) {
          r->counts[SEV_LOW], r->counts[SEV_INFO]);
   printf("verdict: %s%s%s\n", use_color ? "\033[1;37m" : "", r->verdict ? r->verdict : "?",
          use_color ? "\033[0m" : "");
+  /* The verdict only covers the checks that actually ran. Always print the
+   * coverage line: the INFO rows that explain a skip are hidden without -v, so
+   * otherwise a CLEAN verdict looked like a full check on a non-root device. */
+  if (r->n_skips == 0) {
+    printf("coverage: complete\n");
+  } else {
+    printf("coverage: partial (%d check%s could not run", r->n_skips,
+           r->n_skips == 1 ? "" : "s");
+    if (verbose) {
+      char ids[RD_MAX_SKIPS * RD_SKIP_ID_MAX + 8];
+      rd_skip_list(r, ids, sizeof(ids));
+      printf(": %s", ids);
+    } else {
+      printf("; run -v for the list");
+    }
+    printf(")\n");
+  }
 }
 
 void rd_print_json(const rd_report *r) {
@@ -407,6 +468,12 @@ void rd_print_json(const rd_report *r) {
   printf("  \"summary\": {\"critical\": %d, \"high\": %d, \"medium\": %d, \"low\": %d, \"info\": %d},\n",
          r->counts[SEV_CRITICAL], r->counts[SEV_HIGH], r->counts[SEV_MEDIUM],
          r->counts[SEV_LOW], r->counts[SEV_INFO]);
+  printf("  \"coverage\": {\"complete\": %s, \"skipped\": [", r->n_skips ? "false" : "true");
+  for (int i = 0; i < r->n_skips; i++) {
+    rd_json_escape(r->skip_ids[i], esc, sizeof(esc));
+    printf("%s\"%s\"", i ? ", " : "", esc);
+  }
+  printf("]},\n");
   printf("  \"findings\": [");
   for (size_t i = 0; i < r->n; i++) {
     const rd_finding *f = &r->items[i];
