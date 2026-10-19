@@ -8,11 +8,18 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/sock_diag.h>
+#include <linux/unix_diag.h>
 
 /* ----------------------------------------------------------------- sockets */
 
@@ -89,35 +96,189 @@ static long socket_owner_uid(const char *inode, char *how, size_t howsz) {
   return uid;
 }
 
+/* One AF_UNIX socket as reported by NETLINK_SOCK_DIAG. */
+typedef struct {
+  char name[192];
+  unsigned int uid;
+  unsigned int ino;
+  bool have_uid;
+} unix_diag_row;
+
+/* Enumerate AF_UNIX sockets through NETLINK_SOCK_DIAG.
+ *
+ * /proc/net/unix is denied to apps on Android 11+ (SELinux), which used to make
+ * the whole socket-name check a skip. The kernel exposes the same table over
+ * sock_diag, and modern kernels include UNIX_DIAG_UID, so the owner of a name
+ * can be known without walking /proc/<pid>/fd (which an app cannot do for root
+ * processes anyway). Returns the number of rows filled, or -1 with `why` set.
+ */
+static int unix_diag_dump(unix_diag_row *rows, int max, char *why, size_t whysz) {
+  if (whysz) why[0] = '\0';
+  int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG);
+  if (fd < 0) {
+    snprintf(why, whysz, "socket: %s", strerror(errno));
+    return -1;
+  }
+  /* Never let a wedged kernel hang the whole scan: the tool has a watchdog,
+   * but a two-second cap keeps the check itself bounded. */
+  struct timeval tv;
+  tv.tv_sec = 2;
+  tv.tv_usec = 0;
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  struct sockaddr_nl sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.nl_family = AF_NETLINK;
+  if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+    snprintf(why, whysz, "bind: %s", strerror(errno));
+    close(fd);
+    return -1;
+  }
+
+  struct {
+    struct nlmsghdr nlh;
+    struct unix_diag_req req;
+  } msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.nlh.nlmsg_len = sizeof(msg);
+  msg.nlh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+  msg.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  msg.nlh.nlmsg_seq = 1;
+  msg.req.sdiag_family = AF_UNIX;
+  msg.req.udiag_states = 0xffffffffu;
+  msg.req.udiag_show = UDIAG_SHOW_NAME;
+  if (send(fd, &msg, sizeof(msg), 0) < 0) {
+    snprintf(why, whysz, "send: %s", strerror(errno));
+    close(fd);
+    return -1;
+  }
+
+  int n = 0;
+  for (;;) {
+    char buf[8192];
+    ssize_t got = recv(fd, buf, sizeof(buf), 0);
+    if (got < 0) {
+      if (n > 0) break; /* timeout after useful rows: keep them */
+      snprintf(why, whysz, "recv: %s", strerror(errno));
+      close(fd);
+      return -1;
+    }
+    if (got == 0) break;
+    unsigned int left = (unsigned int)got;
+    for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, left); h = NLMSG_NEXT(h, left)) {
+      if (h->nlmsg_type == NLMSG_DONE) {
+        close(fd);
+        return n;
+      }
+      if (h->nlmsg_type == NLMSG_ERROR) {
+        struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(h);
+        if (n == 0) {
+          snprintf(why, whysz, "netlink error %d", e->error);
+          close(fd);
+          return -1;
+        }
+        close(fd);
+        return n;
+      }
+      struct unix_diag_msg *d = (struct unix_diag_msg *)NLMSG_DATA(h);
+      int alen = (int)h->nlmsg_len - (int)NLMSG_LENGTH(sizeof(*d));
+      const char *name = NULL;
+      size_t nlen = 0;
+      unsigned int uid = 0;
+      bool have_uid = false;
+      for (struct rtattr *a = (struct rtattr *)(d + 1); RTA_OK(a, alen); a = RTA_NEXT(a, alen)) {
+        if (a->rta_type == UNIX_DIAG_NAME) {
+          name = (const char *)RTA_DATA(a);
+          nlen = (size_t)RTA_PAYLOAD(a);
+        } else if (a->rta_type == UNIX_DIAG_UID && RTA_PAYLOAD(a) >= (int)sizeof(uid)) {
+          memcpy(&uid, RTA_DATA(a), sizeof(uid));
+          have_uid = true;
+        }
+      }
+      if (!name || n >= max) continue;
+      unix_diag_row *row = &rows[n++];
+      memset(row, 0, sizeof(*row));
+      bool abstract = nlen > 0 && name[0] == '\0';
+      size_t off = abstract ? 1 : 0;
+      size_t copy = nlen - off;
+      if (copy > sizeof(row->name) - 2) copy = sizeof(row->name) - 2;
+      if (abstract) row->name[0] = '@';
+      memcpy(row->name + (abstract ? 1 : 0), name + off, copy);
+      row->name[(abstract ? 1 : 0) + copy] = '\0';
+      row->uid = uid;
+      row->have_uid = have_uid;
+      row->ino = d->udiag_ino;
+    }
+  }
+  close(fd);
+  return n;
+}
+
 /* Root and instrumentation frameworks keep a control channel as an abstract
  * unix socket: Frida's linjector, Zygisk's daemon, Magisk's socket, LSPosed. */
 static void check_unix_sockets(rd_report *rep) {
-  char *txt = rd_slurp("/proc/net/unix", NULL);
-  if (!txt) {
-    rd_add_skip(rep, SEV_INFO, "unix-sockets", "/proc/net/unix not readable",
-                "SELinux may restrict this file for the current domain.");
-    return;
-  }
   char ev[RD_MAXEVID];
   ev[0] = '\0';
   int hits = 0, root_owned = 0, nonroot_owned = 0;
-  char *save = NULL;
-  for (char *line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-    const char *which = NULL;
-    if (!rd_has_keyword(line, &which)) continue;
-    if (strcmp(which, "busybox") == 0) continue;
-    hits++;
-    char how[96] = "owner unknown";
-    long uid = -1;
-    char ino[64];
-    if (unix_row_inode(line, ino, sizeof(ino))) uid = socket_owner_uid(ino, how, sizeof(how));
-    if (uid == 0)
-      root_owned++;
-    else if (uid > 0)
-      nonroot_owned++;
-    if (strlen(ev) < sizeof(ev) - 256) rd_appendf(ev, sizeof(ev), "%s [%s]\n", line, how);
+
+  int rows = 0;
+  char *txt = rd_slurp("/proc/net/unix", NULL);
+  if (txt) {
+    char *save = NULL;
+    for (char *line = strtok_r(txt, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+      char ino[64] = "";
+      if (unix_row_inode(line, ino, sizeof(ino))) rows++;
+      const char *which = NULL;
+      if (!rd_has_keyword(line, &which)) continue;
+      if (strcmp(which, "busybox") == 0) continue;
+      hits++;
+      char how[96] = "owner unknown";
+      long uid = -1;
+      if (ino[0]) uid = socket_owner_uid(ino, how, sizeof(how));
+      if (uid == 0)
+        root_owned++;
+      else if (uid > 0)
+        nonroot_owned++;
+      if (strlen(ev) < sizeof(ev) - 256) rd_appendf(ev, sizeof(ev), "%s [%s]\n", line, how);
+    }
+    free(txt);
   }
-  free(txt);
+  /* A header-only or empty view is as useless as an unreadable one: fall back
+   * to the kernel's own table instead of reporting "no suspicious names". */
+  if (rows == 0) {
+    static unix_diag_row net_rows[256];
+    char why[160] = "";
+    int n = unix_diag_dump(net_rows, 256, why, sizeof(why));
+    if (n < 0) {
+      rd_add_skip(rep, SEV_INFO, "unix-sockets",
+                  "/proc/net/unix unavailable and the netlink dump failed",
+                  "/proc/net/unix is denied to this domain or returned no rows, and "
+                  "NETLINK_SOCK_DIAG returned no table (%s), so the socket-name check could not "
+                  "run. This is not a clean result.", why);
+      return;
+    }
+    for (int i = 0; i < n; i++) {
+      const char *which = NULL;
+      if (!rd_has_keyword(net_rows[i].name, &which)) continue;
+      if (strcmp(which, "busybox") == 0) continue;
+      hits++;
+      long uid = net_rows[i].have_uid ? (long)net_rows[i].uid : -1;
+      char how[96] = "owner unknown";
+      if (uid >= 0) {
+        snprintf(how, sizeof(how), "netlink uid %ld", uid);
+      } else if (net_rows[i].ino) {
+        char ino[32];
+        snprintf(ino, sizeof(ino), "%u", net_rows[i].ino);
+        uid = socket_owner_uid(ino, how, sizeof(how));
+      }
+      if (uid == 0)
+        root_owned++;
+      else if (uid > 0)
+        nonroot_owned++;
+      if (strlen(ev) < sizeof(ev) - 256)
+        rd_appendf(ev, sizeof(ev), "%s [%s]\n", net_rows[i].name, how);
+    }
+  }
   if (!hits) {
     rd_add(rep, SEV_INFO, "unix-sockets", "no suspicious unix socket names", "");
     return;
