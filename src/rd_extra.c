@@ -108,18 +108,35 @@ typedef struct {
   int hits;
   int root_owned;
   int nonroot_owned;
-  unsigned int seen[256];
+  unsigned int *seen;
   size_t n_seen;
+  size_t cap_seen;
+  bool merge_oom;
   char ev[RD_MAXEVID];
 } unix_scan;
 
 /* True when this inode was already counted. A zero inode is never merged
- * because there is nothing to compare. */
+ * because there is nothing to compare. The set grows with the number of
+ * matches; with a fixed window a socket seen in both views stopped being
+ * recognized once the window filled and was counted twice (a 300-socket
+ * repro reported 344). */
 static bool unix_seen(unix_scan *sc, unsigned int ino) {
   if (!ino) return false;
   for (size_t i = 0; i < sc->n_seen; i++)
     if (sc->seen[i] == ino) return true;
-  if (sc->n_seen < sizeof(sc->seen) / sizeof(sc->seen[0])) sc->seen[sc->n_seen++] = ino;
+  if (sc->n_seen == sc->cap_seen) {
+    size_t cap = sc->cap_seen ? sc->cap_seen * 2 : 64;
+    unsigned int *grown = realloc(sc->seen, cap * sizeof(*grown));
+    if (!grown) {
+      /* Fail closed: dropping a new match is an undercount, but counting the
+       * same socket twice is a wrong number in the report. */
+      sc->merge_oom = true;
+      return true;
+    }
+    sc->seen = grown;
+    sc->cap_seen = cap;
+  }
+  sc->seen[sc->n_seen++] = ino;
   return false;
 }
 
@@ -359,13 +376,26 @@ static void check_unix_sockets(rd_report *rep) {
     free(txt);
   }
 
-  if (rc == UNIX_DUMP_ERR && proc_rows == 0) {
+  if (rc == UNIX_DUMP_ERR) {
+    if (proc_rows == 0) {
+      rd_add_skip(rep, SEV_INFO, "unix-sockets",
+                  "/proc/net/unix unavailable and the netlink dump failed",
+                  "/proc/net/unix is denied to this domain or returned no rows, and "
+                  "NETLINK_SOCK_DIAG returned no table (%s), so the socket-name check could not "
+                  "run. This is not a clean result.", why);
+      free(sc.seen);
+      return;
+    }
+    /* /proc/net/unix still ran, but the kernel-side view (the one that carries
+     * UNIX_DIAG_UID) did not. Do not let the report look as if both views had
+     * been checked: from an app domain the fd walk cannot attribute a root
+     * process, so a root channel can end up as "owner unknown" (MEDIUM). */
     rd_add_skip(rep, SEV_INFO, "unix-sockets",
-                "/proc/net/unix unavailable and the netlink dump failed",
-                "/proc/net/unix is denied to this domain or returned no rows, and "
-                "NETLINK_SOCK_DIAG returned no table (%s), so the socket-name check could not "
-                "run. This is not a clean result.", why);
-    return;
+                "the netlink socket table was unavailable, only /proc/net/unix was checked",
+                "NETLINK_SOCK_DIAG returned no table (%s) while /proc/net/unix was readable. "
+                "The matches below are real, but the kernel UID view did not run: a root-owned "
+                "socket that this domain cannot attribute through /proc/<pid>/fd stays 'owner "
+                "unknown', so a missing root channel is not proof of a clean device.", why);
   }
   if (rc == UNIX_DUMP_INCOMPLETE) {
     rd_add_skip(rep, SEV_INFO, "unix-sockets",
@@ -373,10 +403,14 @@ static void check_unix_sockets(rd_report *rep) {
                 "The NETLINK_SOCK_DIAG cross-check was interrupted, truncated or timed out (%s). "
                 "Any match below is real, but a missing name is not proof of a clean device.",
                 why);
-    if (!sc.hits) return;
+    if (!sc.hits) {
+      free(sc.seen);
+      return;
+    }
   }
   if (!sc.hits) {
     rd_add(rep, SEV_INFO, "unix-sockets", "no suspicious unix socket names", "");
+    free(sc.seen);
     return;
   }
   /* A bare name match proves nothing: the table has no owner column and any
@@ -384,6 +418,11 @@ static void check_unix_sockets(rd_report *rep) {
    * turn this finding into ROOT_DETECTED (reproduced). Only a socket that can be
    * attributed to uid 0 earns HIGH. */
   rd_sev sev = sc.root_owned ? SEV_HIGH : SEV_MEDIUM;
+  if (sc.merge_oom)
+    rd_add_skip(rep, SEV_INFO, "unix-sockets-merge",
+                "the socket inode merge ran out of memory",
+                "some matching socket names could not be counted; the match count is a lower "
+                "bound.");
   rd_add_ev(rep, sev, "unix-socket-roots",
             "unix socket name references a root/instrumentation framework", sc.ev,
             sc.root_owned
@@ -398,6 +437,7 @@ static void check_unix_sockets(rd_report *rep) {
                         "from this domain (no /proc/<pid>/fd access), so the name alone is not "
                         "proof of root.",
             sc.hits);
+  free(sc.seen);
 }
 
 /* ------------------------------------------------------- tracer / environment */
