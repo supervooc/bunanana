@@ -92,7 +92,7 @@ adb root && adb shell /data/local/rx/rx     # uid 0: enables the deep kernel che
 
 > The report also ends with a `coverage:` line that counts the **checks that could not run because of permissions or the environment** (as a non-root user this usually includes the kernel symbol table, the deep checks, the cross-ABI comparison, and `/proc/modules` or `/proc/net/unix` when SELinux denies them). `CLEAN` only covers the checks that did run: `coverage: partial (...)` gives the count, and `-v` also prints the ids and the reason for each skip.
 >
-> Three of those files have a second, independent view that needs no extra privilege: `/proc/net/unix` falls back to a `NETLINK_SOCK_DIAG` dump (socket names, plus the owner uid on kernels that export `UNIX_DIAG_UID`), `/proc/modules` falls back to `/sys/module/<name>/initstate == "live"`, and the `/proc/1/mountinfo` comparison runs even when the namespace symlinks cannot be read (only a real difference or an unreadable view stays a skip). The sysfs and `/proc/modules` views are also cross-checked: a module that is `live` in sysfs but missing from `/proc/modules` in two consecutive reads is reported as `kernel-module-list-filtered` (HIGH).
+> Three of those files have a second, independent view that needs no extra privilege: `/proc/net/unix` is merged with a `NETLINK_SOCK_DIAG` dump (deduplicated by socket inode; the netlink view carries the owner uid on kernels that export `UNIX_DIAG_UID`, and that uid wins), `/proc/modules` falls back to `/sys/module/<name>/initstate == "live"`, and the `/proc/1/mountinfo` comparison runs even when the namespace symlinks cannot be read (only a real difference or an unreadable view stays a skip). The sysfs and `/proc/modules` views are also cross-checked: a module that is `live` in sysfs but missing from `/proc/modules` in two consecutive reads is reported as `kernel-module-list-filtered` (HIGH).
 
 ---
 
@@ -337,7 +337,7 @@ adb shell /data/local/rx/rx        # auto-discovers the helper and enables the d
 
 | id | Severity | What it checks |
 |---|---|---|
-| `unix-socket-roots` | HIGH | control-channel names from `/proc/net/unix`, or from a `NETLINK_SOCK_DIAG` dump when `/proc/net/unix` is denied (the netlink view also carries the owner uid on kernels that export `UNIX_DIAG_UID`). They are sockets, not files, so file-system hiding does not make them disappear |
+| `unix-socket-roots` | HIGH | control-channel names merged from `/proc/net/unix` and a `NETLINK_SOCK_DIAG` dump (deduplicated by socket inode; the netlink view carries the owner uid on kernels that export `UNIX_DIAG_UID`, and that uid wins). They are sockets, not files, so file-system hiding does not make them disappear |
 | `self-traced` | HIGH | `TracerPid != 0` in `/proc/self/status`: this process is being ptraced |
 | `map-backing-hidden` | **CRITICAL** | a file mmap'ed into this process's own address space cannot be `stat`ed/`open`ed — path hiding did not cover the mmap path |
 | `map-deleted-exec` | MEDIUM | the backing file of an executable mapping has been unlinked |
@@ -366,7 +366,7 @@ wsl -u root -e bash android-rootdetect/scripts/wsl-verify.sh fixtures # inject +
 
 | Scenario | Measured result |
 |---|---|
-| `--selftest` | **128 checks, 0 failure(s), 2 skipped** (current binary; the two skips are the Android-only assertions - the getprop table and ro.build.version.sdk) |
+| `--selftest` | **129 checks, 0 failure(s), 2 skipped** (current binary; the two skips are the Android-only assertions - the getprop table and ro.build.version.sdk) |
 | clean-system baseline (false-positive rate) | **verdict: CLEAN** — 0 critical / 0 high / 0 medium / 0 low (the rest are INFO rows; the count depends on the kernel and environment) |
 | injected root traces (`/system/xbin/su`, `/system/bin/ksud`, `/data/adb/magisk`) | `artefact-present` + `artefact-listing` = **HIGH**, verdict: ROOT_DETECTED (exit 2) |
 | `tmpfs` over `/system` | `mount-overlay` = **HIGH** |
