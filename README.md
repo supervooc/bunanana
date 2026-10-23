@@ -92,7 +92,7 @@ adb root && adb shell /data/local/rx/rx     # uid 0：开启内核深度检查
 
 > 报告末尾另有一行 `coverage:`，统计**因权限/环境而没能执行的检查**（非 root 时通常包括内核符号表、深度检查、跨 ABI 对比，以及被 SELinux 挡住的 `/proc/modules`、`/proc/net/unix` 等）。`CLEAN` 只代表已执行的检查没有发现问题：`coverage: partial (...)` 会给出数量，`-v` 会连 id 和每个跳过原因一起打印。
 >
-> 其中三处已有**不需要额外权限的独立视图**：`/proc/net/unix` 不可读时改走 `NETLINK_SOCK_DIAG` 枚举（拿得到 socket 名，内核导出 `UNIX_DIAG_UID` 时还带 owner uid）；`/proc/modules` 不可读时改用 `/sys/module/<名字>/initstate == "live"`；`/proc/1/ns/mnt` 的 readlink 被拒时，只要两个可读的挂载视图一致就不再算盲区（只有视图确实不同或不可读才保留 skip）。sysfs 与 `/proc/modules` 还会互相交叉验证：连续两次读取中都在 sysfs 里 `live`、却不在 `/proc/modules` 里的模块，会报 `kernel-module-list-filtered`（HIGH）。
+> 其中三处已有**不需要额外权限的独立视图**：`/proc/net/unix` 会与 `NETLINK_SOCK_DIAG` 枚举**合并**（按 socket inode 去重；netlink 视图带 owner uid，内核导出 `UNIX_DIAG_UID` 时以它为准）；`/proc/modules` 不可读时改用 `/sys/module/<名字>/initstate == "live"`；`/proc/1/ns/mnt` 的 readlink 被拒时，只要两个可读的挂载视图一致就不再算盲区（只有视图确实不同或不可读才保留 skip）。sysfs 与 `/proc/modules` 还会互相交叉验证：连续两次读取中都在 sysfs 里 `live`、却不在 `/proc/modules` 里的模块，会报 `kernel-module-list-filtered`（HIGH）。
 
 ---
 
@@ -337,7 +337,7 @@ adb shell /data/local/rx/rx        # 自动发现助手并启用差分
 
 | id | 级别 | 内容 |
 |---|---|---|
-| `unix-socket-roots` | HIGH | `/proc/net/unix`（不可读时改走 `NETLINK_SOCK_DIAG` 枚举，内核导出 `UNIX_DIAG_UID` 时还带 owner uid）里的控制通道名（Frida linjector / Zygisk / Magisk / LSPosed）。它们是 socket 不是文件，藏文件系统不会让它们消失 |
+| `unix-socket-roots` | HIGH | `/proc/net/unix` 与 `NETLINK_SOCK_DIAG` 两个视图合并（按 socket inode 去重；内核导出 `UNIX_DIAG_UID` 时 owner uid 以 netlink 为准）后的控制通道名（Frida linjector / Zygisk / Magisk / LSPosed）。它们是 socket 不是文件，藏文件系统不会让它们消失 |
 | `self-traced` | HIGH | `/proc/self/status` 的 `TracerPid != 0`：本进程正被 ptrace 附加 |
 | `map-backing-hidden` | **CRITICAL** | 自己地址空间里 mmap 进来的文件却 `stat`/`open` 不到——路径隐藏没覆盖 mmap 这条路径 |
 | `map-deleted-exec` | MEDIUM | 可执行映射的宿主文件已被 unlink |
@@ -366,7 +366,7 @@ wsl -u root -e bash android-rootdetect/scripts/wsl-verify.sh fixtures # 注入 +
 
 | 场景 | 实测结果 |
 |---|---|
-| `--selftest` | **128 checks, 0 failure(s), 2 skipped**（当前二进制；两条 SKIP 是 Android 专属断言——getprop 表与 ro.build.version.sdk） |
+| `--selftest` | **129 checks, 0 failure(s), 2 skipped**（当前二进制；两条 SKIP 是 Android 专属断言——getprop 表与 ro.build.version.sdk） |
 | 干净系统基线（误报率） | **verdict: CLEAN** —— 0 critical / 0 high / 0 medium / 0 low（其余全部 INFO；条数随内核与环境不同） |
 | 注入 root 痕迹（`/system/xbin/su`、`/system/bin/ksud`、`/data/adb/magisk`） | `artefact-present` + `artefact-listing` = **HIGH**，verdict: ROOT_DETECTED（exit 2） |
 | `tmpfs` 覆盖 `/system` | `mount-overlay` = **HIGH** |
